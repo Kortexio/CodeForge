@@ -18,20 +18,25 @@ OpenCodeIDE is an AI-native code editor built on Code-OSS with a fully embedded 
 
 ## Quick Start
 
+### AI Platform only (library + Electron shell)
+
 ```bash
-# Clone the repository
 git clone https://github.com/Kortexio/OpenCodeIDE.git
 cd OpenCodeIDE
-
-# Install dependencies
 npm install
-
-# Build
-npm run build
-
-# Run in development mode
+npm run verify
 npm start
 ```
+
+### Full IDE (Code-OSS + AI extension)
+
+```bash
+npm run vscode:setup      # clone Code-OSS, brand, install deps
+npm run vscode:compile    # compile editor (first time is slow)
+npm run vscode:dev        # launch OpenCodeIDE with AI sidebar
+```
+
+See [docs/code-oss-integration.md](docs/code-oss-integration.md) for details.
 
 ## Architecture
 

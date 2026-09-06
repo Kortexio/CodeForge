@@ -68,3 +68,6 @@ secrets/
 
 # Model cache (can be large)
 model-cache/
+
+# Code-OSS clone (setup via: npm run vscode:setup)
+vscode/

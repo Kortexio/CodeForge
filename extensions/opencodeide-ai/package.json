@@ -66,6 +66,11 @@
         "command": "opencodeide-ai.showTrace",
         "title": "Show Execution Trace",
         "category": "OpenCodeIDE AI"
+      },
+      {
+        "command": "opencodeide-ai.inspectWorkspace",
+        "title": "Inspect Workspace",
+        "category": "OpenCodeIDE AI"
       }
     ],
     "configuration": {
