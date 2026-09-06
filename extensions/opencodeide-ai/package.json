@@ -1,0 +1,151 @@
+{
+  "name": "opencodeide-ai",
+  "displayName": "OpenCodeIDE AI",
+  "description": "AI Agent sidebar and approval UI for OpenCodeIDE",
+  "version": "0.1.0",
+  "publisher": "kortexio",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "opencodeide-ai",
+          "title": "AI Agent",
+          "icon": "resources/ai-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "opencodeide-ai": [
+        {
+          "type": "webview",
+          "id": "opencodeide-ai.chat",
+          "name": "Chat"
+        },
+        {
+          "id": "opencodeide-ai.sessions",
+          "name": "Sessions"
+        },
+        {
+          "id": "opencodeide-ai.tasks",
+          "name": "Tasks"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "opencodeide-ai.newChat",
+        "title": "New Chat",
+        "category": "OpenCodeIDE AI"
+      },
+      {
+        "command": "opencodeide-ai.runTask",
+        "title": "Run AI Task",
+        "category": "OpenCodeIDE AI"
+      },
+      {
+        "command": "opencodeide-ai.cancelTask",
+        "title": "Cancel AI Task",
+        "category": "OpenCodeIDE AI"
+      },
+      {
+        "command": "opencodeide-ai.configureProvider",
+        "title": "Configure AI Provider",
+        "category": "OpenCodeIDE AI"
+      },
+      {
+        "command": "opencodeide-ai.showTrace",
+        "title": "Show Execution Trace",
+        "category": "OpenCodeIDE AI"
+      }
+    ],
+    "configuration": {
+      "title": "OpenCodeIDE AI",
+      "properties": {
+        "opencodeide.ai.provider": {
+          "type": "string",
+          "enum": [
+            "openai",
+            "anthropic",
+            "google",
+            "xai",
+            "openrouter",
+            "ollama",
+            "vllm",
+            "lmstudio",
+            "custom"
+          ],
+          "default": "openai",
+          "description": "AI model provider"
+        },
+        "opencodeide.ai.apiKey": {
+          "type": "string",
+          "default": "",
+          "description": "API key for the selected provider"
+        },
+        "opencodeide.ai.model": {
+          "type": "string",
+          "default": "gpt-4o",
+          "description": "Model to use for AI tasks"
+        },
+        "opencodeide.ai.baseUrl": {
+          "type": "string",
+          "default": "",
+          "description": "Custom base URL for API requests (for self-hosted models)"
+        },
+        "opencodeide.ai.autoApprove": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "List of tools to auto-approve"
+        },
+        "opencodeide.ai.traceLevel": {
+          "type": "string",
+          "enum": [
+            "none",
+            "basic",
+            "detailed"
+          ],
+          "default": "basic",
+          "description": "Level of execution tracing"
+        }
+      }
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "opencodeide-ai.newChat",
+          "when": "view == opencodeide-ai.chat",
+          "group": "navigation"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "opencodeide-ai.runTask",
+          "group": "opencodeide"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.90.0",
+    "typescript": "^5.4.0"
+  },
+  "dependencies": {}
+}
