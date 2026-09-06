@@ -38,9 +38,11 @@ if (!fs.existsSync(vscodeDir)) {
 }
 
 run('node', [path.join('scripts', 'apply-branding.mjs')], root);
+run('node', [path.join('scripts', 'apply-vscode-patches.mjs')], root);
 
 if (!skipInstall) {
 	console.log('\nInstalling Code-OSS dependencies (this can take 10–20 minutes)...');
+	console.log('Requires: Node matching vscode/.nvmrc, VS C++ tools + Spectre libs');
 	run('npm', ['install'], vscodeDir);
 } else {
 	console.log('\nSkipped npm install (--skip-install)');
