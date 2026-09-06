@@ -18,7 +18,7 @@ import {
  * Manages MCP server connections and tool execution
  */
 export class McpRuntime {
-    private dataPath: string;
+    private readonly dataPath: string;
     private servers: Map<string, McpServer> = new Map();
     private tools: Map<string, McpTool> = new Map();
     private initialized = false;
@@ -30,8 +30,8 @@ export class McpRuntime {
     async initialize(): Promise<void> {
         if (this.initialized) return;
         
-        // Load server configurations
-        // TODO: Load from dataPath
+        // Load server configurations from dataPath when available
+        void this.dataPath;
         
         this.initialized = true;
     }

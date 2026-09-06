@@ -169,18 +169,34 @@ export class CodeIndex {
      */
     getRepositoryMap(): { directories: DirectoryNode[]; fileCount: number; languageStats: Record<string, number> } {
         const languageStats: Record<string, number> = {};
-        const directories: Map<string, DirectoryNode> = new Map();
+        const rootDirs = new Map<string, DirectoryNode>();
 
         for (const filePath of this.fileSymbols.keys()) {
             const dir = path.dirname(filePath);
             const ext = path.extname(filePath);
+            const fileName = path.basename(filePath);
 
-            // Count languages
             languageStats[ext] = (languageStats[ext] ?? 0) + 1;
+
+            if (!rootDirs.has(dir)) {
+                rootDirs.set(dir, {
+                    name: path.basename(dir) || dir,
+                    path: dir,
+                    children: [],
+                    files: [],
+                });
+            }
+
+            rootDirs.get(dir)!.files.push({
+                name: fileName,
+                path: filePath,
+                language: ext.replace('.', '') || 'unknown',
+                symbolCount: (this.fileSymbols.get(filePath) ?? []).length,
+            });
         }
 
         return {
-            directories: [], // TODO: Build tree structure
+            directories: Array.from(rootDirs.values()),
             fileCount: this.fileSymbols.size,
             languageStats,
         };

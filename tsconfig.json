@@ -40,6 +40,8 @@
     "node_modules",
     "out",
     "dist",
-    "tests"
+    "tests",
+    "extensions",
+    "src/core"
   ]
 }

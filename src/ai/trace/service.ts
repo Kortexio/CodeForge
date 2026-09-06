@@ -12,7 +12,7 @@ import { TraceEntry, TraceLevel, TraceMetrics } from '../types.js';
  * Logs and tracks agent execution for debugging and observability
  */
 export class TraceService {
-    private dataPath: string;
+    private readonly dataPath: string;
     private entries: TraceEntry[] = [];
     private metrics: TraceMetrics = {
         totalTokens: 0,
@@ -24,6 +24,13 @@ export class TraceService {
 
     constructor(dataPath: string) {
         this.dataPath = dataPath;
+    }
+
+    /**
+     * Get path used for persisting traces
+     */
+    getDataPath(): string {
+        return this.dataPath;
     }
 
     /**

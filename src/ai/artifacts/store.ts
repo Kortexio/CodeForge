@@ -15,13 +15,11 @@ import { Artifact, ArtifactType } from '../types.js';
  * Stores and retrieves large artifacts
  */
 export class ArtifactStore {
-    private dataPath: string;
     private artifactsPath: string;
     private artifacts: Map<string, Artifact> = new Map();
     private initialized = false;
 
     constructor(dataPath: string) {
-        this.dataPath = dataPath;
         this.artifactsPath = path.join(dataPath, 'artifacts');
     }
 

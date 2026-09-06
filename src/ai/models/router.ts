@@ -7,7 +7,6 @@
 
 import {
     ModelProvider,
-    ModelConfig,
     ModelHarness,
     ChatCompletionRequest,
     ChatCompletionResponse,

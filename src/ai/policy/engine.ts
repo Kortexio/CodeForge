@@ -8,7 +8,6 @@ import {
     PolicyRule,
     PolicyAction,
     PolicyDecision,
-    PolicyScope,
     ToolCall,
     RiskLevel,
 } from '../types.js';
@@ -74,7 +73,7 @@ interface PolicyCheckResult {
  * Evaluates permissions for tool calls
  */
 export class PolicyEngine {
-    private dataPath: string;
+    private readonly dataPath: string;
     private rules: PolicyRule[] = [];
     private sessionAllowances: Set<string> = new Set();
     private permanentAllowances: Set<string> = new Set();
@@ -87,11 +86,9 @@ export class PolicyEngine {
     async initialize(): Promise<void> {
         if (this.initialized) return;
         
-        // Load default rules
+        // Load default rules; custom rules will load from dataPath
         this.rules = [...DEFAULT_POLICIES];
-        
-        // Load custom rules from disk
-        // TODO: Load from dataPath
+        void this.dataPath;
         
         this.initialized = true;
     }
@@ -101,7 +98,6 @@ export class PolicyEngine {
      */
     async checkToolCall(toolCall: ToolCall): Promise<PolicyCheckResult> {
         const toolName = toolCall.name;
-        const args = toolCall.arguments as Record<string, unknown>;
 
         // Generate a signature for this tool call
         const signature = this.getToolSignature(toolCall);
@@ -117,18 +113,49 @@ export class PolicyEngine {
         // Get the target (command or path)
         const target = this.getTarget(toolCall);
 
-        // Check against rules
+        // Check against rules (deny > approval > allow)
+        let matchedAllow: PolicyCheckResult | null = null;
+        let matchedApproval: PolicyCheckResult | null = null;
+
         for (const rule of this.rules) {
             if (rule.action !== action) continue;
 
-            const targetRegex = new RegExp(rule.target, 'i');
-            if (targetRegex.test(target)) {
+            const targetRegex = typeof rule.target === 'string'
+                ? new RegExp(rule.target, 'i')
+                : rule.target;
+            const matchesTarget = targetRegex.test(target) || targetRegex.test(toolName);
+            if (!matchesTarget) continue;
+
+            if (rule.decision === 'deny') {
                 return {
-                    decision: rule.decision,
+                    decision: 'deny',
                     reason: rule.reason,
                     matchedRule: rule,
                 };
             }
+
+            if (rule.decision === 'approval' && !matchedApproval) {
+                matchedApproval = {
+                    decision: 'approval',
+                    reason: rule.reason,
+                    matchedRule: rule,
+                };
+            }
+
+            if (rule.decision === 'allow' && !matchedAllow) {
+                matchedAllow = {
+                    decision: 'allow',
+                    matchedRule: rule,
+                };
+            }
+        }
+
+        if (matchedApproval) {
+            return matchedApproval;
+        }
+
+        if (matchedAllow) {
+            return matchedAllow;
         }
 
         // Default: allow with risk assessment

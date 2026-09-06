@@ -5,7 +5,6 @@
  */
 
 import * as path from 'path';
-import { Artifact } from '../ai/types.js';
 
 /**
  * Screenshot Manager
@@ -13,11 +12,18 @@ import { Artifact } from '../ai/types.js';
  * Stores and compares screenshots
  */
 export class ScreenshotManager {
-    private dataPath: string;
+    private readonly dataPath: string;
     private screenshots: Map<string, ScreenshotInfo> = new Map();
 
     constructor(dataPath: string) {
         this.dataPath = path.join(dataPath, 'screenshots');
+    }
+
+    /**
+     * Get storage path
+     */
+    getDataPath(): string {
+        return this.dataPath;
     }
 
     /**

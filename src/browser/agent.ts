@@ -183,8 +183,11 @@ export class BrowserAgent {
             const tagName = await element.evaluate((el: Element) => el.tagName.toLowerCase());
             const attrs = await element.evaluate((el: Element) => {
                 const result: Record<string, string> = {};
-                for (const attr of el.attributes) {
-                    result[attr.name] = attr.value;
+                for (let i = 0; i < el.attributes.length; i++) {
+                    const attr = el.attributes.item(i);
+                    if (attr) {
+                        result[attr.name] = attr.value;
+                    }
                 }
                 return result;
             });
@@ -227,7 +230,7 @@ export class BrowserAgent {
         try {
             // Dynamic import to avoid hard dependency
             const playwright = await import('playwright');
-            return playwright;
+            return playwright as unknown as PlaywrightLike;
         } catch {
             return null;
         }

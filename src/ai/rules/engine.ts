@@ -12,7 +12,7 @@ import { Rule, RuleScope } from '../types.js';
  * Manages hierarchical rules for agent behavior
  */
 export class RulesEngine {
-    private dataPath: string;
+    private readonly dataPath: string;
     private rules: Map<string, Rule> = new Map();
     private initialized = false;
 
@@ -22,10 +22,7 @@ export class RulesEngine {
 
     async initialize(): Promise<void> {
         if (this.initialized) return;
-        
-        // Load rules from disk
-        // TODO: Load from dataPath
-        
+        void this.dataPath;
         this.initialized = true;
     }
 

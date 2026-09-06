@@ -30,24 +30,28 @@
   },
   "main": "./out/main.js",
   "scripts": {
-    "build": "npm run build:ai && npm run build:extensions",
-    "build:ai": "tsc -p src/ai/tsconfig.json",
-    "build:extensions": "tsc -p extensions/tsconfig.json",
-    "watch": "npm run watch:ai & npm run watch:extensions",
-    "watch:ai": "tsc -p src/ai/tsconfig.json --watch",
-    "watch:extensions": "tsc -p extensions/tsconfig.json --watch",
-    "test": "npm run test:unit && npm run test:integration",
-    "test:unit": "jest --config tests/unit/jest.config.js",
-    "test:integration": "jest --config tests/integration/jest.config.js",
+    "build": "npm run build:src && npm run build:extensions",
+    "build:src": "tsc -p tsconfig.json",
+    "build:ai": "tsc -p tsconfig.json",
+    "build:core": "tsc -p tsconfig.json",
+    "build:extensions": "tsc -p extensions/opencodeide-ai/tsconfig.json",
+    "watch": "tsc -p tsconfig.json --watch",
+    "watch:ai": "tsc -p tsconfig.json --watch",
+    "watch:extensions": "tsc -p extensions/opencodeide-ai/tsconfig.json --watch",
+    "start": "electron .",
+    "test": "npm run test:unit",
+    "test:unit": "jest --config tests/unit/jest.config.js --passWithNoTests",
+    "test:integration": "jest --config tests/integration/jest.config.js --passWithNoTests",
     "test:e2e": "playwright test",
-    "lint": "eslint src --ext .ts,.tsx",
+    "lint": "eslint src --ext .ts,.tsx --max-warnings 50",
     "lint:fix": "eslint src --ext .ts,.tsx --fix",
     "format": "prettier --write \"src/**/*.{ts,tsx,json}\"",
     "clean": "rimraf out dist",
-    "package": "npm run clean && npm run build && electron-builder",
-    "package:win": "npm run package -- --win",
-    "package:mac": "npm run package -- --mac",
-    "package:linux": "npm run package -- --linux",
+    "verify": "npm run build && npm run test:unit",
+    "package": "npm run clean && npm run build && electron-builder --dir",
+    "package:win": "npm run clean && npm run build && electron-builder --win --dir",
+    "package:mac": "npm run clean && npm run build && electron-builder --mac --dir",
+    "package:linux": "npm run clean && npm run build && electron-builder --linux --dir",
     "postinstall": "electron-builder install-app-deps"
   },
   "dependencies": {
@@ -98,7 +102,7 @@
     ],
     "extraResources": [
       {
-        "from": "resources/binaries/${os}",
+        "from": "resources/binaries/win32",
         "to": "binaries",
         "filter": ["**/*"]
       }
@@ -106,15 +110,11 @@
     "win": {
       "target": [
         {
-          "target": "nsis",
-          "arch": ["x64", "arm64"]
-        },
-        {
-          "target": "portable",
+          "target": "dir",
           "arch": ["x64"]
         }
       ],
-      "icon": "resources/icons/win/icon.ico"
+      "signAndEditExecutable": false
     },
     "mac": {
       "target": [

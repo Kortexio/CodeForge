@@ -6,7 +6,7 @@
  */
 
 import { spawn } from 'child_process';
-import { SandboxLevel, SandboxOptions, SandboxResult } from '../types.js';
+import { SandboxOptions, SandboxResult } from '../types.js';
 
 const DEFAULT_TIMEOUT = 30000; // 30 seconds
 const DEFAULT_MEMORY_LIMIT = 512 * 1024 * 1024; // 512MB

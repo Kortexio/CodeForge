@@ -6,7 +6,7 @@
 
 import { CodeIndex, IncrementalIndexer } from './indexer.js';
 import { HybridSearch, SearchResult } from './search.js';
-import { SymbolExtractor, Symbol } from './symbols.js';
+import { Symbol } from './symbols.js';
 
 export interface CodeIntelligenceConfig {
     workspacePath: string;
@@ -20,19 +20,15 @@ export interface CodeIntelligenceConfig {
  * Provides repository understanding capabilities
  */
 export class CodeIntelligenceEngine {
-    private config: CodeIntelligenceConfig;
     private index: CodeIndex;
     private indexer: IncrementalIndexer;
-    private search: HybridSearch;
-    private symbolExtractor: SymbolExtractor;
+    private hybridSearch: HybridSearch;
     private initialized = false;
 
     constructor(config: CodeIntelligenceConfig) {
-        this.config = config;
         this.index = new CodeIndex(config.dataPath);
         this.indexer = new IncrementalIndexer(this.index, config.workspacePath);
-        this.search = new HybridSearch(this.index);
-        this.symbolExtractor = new SymbolExtractor();
+        this.hybridSearch = new HybridSearch(this.index);
     }
 
     /**
@@ -63,7 +59,7 @@ export class CodeIntelligenceEngine {
      * Search for code
      */
     async search(query: string, options?: SearchOptions): Promise<SearchResult[]> {
-        return this.search.search(query, options);
+        return this.hybridSearch.search(query, options);
     }
 
     /**

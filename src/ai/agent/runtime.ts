@@ -8,10 +8,8 @@
 import { v4 as uuid } from 'uuid';
 import {
     AgentState,
-    AgentEvent,
     AgentTask,
     AgentResult,
-    ChatMessage,
     ToolCall,
     ToolResult,
     FileChange,
@@ -243,8 +241,7 @@ export class AgentRuntime {
                             };
                         }
 
-                        // Add tool result to context
-                        this.stateMachine.transition('observing');
+                        // Add tool result to context (toolResult already moved us to observing)
                         await this.memory.addToolResult(session.id, toolCall, result);
                     }
                 }

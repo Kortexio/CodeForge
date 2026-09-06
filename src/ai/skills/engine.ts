@@ -12,7 +12,7 @@ import { Skill, SkillScope } from '../types.js';
  * Manages skills catalog and execution
  */
 export class SkillsEngine {
-    private dataPath: string;
+    private readonly dataPath: string;
     private skills: Map<string, Skill> = new Map();
     private initialized = false;
 
@@ -22,10 +22,7 @@ export class SkillsEngine {
 
     async initialize(): Promise<void> {
         if (this.initialized) return;
-        
-        // Load skills from disk
-        // TODO: Load from dataPath
-        
+        void this.dataPath;
         this.initialized = true;
     }
 

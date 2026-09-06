@@ -40,6 +40,13 @@ export class SubagentOrchestrator {
     }
 
     /**
+     * Get available tools for subagent filtering
+     */
+    getAvailableTools(): string[] {
+        return this.tools.getSchemas().map(t => t.name);
+    }
+
+    /**
      * Delegate a task to a subagent
      */
     async delegate(toolCall: ToolCall, depth: number): Promise<ToolResult> {

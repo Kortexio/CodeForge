@@ -114,7 +114,7 @@ export class ContextEngine {
         wiki: { workingMemory: { objective: string; plan: string[]; blockers: string[] } } | null,
         skills: Array<{ name: string; content: string }>,
         rules: Array<{ name: string; content: string }>,
-        query: string
+        _query: string
     ): string {
         const parts: string[] = [];
 

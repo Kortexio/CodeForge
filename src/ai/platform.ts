@@ -92,7 +92,10 @@ export class AIPlatform {
     async initialize(): Promise<void> {
         if (this.initialized) return;
 
-        this.trace.log('platform', 'Initializing AI Platform...');
+        this.trace.log('platform', 'Initializing AI Platform...', {
+            dataPath: this.config.dataPath,
+            workspace: this.config.workspacePath,
+        });
 
         try {
             // Initialize in dependency order
@@ -107,6 +110,10 @@ export class AIPlatform {
             await this.tools.initialize();
             await this.context.initialize();
             await this.agent.initialize();
+
+            if (this.config.workspacePath) {
+                this.tools.setWorkspace(this.config.workspacePath);
+            }
 
             this.initialized = true;
             this.trace.log('platform', 'AI Platform initialized successfully');
