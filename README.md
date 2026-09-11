@@ -4,9 +4,11 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![CI](https://img.shields.io/github/actions/workflow/status/Kortexio/CodeForge/ci.yml?branch=master&label=CI)](https://github.com/Kortexio/CodeForge/actions)
 
-**An open-source, model-independent, memory-native, agentic coding IDE** — a Cursor-style AI coding experience you run yourself.
+**An open-source, model-independent, memory-native, agentic coding IDE.**
 
-CodeForge is an AI-native code editor built on [Code-OSS](https://github.com/microsoft/vscode). One Windows install, your own models (cloud or local), no Docker required. Search: *Cursor AI alternative*, *open source AI IDE*, *Ollama coding agent*.
+CodeForge is an AI-native code editor built on [Code-OSS](https://github.com/microsoft/vscode). One Windows install, your own models (cloud or local), no Docker required.
+
+Also discoverable via: *Cursor AI*, *Cursor-style AI IDE*, *open source AI coding IDE*, *Ollama coding agent*.
 
 > **Download:** [Latest Windows installer](https://github.com/Kortexio/CodeForge/releases/latest) · **Source of truth:** [`extensions/codeforge/`](extensions/codeforge/)
 
@@ -124,11 +126,11 @@ Artifact: `dist/codeforge-win32-x64/CodeForge-Setup-<version>-win32-x64.exe`
 
 ## Discoverability
 
-Search on GitHub for **CodeForge**, **Cursor AI**, **AI coding IDE**, or topics below.
+Search on GitHub for **CodeForge**, **AI coding IDE**, **Cursor AI**, or topics below.
 
 - Repo: [github.com/Kortexio/CodeForge](https://github.com/Kortexio/CodeForge)
 - Releases: [github.com/Kortexio/CodeForge/releases](https://github.com/Kortexio/CodeForge/releases)
-- Topics: `cursor` · `cursor-ai` · `ai-ide` · `ide` · `ai` · `vscode` · `code-oss` · `openai` · `ollama` · `agent` · `mcp` · `llm` · `coding-agent`
+- Topics: `ide` · `ai` · `vscode` · `code-oss` · `openai` · `ollama` · `agent` · `mcp` · `electron` · `typescript` · `cursor` · `cursor-ai` · `ai-ide` · `ai-coding` · `coding-agent` · `llm`
 
 ## License
 
