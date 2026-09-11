@@ -72,6 +72,38 @@ export function builtinSkills(): SkillItem[] {
 				'One file patch per error cluster, then rebuild. Do not rewrite Models/Services/Views all at once.',
 			].join('\n'),
 		},
+		{
+			id: 'skill.harness-weak-models',
+			kind: 'skill',
+			title: 'Harness for weak (~27B) models',
+			description: 'Tight loops, plan-first, TDD, verify APIs — for small local models',
+			triggers: [
+				'implement',
+				'fix',
+				'feature',
+				'criar',
+				'implementar',
+				'bug',
+				'refactor',
+				'weak',
+				'harness',
+			],
+			enabled: true,
+			builtin: true,
+			updatedAt: now(),
+			content: [
+				'You are running under the weak-model harness. Shrink work until it fits a short context.',
+				'1. BEFORE any production write: wiki_write id=task-plan with a numbered checklist + Definition of Done (build/test/endpoint criteria).',
+				'2. One file / one concern per edit turn. Prefer surgical patches over rewrites.',
+				'3. TDD-first when adding behavior: write a failing test, run it (red), then implement until green.',
+				'4. Never invent API signatures — confirm with symbols/definition/search (or package docs) first.',
+				'5. Prefer retrieve with small k over dumping whole files. Act from CONTEXT PACKET.',
+				'6. After EACH production write: run build (or test). Do not batch many writes before validating.',
+				'7. Prefer scaffolding (dotnet new, generators) over hand-rolled project structure.',
+				'8. Record durable paths/versions/decisions with wiki_fact — do not re-derive from memory.',
+				'9. When the DoD is met: stop tools and summarize briefly.',
+			].join('\n'),
+		},
 	];
 }
 
@@ -121,6 +153,39 @@ export function builtinRules(): RuleItem[] {
 			content:
 				'After meaningful writes, run dotnet build (or the project build command). If it fails, fix errors before adding features.',
 		},
+		{
+			id: 'rule.plan-before-code',
+			kind: 'rule',
+			title: 'Plan before code',
+			description: 'Checklist + DoD before mutating',
+			enabled: true,
+			builtin: true,
+			updatedAt: now(),
+			content:
+				'For non-trivial tasks, write a short plan (wiki task-plan) with checklist and verifiable Definition of Done before the first production write.',
+		},
+		{
+			id: 'rule.one-file-turn',
+			kind: 'rule',
+			title: 'One file per turn',
+			description: 'Limit files touched per edit round',
+			enabled: true,
+			builtin: true,
+			updatedAt: now(),
+			content:
+				'Prefer at most 1–2 files per write round. Validate with build/test before spreading changes.',
+		},
+		{
+			id: 'rule.verify-apis',
+			kind: 'rule',
+			title: 'Verify APIs',
+			description: 'Do not invent signatures',
+			enabled: true,
+			builtin: true,
+			updatedAt: now(),
+			content:
+				'Never guess framework/library method signatures. Use symbols, definition, search, or package metadata first.',
+		},
 	];
 }
 
@@ -150,7 +215,7 @@ export function builtinPolicies(): PolicyItem[] {
 			builtin: true,
 			updatedAt: now(),
 			params: {
-				maxWritesWithoutBuild: 4,
+				maxWritesWithoutBuild: 1,
 			},
 			content:
 				'If more than N file writes occur without a successful build/test shell, force a build before more writes (when the matching guardrail is on).',
@@ -199,10 +264,37 @@ export function builtinGuardrails(): GuardrailItem[] {
 			builtin: true,
 			updatedAt: now(),
 			params: {
-				maxWritesWithoutBuild: 4,
+				maxWritesWithoutBuild: 1,
 			},
 			content:
 				'Hard: after N successful writes without a build/test shell, block more writes and require `dotnet build` (or equivalent).',
+		},
+		{
+			id: 'guard.require-plan-before-writes',
+			kind: 'guardrail',
+			gateId: 'require_plan_before_writes',
+			title: 'Require plan before writes',
+			description: 'Block first production write until wiki task-plan exists',
+			enabled: true,
+			builtin: true,
+			updatedAt: now(),
+			content:
+				'Hard: before the first write/delete/rename, require wiki document id=task-plan (or fact plan.ready=true) with checklist + Definition of Done.',
+		},
+		{
+			id: 'guard.require-failing-test-before-impl',
+			kind: 'guardrail',
+			gateId: 'require_failing_test_before_impl',
+			title: 'TDD: failing test before impl',
+			description: 'Under weak harness, require a red test before production writes',
+			enabled: true,
+			builtin: true,
+			updatedAt: now(),
+			params: {
+				maxImplWritesAfterRed: 3,
+			},
+			content:
+				'Hard (when weak profile is active): block production writes until a test command has failed once; test files are always allowed.',
 		},
 		{
 			id: 'guard.preserve-build-errors',

@@ -31,8 +31,9 @@ import {
 	generateAgentsMd,
 	loadAgentsMdForPrompt,
 } from '../agent/projectInstructions';
+import { isWeakModel, resolveWeakModelMode } from '../agent/weakModelProfile';
 
-type AgentMode = 'ask' | 'agent' | 'auto';
+type AgentMode = 'ask' | 'plan' | 'agent' | 'auto';
 type Permissions = PermissionLevel;
 
 interface TimelineItem {
@@ -61,6 +62,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 	private _mode: AgentMode = 'agent';
 	private _permissions: Permissions = 'default';
 	private _contextBadge = { indexed: 0, inContext: 0 };
+	private _weakHarness = false;
 	private _pendingAttachments: PendingAttachment[] = [];
 	private _pendingImages: Array<{ mime: string; dataUrl: string; label?: string }> = [];
 	private _hasAgentsMd = false;
@@ -92,6 +94,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		void agentsMdExists().then(v => {
 			this._hasAgentsMd = v;
 			this.pushConfig();
+		});
+		vscode.workspace.onDidChangeConfiguration(e => {
+			if (
+				e.affectsConfiguration('codeforge.ai.collapseToolCards') ||
+				e.affectsConfiguration('codeforge.ai.enabled')
+			) {
+				this.updateView();
+			}
 		});
 	}
 
@@ -315,6 +325,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 	async runTask(task: string, mode?: AgentMode) {
 		if (mode) {
 			await this.setMode(mode);
+		}
+		const aiEnabled =
+			vscode.workspace.getConfiguration('codeforge.ai').get<boolean>('enabled') !== false;
+		if (!aiEnabled) {
+			this.addMessage('user', task);
+			this.addMessage(
+				'assistant',
+				'AI Agent is disabled. Enable it in Settings → AI → Agent (`codeforge.ai.enabled`), then try again.'
+			);
+			return;
 		}
 		if (this._running) {
 			this.enqueueMessage(task, mode);
@@ -592,10 +612,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		return 'Add server in Settings';
 	}
 
+	private detectWeakHarness(server: { baseUrl?: string; numCtx?: number } | null | undefined, model: string | null | undefined): boolean {
+		const mode = resolveWeakModelMode(
+			vscode.workspace.getConfiguration('codeforge.ai').get<string>('weakModelMode')
+		);
+		return isWeakModel(
+			{ modelId: model, baseUrl: server?.baseUrl, numCtx: server?.numCtx },
+			mode
+		);
+	}
+
 	private pushConfig() {
 		if (!this._view) return;
 		const { server, model } = this._store.getActiveSelection();
 		const configured = Boolean(server);
+		this._weakHarness = this.detectWeakHarness(server, model);
 		this._view.description = this.getModelLabel();
 		this._view.webview.postMessage({
 			type: 'config',
@@ -609,6 +640,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			workspace: this._bridge.getWorkspaceRoot() ?? null,
 			badge: this._contextBadge,
 			hasAgentsMd: this._hasAgentsMd,
+			weakHarness: this._weakHarness,
 			slashCommands: SLASH_COMMANDS,
 			attachments: this._pendingAttachments.map(a => ({
 				id: a.id,
@@ -702,6 +734,47 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			);
 		}
 
+		const weakProfile = this.detectWeakHarness(server, activeModel);
+		this._weakHarness = weakProfile;
+		this.pushConfig();
+
+		if (this._mode === 'plan') {
+			const cfgAgentPlan = vscode.workspace.getConfiguration('codeforge.ai');
+			return runAgentWithTools({
+				bridge: this._bridge,
+				provider,
+				apiKey,
+				model: activeModel,
+				baseUrl,
+				workspaceRoot: root,
+				task,
+				images,
+				history: this.getHistoryForLlm(),
+				cancelled: () => this._cancelled,
+				abortSignal: this._abort?.signal,
+				numCtx: server.numCtx,
+				forceJson: server.forceJson === true,
+				onStatus: text => {
+					if (/^Running\s/i.test(text)) {
+						return;
+					}
+					this.updateLastMessage('assistant', text, 'pending');
+				},
+				onActivity: ev => this.pushActivity(ev),
+				onContextBadge: badge => {
+					this._contextBadge = badge;
+					this.pushConfig();
+				},
+				onTaskUpdate: this._onTaskUpdate,
+				sessionStore: this._sessions,
+				sessionId: this._currentSessionId,
+				maxSteps: cfgAgentPlan.get<number>('agentCheckpointSteps') ?? 20,
+				hardCap: cfgAgentPlan.get<number>('agentHardCap') ?? 100,
+				weakProfile,
+				planMode: true,
+			});
+		}
+
 		const lower = task.toLowerCase();
 		if (lower.includes('list') && (lower.includes('file') || lower.includes('dir') || lower.includes('pasta'))) {
 			const result = await this._bridge.execute({
@@ -779,6 +852,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			sessionId: this._currentSessionId,
 			maxSteps: cfgAgent.get<number>('agentCheckpointSteps') ?? 20,
 			hardCap: cfgAgent.get<number>('agentHardCap') ?? 100,
+			weakProfile,
 		});
 	}
 
@@ -969,6 +1043,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 				this.addMessage('user', '/ask');
 				this.addMessage('assistant', 'Switched to Ask mode.');
 				return true;
+			case 'plan':
+				await this.setMode('plan');
+				this.addMessage('user', '/plan');
+				this.addMessage(
+					'assistant',
+					'Switched to Plan mode — explore the repo and save a wiki task-plan (no implementation writes).'
+				);
+				return true;
 			case 'agent':
 				await this.setPermissions('default');
 				this.addMessage('user', '/agent');
@@ -1018,10 +1100,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
 	private updateView() {
 		if (this._view) {
+			const collapseToolCards =
+				vscode.workspace.getConfiguration('codeforge.ai').get<boolean>('collapseToolCards') !==
+				false;
 			this._view.webview.postMessage({
 				type: 'updateMessages',
 				messages: this._messages,
 				timeline: this._timeline,
+				collapseToolCards,
 			});
 		}
 	}
@@ -1335,10 +1421,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   <div class="topbar">
     <div class="modes" role="tablist">
       <button type="button" id="modeAgent" class="active" data-mode="agent">Agent</button>
+      <button type="button" id="modePlan" data-mode="plan">Plan</button>
       <button type="button" id="modeAsk" data-mode="ask">Ask</button>
       <button type="button" id="modeAuto" data-mode="auto">Auto</button>
     </div>
     <div class="spacer"></div>
+    <span class="badge" id="weakBadge" title="Weak-model harness active" style="display:none">Weak harness</span>
     <span class="badge" id="contextBadge" title="Indexed paths · in context">0 · 0</span>
     <button type="button" class="chip" id="modelChip" title="Switch model">model</button>
     <button type="button" class="icon-btn" id="settingsBtn" title="Settings">⚙</button>
@@ -1389,6 +1477,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   let permissions = 'default';
   let busy = false;
   let timeline = [];
+  let collapseToolCards = true;
   let slashCommands = [];
   let hasAgentsMd = false;
   let slashOpen = false;
@@ -1402,8 +1491,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   const modelChip = document.getElementById('modelChip');
   const modeHint = document.getElementById('modeHint');
   const modeAgent = document.getElementById('modeAgent');
+  const modePlan = document.getElementById('modePlan');
   const modeAsk = document.getElementById('modeAsk');
   const modeAuto = document.getElementById('modeAuto');
+  const weakBadge = document.getElementById('weakBadge');
   const contextBadge = document.getElementById('contextBadge');
   const attachRow = document.getElementById('attachRow');
   const composerBox = document.getElementById('composerBox');
@@ -1454,12 +1545,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   function setMode(next) {
-    mode = next === 'ask' ? 'ask' : next === 'auto' ? 'auto' : 'agent';
+    mode = next === 'ask' ? 'ask' : next === 'plan' ? 'plan' : next === 'auto' ? 'auto' : 'agent';
     modeAgent.classList.toggle('active', mode === 'agent');
+    if (modePlan) modePlan.classList.toggle('active', mode === 'plan');
     modeAsk.classList.toggle('active', mode === 'ask');
     modeAuto.classList.toggle('active', mode === 'auto');
     modeHint.textContent = mode === 'ask'
       ? 'Ask answers without running tools'
+      : mode === 'plan'
+        ? 'Plan: explore + wiki plan only (no code writes)'
       : mode === 'auto'
         ? 'Auto-approves edits + shell this session'
         : permissions === 'assisted'
@@ -1469,11 +1563,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       ? 'Add to queue… Enter queues while Agent is working'
       : (mode === 'ask'
         ? 'Ask about the codebase… Type / for commands'
+        : mode === 'plan'
+          ? 'Describe the feature to plan… Type / for commands'
         : 'Plan, search, edit… Type / for commands');
     vscode.postMessage({ type: 'setMode', mode });
   }
 
   modeAgent.addEventListener('click', () => setMode('agent'));
+  if (modePlan) modePlan.addEventListener('click', () => setMode('plan'));
   modeAsk.addEventListener('click', () => setMode('ask'));
   modeAuto.addEventListener('click', () => setMode('auto'));
 	modelChip.addEventListener('click', () => {
@@ -1691,13 +1788,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       input.focus();
     }
     if (msg.type === 'config') {
-      mode = msg.mode === 'ask' ? 'ask' : msg.mode === 'auto' ? 'auto' : 'agent';
+      mode = msg.mode === 'ask' ? 'ask' : msg.mode === 'plan' ? 'plan' : msg.mode === 'auto' ? 'auto' : 'agent';
       permissions = msg.permissions === 'assisted' || msg.permissions === 'allowAll' ? msg.permissions : 'default';
       slashCommands = msg.slashCommands || [];
       hasAgentsMd = !!msg.hasAgentsMd;
       modeAgent.classList.toggle('active', mode === 'agent');
+      if (modePlan) modePlan.classList.toggle('active', mode === 'plan');
       modeAsk.classList.toggle('active', mode === 'ask');
       modeAuto.classList.toggle('active', mode === 'auto');
+      if (weakBadge) weakBadge.style.display = msg.weakHarness ? '' : 'none';
       syncPermChip();
       modelChip.textContent = msg.configured
         ? ((msg.serverName || msg.provider || 'server') + (msg.model ? ' · ' + msg.model : ' · add a model'))
@@ -1707,6 +1806,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         ? 'Open Settings (⚙) to add a server'
         : mode === 'ask'
           ? 'Ask answers without running tools'
+          : mode === 'plan'
+            ? 'Plan: explore + wiki plan only (no code writes)'
           : mode === 'auto'
             ? 'Auto-approves edits + shell this session'
             : (permissions === 'assisted' ? 'Agent with edit preview' : 'Agent can use workspace tools');
@@ -1745,6 +1846,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
     if (msg.type === 'updateMessages') {
       if (msg.timeline) timeline = msg.timeline;
+      if (typeof msg.collapseToolCards === 'boolean') {
+        collapseToolCards = msg.collapseToolCards;
+      }
       renderMessages(msg.messages || []);
       busy = (msg.messages || []).some(m => m.status === 'pending');
       document.body.classList.toggle('busy', busy);
@@ -1781,7 +1885,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       bindEmptyCtas();
       return;
     }
-    const roleLabel = mode === 'ask' ? 'Ask' : mode === 'auto' ? 'Auto' : 'Agent';
+    const roleLabel = mode === 'ask' ? 'Ask' : mode === 'plan' ? 'Plan' : mode === 'auto' ? 'Auto' : 'Agent';
     const tools = timeline.filter(t => t.kind === 'tool');
     const other = timeline.filter(t => t.kind !== 'tool');
     const toolHtml = tools.length
@@ -1790,8 +1894,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           const detail = t.detail
             ? '<div class="body">' + escapeHtml(t.detail) + '</div>'
             : '';
+          const open =
+            st === 'running' || (!collapseToolCards && st !== 'running');
           return '<details class="tool-card ' + escapeHtml(st) + '"' +
-            (st === 'running' ? ' open' : '') + '>' +
+            (open ? ' open' : '') + '>' +
             '<summary><span class="badge">' + escapeHtml(st) + '</span>' +
             '<span>' + escapeHtml(t.label) + '</span></summary>' + detail + '</details>';
         }).join('') + '</div>'
@@ -1994,7 +2100,7 @@ function looksLikeContinue(text: string): boolean {
 }
 
 function normalizeMode(mode: unknown): AgentMode {
-	if (mode === 'ask' || mode === 'auto') return mode;
+	if (mode === 'ask' || mode === 'plan' || mode === 'auto') return mode;
 	return 'agent';
 }
 

@@ -68,12 +68,24 @@ export class ProjectWikiStore {
 	}
 
 	async save(): Promise<void> {
-		if (!this.root) return;
+		if (!this.root) {
+			throw new Error(
+				'Project wiki is not initialized (no workspace memory root). Open a folder and retry.'
+			);
+		}
 		const data: WikiFile = {
 			documents: Array.from(this.docs.values()),
 			facts: Array.from(this.facts.values()),
 		};
 		await fs.writeFile(this.filePath(), JSON.stringify(data, null, 2), 'utf8');
+	}
+
+	private ensureReady(): void {
+		if (!this.ready || !this.root) {
+			throw new Error(
+				'Project wiki is not initialized. Open a workspace folder before using wiki_write / wiki_fact.'
+			);
+		}
 	}
 
 	listDocuments(): WikiDocument[] {
@@ -92,6 +104,7 @@ export class ProjectWikiStore {
 		content: string,
 		category = 'general'
 	): Promise<WikiDocument> {
+		this.ensureReady();
 		const now = new Date().toISOString();
 		const existing = this.docs.get(id);
 		const doc: WikiDocument = existing
@@ -140,6 +153,7 @@ export class ProjectWikiStore {
 	}
 
 	async addFact(key: string, value: string, reason?: string): Promise<TemporalFact> {
+		this.ensureReady();
 		const now = new Date().toISOString();
 		// Supersede any current fact with same key
 		for (const f of this.facts.values()) {
@@ -230,5 +244,14 @@ export function getProjectWikiStore(): ProjectWikiStore {
 export async function initProjectWiki(workspaceFolder?: string): Promise<ProjectWikiStore> {
 	const store = getProjectWikiStore();
 	await store.initialize(workspaceFolder);
+	return store;
+}
+
+/** Ensure wiki is bound to the current workspace (no-op if already ready for that root). */
+export async function ensureProjectWiki(workspaceFolder?: string): Promise<ProjectWikiStore> {
+	const store = getProjectWikiStore();
+	if (!store.isReady() || workspaceFolder) {
+		await store.initialize(workspaceFolder);
+	}
 	return store;
 }

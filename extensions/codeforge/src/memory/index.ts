@@ -15,6 +15,7 @@ export {
 	ProjectWikiStore,
 	getProjectWikiStore,
 	initProjectWiki,
+	ensureProjectWiki,
 	type WikiDocument,
 	type TemporalFact,
 } from './projectWiki';

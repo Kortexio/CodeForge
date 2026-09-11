@@ -1,27 +1,35 @@
 # CodeForge
 
+[![GitHub release](https://img.shields.io/github/v/release/Kortexio/CodeForge?include_prereleases&sort=semver)](https://github.com/Kortexio/CodeForge/releases/latest)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![CI](https://img.shields.io/github/actions/workflow/status/Kortexio/CodeForge/ci.yml?branch=master&label=CI)](https://github.com/Kortexio/CodeForge/actions)
+
 **An open-source, model-independent, memory-native, agentic coding IDE.**
 
-CodeForge is an AI-native code editor built on Code-OSS with a fully embedded AI platform. One installation, no Docker required.
+CodeForge is an AI-native code editor built on [Code-OSS](https://github.com/microsoft/vscode). One Windows install, your own models (cloud or local), no Docker required.
 
-> **Shipped surface:** `extensions/codeforge/` (built into `CodeForge.exe`). The legacy `src/` tree is frozen reference code and will be removed.
+> **Download:** [Latest Windows installer](https://github.com/Kortexio/CodeForge/releases/latest) · **Source of truth:** [`extensions/codeforge/`](extensions/codeforge/)
 
-## Features
+## Why CodeForge?
 
-- **Embedded AI Platform**: Complete AI capabilities built into the IDE
-- **Model Independence**: Use OpenAI, Anthropic, Google, Ollama, or any OpenAI-compatible provider
-- **Persistent Memory**: Session wiki, project wiki, and temporal facts on disk
-- **Multi-file Agent**: AI agent that can plan, edit, and validate changes across your codebase
-- **Code Intelligence**: Hybrid search (lexical + semantic embeddings)
-- **MCP Support**: Inbound tools + outbound wiki server
-- **Tab Completion**: Low-latency inline completions with your model
-- **Browser Agent**: Visual testing and web automation (Playwright optional)
-- **Git Intelligence**: Status, diff, blame, conflicts, commit messages
-- **Sandbox**: safe-local / restricted / isolated shell levels
+| | CodeForge |
+|---|---|
+| Models | OpenAI, Anthropic, Gemini, xAI, OpenRouter, Ollama, vLLM, LM Studio, any OpenAI-compatible API |
+| Agent | Multi-file agent with approvals, Plan / Ask / Agent / Auto modes |
+| Weak local models | Auto harness for ~≤34B models (plan-first, TDD gate, build-after-write) |
+| Memory | Session wiki, project wiki, stable facts on disk (`~/.CodeForge/`) |
+| Governance | Editable skills, rules, policies, hard guardrails |
+| MCP | Inbound tools + outbound wiki server |
 
-## Quick Start
+## Install (Windows)
 
-### Full IDE (Code-OSS + AI extension)
+1. Open **[Releases](https://github.com/Kortexio/CodeForge/releases/latest)**
+2. Download `CodeForge-Setup-*-win32-x64.exe`
+3. Run the installer (per-user under `%LOCALAPPDATA%\Programs\CodeForge`)
+
+Or build from source (below).
+
+## Quick Start (development)
 
 ```bash
 git clone https://github.com/Kortexio/CodeForge.git
@@ -35,12 +43,25 @@ npm run vscode:dev       # launch CodeForge with AI sidebar
 
 See [docs/code-oss-integration.md](docs/code-oss-integration.md) for details.
 
+## Features
+
+- **Embedded AI Platform** — agent, chat, settings, and tools inside the IDE
+- **Model Independence** — bring your own API keys or local servers
+- **Plan mode** — explore + write a wiki plan without mutating source
+- **Weak-model harness** — automatic tighter guardrails for small/local LLMs
+- **Persistent Memory** — session/project wiki and temporal facts
+- **Code Intelligence** — hybrid search (lexical + semantic embeddings)
+- **MCP Support** — inbound tools + outbound wiki server
+- **Tab Completion** — inline completions with your model
+- **Browser Agent** — visual checks (Playwright optional)
+- **Git Intelligence** — status, diff, blame, conflicts, commit messages
+
 ## Architecture
 
 ```
 CodeForge/
 ├── extensions/codeforge/   # Shipped AI platform (source of truth)
-│   ├── src/agent/               # Agent loop, context, wiki hooks
+│   ├── src/agent/               # Agent loop, context, weak-model harness
 │   ├── src/memory/              # Session + project wiki + temporal facts
 │   ├── src/storage/             # ~/.CodeForge paths, sessions, artifacts, traces
 │   ├── src/context/             # Context budget / ranking
@@ -58,54 +79,28 @@ See [docs/architecture.md](docs/architecture.md) for the full component model.
 
 ## Configuration
 
-### Model Providers
+Prefer **CodeForge Settings** (Models / MCP / Guardrails / Agent) in the app.
 
-Configure your preferred AI model provider in **CodeForge AI Settings** (or Settings JSON):
-
-```json
-{
-  "codeforge.ai.provider": "anthropic",
-  "codeforge.ai.apiKey": "your-api-key",
-  "codeforge.ai.model": "claude-3-sonnet-20240229"
-}
-```
-
-Supported providers:
-- OpenAI
-- Anthropic
-- Google (Gemini)
-- xAI (Grok)
-- OpenRouter
-- Ollama (local)
-- vLLM (self-hosted)
-- LM Studio (local)
-- Any OpenAI-compatible endpoint
-
-### MCP Servers
+Legacy mirrors (active server only):
 
 ```json
 {
-  "CodeForge.mcp.servers": [
-    {
-      "name": "github",
-      "transport": "stdio",
-      "command": "npx",
-      "args": ["@modelcontextprotocol/server-github"]
-    }
-  ]
+  "codeforge.ai.mode": "agent",
+  "codeforge.ai.weakModelMode": "auto"
 }
 ```
+
+Supported providers: OpenAI, Anthropic, Google (Gemini), xAI, OpenRouter, Ollama, vLLM, LM Studio, custom OpenAI-compatible endpoints.
 
 ## Development
 
 ### Prerequisites
 
 - Node.js matching `vscode/.nvmrc` (for full IDE builds)
-- npm
-- Git
+- npm, Git
 - On Windows: Visual Studio C++ workload + Spectre-mitigated libs
 
-### Building
+### Building & tests
 
 ```bash
 npm install
@@ -127,9 +122,17 @@ Requires Inno Setup: `winget install JRSoftware.InnoSetup`
 
 Artifact: `dist/codeforge-win32-x64/CodeForge-Setup-<version>-win32-x64.exe`
 
+## Discoverability
+
+Search on GitHub for **CodeForge**, **AI coding IDE**, or topics below.
+
+- Repo: [github.com/Kortexio/CodeForge](https://github.com/Kortexio/CodeForge)
+- Releases: [github.com/Kortexio/CodeForge/releases](https://github.com/Kortexio/CodeForge/releases)
+- Topics: `ide` · `ai` · `vscode` · `code-oss` · `openai` · `ollama` · `agent` · `mcp` · `electron` · `typescript`
+
 ## License
 
-MIT License - see [LICENSE](LICENSE) for details.
+MIT License — see [LICENSE](LICENSE) for details.
 
 ## Contributing
 

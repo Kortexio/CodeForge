@@ -1,9 +1,9 @@
 /**
  * CodeForge AI Settings — Cursor-like editor panel
  *
- * Tabs: Models · MCP
- * - Models: manage servers (API / local), model lists, pick active model
- * - MCP: add/enable MCP servers
+ * Tabs: Models · MCP · Guardrails · Agent
+ * - Models / MCP / Guardrails: catalog UIs (same surface the Settings TOC opens)
+ * - Agent: codeforge.ai.* prefs (shared with Settings TOC → AI → Agent)
  *
  * Quick model switch while coding stays on QuickPick (separate command).
  */
@@ -22,6 +22,41 @@ import {
 import { GovernanceStore } from '../governance/governanceStore';
 import { GovernanceKind, GovernanceItem } from '../governance/types';
 
+export type AiSettingsTab = 'models' | 'mcp' | 'guardrails' | 'agent';
+
+type AgentPrefs = {
+	enabled: boolean;
+	mode: string;
+	weakModelMode: string;
+	collapseToolCards: boolean;
+	autoApprove: string[];
+	autoApproveEdits: boolean;
+	previewEdits: boolean;
+	traceLevel: string;
+	tabCompletion: boolean;
+	agentCheckpointSteps: number;
+	agentHardCap: number;
+	contextBudget: number;
+};
+
+function readAgentPrefs(): AgentPrefs {
+	const cfg = vscode.workspace.getConfiguration('codeforge.ai');
+	return {
+		enabled: cfg.get<boolean>('enabled', true),
+		mode: cfg.get<string>('mode', 'agent'),
+		weakModelMode: cfg.get<string>('weakModelMode', 'auto'),
+		collapseToolCards: cfg.get<boolean>('collapseToolCards', true),
+		autoApprove: cfg.get<string[]>('autoApprove', []),
+		autoApproveEdits: cfg.get<boolean>('autoApproveEdits', false),
+		previewEdits: cfg.get<boolean>('previewEdits', false),
+		traceLevel: cfg.get<string>('traceLevel', 'basic'),
+		tabCompletion: cfg.get<boolean>('tabCompletion', true),
+		agentCheckpointSteps: cfg.get<number>('agentCheckpointSteps', 20),
+		agentHardCap: cfg.get<number>('agentHardCap', 100),
+		contextBudget: cfg.get<number>('contextBudget', 32768),
+	};
+}
+
 export class AiSettingsPanel {
 	public static readonly viewType = 'codeforge.settings';
 	private static current: AiSettingsPanel | undefined;
@@ -32,12 +67,14 @@ export class AiSettingsPanel {
 	static show(
 		context: vscode.ExtensionContext,
 		store: AiSettingsStore,
-		governance: GovernanceStore
+		governance: GovernanceStore,
+		tab: AiSettingsTab = 'models'
 	) {
 		const column = vscode.window.activeTextEditor?.viewColumn ?? vscode.ViewColumn.One;
 
 		if (AiSettingsPanel.current) {
 			AiSettingsPanel.current.panel.reveal(column);
+			AiSettingsPanel.current.selectTab(tab);
 			AiSettingsPanel.current.postState();
 			return AiSettingsPanel.current;
 		}
@@ -53,18 +90,19 @@ export class AiSettingsPanel {
 			}
 		);
 
-		AiSettingsPanel.current = new AiSettingsPanel(panel, store, governance);
+		AiSettingsPanel.current = new AiSettingsPanel(panel, store, governance, tab);
 		return AiSettingsPanel.current;
 	}
 
 	private constructor(
 		panel: vscode.WebviewPanel,
 		private readonly store: AiSettingsStore,
-		private readonly governance: GovernanceStore
+		private readonly governance: GovernanceStore,
+		initialTab: AiSettingsTab
 	) {
 		this.panel = panel;
 		this.panel.iconPath = undefined;
-		this.panel.webview.html = this.html();
+		this.panel.webview.html = this.html(initialTab);
 		this.postState();
 
 		this.disposables.push(
@@ -73,8 +111,17 @@ export class AiSettingsPanel {
 			}),
 			this.store.onDidChange(() => this.postState()),
 			this.governance.onDidChange(() => this.postState()),
+			vscode.workspace.onDidChangeConfiguration(e => {
+				if (e.affectsConfiguration('codeforge.ai')) {
+					this.postState();
+				}
+			}),
 			this.panel.onDidDispose(() => this.dispose())
 		);
+	}
+
+	selectTab(tab: AiSettingsTab) {
+		void this.panel.webview.postMessage({ type: 'selectTab', tab });
 	}
 
 	private postState() {
@@ -83,6 +130,7 @@ export class AiSettingsPanel {
 			type: 'state',
 			state: sanitizeForWebview(state),
 			governance: this.governance.getState(),
+			agent: readAgentPrefs(),
 		});
 	}
 
@@ -93,6 +141,32 @@ export class AiSettingsPanel {
 			case 'ready':
 				this.postState();
 				return;
+
+			case 'updateAgentPrefs': {
+				const prefs = msg.prefs as Partial<AgentPrefs>;
+				const cfg = vscode.workspace.getConfiguration('codeforge.ai');
+				const entries: Array<[keyof AgentPrefs, unknown]> = [
+					['enabled', prefs.enabled],
+					['mode', prefs.mode],
+					['weakModelMode', prefs.weakModelMode],
+					['collapseToolCards', prefs.collapseToolCards],
+					['autoApprove', prefs.autoApprove],
+					['autoApproveEdits', prefs.autoApproveEdits],
+					['previewEdits', prefs.previewEdits],
+					['traceLevel', prefs.traceLevel],
+					['tabCompletion', prefs.tabCompletion],
+					['agentCheckpointSteps', prefs.agentCheckpointSteps],
+					['agentHardCap', prefs.agentHardCap],
+					['contextBudget', prefs.contextBudget],
+				];
+				for (const [key, value] of entries) {
+					if (value !== undefined) {
+						await cfg.update(key, value, vscode.ConfigurationTarget.Global);
+					}
+				}
+				this.postState();
+				return;
+			}
 
 			case 'addServer': {
 				const kind = (msg.kind as ServerKind) || 'openai';
@@ -259,12 +333,13 @@ export class AiSettingsPanel {
 		}
 	}
 
-	private html(): string {
+	private html(initialTab: AiSettingsTab = 'models'): string {
 		const kinds = (
 			['openai', 'anthropic', 'google', 'xai', 'openrouter', 'ollama', 'vllm', 'lmstudio', 'custom'] as ServerKind[]
 		)
 			.map(k => `<option value="${k}">${kindLabel(k)}</option>`)
 			.join('');
+		const tabActive = (t: AiSettingsTab) => (t === initialTab ? 'active' : '');
 
 		return `<!DOCTYPE html>
 <html lang="en">
@@ -341,6 +416,7 @@ export class AiSettingsPanel {
     width: 100%; border: 1px solid var(--input-border); background: var(--input);
     color: var(--input-fg); border-radius: 6px; padding: 7px 10px; font: inherit;
   }
+  input[type="checkbox"] { width: auto; margin-right: 8px; }
   textarea { min-height: 64px; resize: vertical; }
   .actions { display: flex; gap: 8px; flex-wrap: wrap; }
   button.primary, button.secondary, button.danger {
@@ -382,16 +458,17 @@ export class AiSettingsPanel {
   .params .param-row { display: grid; grid-template-columns: 1fr 120px; gap: 8px; align-items: center; }
 </style>
 </head>
-<body>
+<body data-initial-tab="${initialTab}">
 <div class="shell">
   <aside class="nav">
     <div class="brand">CodeForge</div>
-    <button class="active" data-tab="models">Models</button>
-    <button data-tab="mcp">MCP</button>
-    <button data-tab="guardrails">Guardrails</button>
+    <button class="${tabActive('models')}" data-tab="models">Models</button>
+    <button class="${tabActive('mcp')}" data-tab="mcp">MCP</button>
+    <button class="${tabActive('guardrails')}" data-tab="guardrails">Guardrails</button>
+    <button class="${tabActive('agent')}" data-tab="agent">Agent</button>
   </aside>
   <main class="main">
-    <section id="tab-models" class="split active">
+    <section id="tab-models" class="split ${tabActive('models')}">
       <h1>Models</h1>
       <p class="subtitle">Add API or local servers, manage their models, and choose what’s active. While coding, use the model QuickPick to switch quickly.</p>
 
@@ -405,7 +482,7 @@ export class AiSettingsPanel {
       <div class="empty" id="serversEmpty">No servers yet. Click <strong>Add server</strong> above, enter your API key or local URL, then fetch models.</div>
     </section>
 
-    <section id="tab-mcp" class="split">
+    <section id="tab-mcp" class="split ${tabActive('mcp')}">
       <h1>MCP</h1>
       <p class="subtitle">Model Context Protocol servers give the agent extra tools (docs, browsers, databases…).</p>
       <div class="toolbar">
@@ -415,7 +492,7 @@ export class AiSettingsPanel {
       <div class="empty" id="mcpEmpty">No MCP servers configured.</div>
     </section>
 
-    <section id="tab-guardrails" class="split">
+    <section id="tab-guardrails" class="split ${tabActive('guardrails')}">
       <h1>Skills · Rules · Policies · Guardrails</h1>
       <p class="subtitle">Soft guidance plus hard IDE enforcement. Toggle, edit, or add custom items. Built-ins can be disabled or reset, not deleted.</p>
       <div class="subtabs">
@@ -430,21 +507,78 @@ export class AiSettingsPanel {
       </div>
       <div id="govList"></div>
     </section>
+
+    <section id="tab-agent" class="split ${tabActive('agent')}">
+      <h1>Agent</h1>
+      <p class="subtitle">Same preferences as Settings → AI → Agent / Approvals / Context / Completion. Changes sync both ways.</p>
+      <div class="card" id="agentForm"><div class="card-body">
+        <div class="row"><label><input type="checkbox" id="agentEnabled" /> Enable AI Agent</label></div>
+        <div class="row"><label>Mode</label>
+          <select id="agentMode">
+            <option value="ask">ask</option>
+            <option value="plan">plan</option>
+            <option value="agent">agent</option>
+            <option value="auto">auto</option>
+          </select>
+        </div>
+        <div class="row"><label>Weak model mode</label>
+          <select id="agentWeakMode">
+            <option value="auto">auto</option>
+            <option value="force">force</option>
+            <option value="off">off</option>
+          </select>
+        </div>
+        <div class="row"><label><input type="checkbox" id="agentCollapse" /> Collapse completed tool cards</label></div>
+        <div class="row"><label>Trace level</label>
+          <select id="agentTrace">
+            <option value="none">none</option>
+            <option value="basic">basic</option>
+            <option value="detailed">detailed</option>
+          </select>
+        </div>
+        <div class="row"><label>Checkpoint every N steps</label><input type="number" id="agentCheckpoint" min="5" max="50" /></div>
+        <div class="row"><label>Hard cap (max steps)</label><input type="number" id="agentHardCap" min="20" max="200" /></div>
+        <h2>Approvals</h2>
+        <div class="row"><label>Auto-approve tools (comma-separated)</label><input type="text" id="agentAutoApprove" placeholder="read, list, grep" /></div>
+        <div class="row"><label><input type="checkbox" id="agentAutoApproveEdits" /> Auto-approve file edits</label></div>
+        <div class="row"><label><input type="checkbox" id="agentPreviewEdits" /> Preview edits before write</label></div>
+        <h2>Context &amp; Completion</h2>
+        <div class="row"><label>Context budget (fallback tokens)</label>
+          <select id="agentContextBudget">
+            <option value="8192">8192</option>
+            <option value="16384">16384</option>
+            <option value="32768">32768</option>
+            <option value="65536">65536</option>
+          </select>
+        </div>
+        <div class="row"><label><input type="checkbox" id="agentTabCompletion" /> Tab completion</label></div>
+        <div class="actions">
+          <button class="primary" id="agentSave">Save</button>
+        </div>
+      </div></div>
+    </section>
   </main>
 </div>
 <script>
   const vscode = acquireVsCodeApi();
   let state = { servers: [], activeServerId: null, activeModel: null, mcpServers: [] };
   let governance = { skills: [], rules: [], policies: [], guardrails: [] };
+  let agent = {};
   let govKind = 'skills';
+  let agentDirty = false;
+
+  function selectTab(tab) {
+    const btn = document.querySelector('.nav button[data-tab="' + tab + '"]');
+    if (!btn) return;
+    document.querySelectorAll('.nav button').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    document.querySelectorAll('.split').forEach(s => s.classList.remove('active'));
+    const section = document.getElementById('tab-' + tab);
+    if (section) section.classList.add('active');
+  }
 
   document.querySelectorAll('.nav button').forEach(btn => {
-    btn.addEventListener('click', () => {
-      document.querySelectorAll('.nav button').forEach(b => b.classList.remove('active'));
-      btn.classList.add('active');
-      document.querySelectorAll('.split').forEach(s => s.classList.remove('active'));
-      document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
-    });
+    btn.addEventListener('click', () => selectTab(btn.dataset.tab));
   });
 
   document.querySelectorAll('.subtabs button').forEach(btn => {
@@ -469,13 +603,68 @@ export class AiSettingsPanel {
     vscode.postMessage({ type: 'govAdd', kind });
   });
 
+  function markAgentDirty() { agentDirty = true; }
+  ['agentEnabled','agentMode','agentWeakMode','agentCollapse','agentTrace','agentCheckpoint','agentHardCap','agentAutoApprove','agentAutoApproveEdits','agentPreviewEdits','agentContextBudget','agentTabCompletion']
+    .forEach(id => {
+      const el = document.getElementById(id);
+      if (el) el.addEventListener('change', markAgentDirty);
+      if (el && el.tagName === 'INPUT' && el.type === 'text') el.addEventListener('input', markAgentDirty);
+    });
+
+  document.getElementById('agentSave').addEventListener('click', () => {
+    const autoApprove = document.getElementById('agentAutoApprove').value
+      .split(',')
+      .map(s => s.trim())
+      .filter(Boolean);
+    vscode.postMessage({
+      type: 'updateAgentPrefs',
+      prefs: {
+        enabled: document.getElementById('agentEnabled').checked,
+        mode: document.getElementById('agentMode').value,
+        weakModelMode: document.getElementById('agentWeakMode').value,
+        collapseToolCards: document.getElementById('agentCollapse').checked,
+        autoApprove,
+        autoApproveEdits: document.getElementById('agentAutoApproveEdits').checked,
+        previewEdits: document.getElementById('agentPreviewEdits').checked,
+        traceLevel: document.getElementById('agentTrace').value,
+        tabCompletion: document.getElementById('agentTabCompletion').checked,
+        agentCheckpointSteps: Number(document.getElementById('agentCheckpoint').value),
+        agentHardCap: Number(document.getElementById('agentHardCap').value),
+        contextBudget: Number(document.getElementById('agentContextBudget').value),
+      }
+    });
+    agentDirty = false;
+  });
+
+  function renderAgent() {
+    if (agentDirty || !agent) return;
+    document.getElementById('agentEnabled').checked = !!agent.enabled;
+    document.getElementById('agentMode').value = agent.mode || 'agent';
+    document.getElementById('agentWeakMode').value = agent.weakModelMode || 'auto';
+    document.getElementById('agentCollapse').checked = !!agent.collapseToolCards;
+    document.getElementById('agentTrace').value = agent.traceLevel || 'basic';
+    document.getElementById('agentCheckpoint').value = agent.agentCheckpointSteps ?? 20;
+    document.getElementById('agentHardCap').value = agent.agentHardCap ?? 100;
+    document.getElementById('agentAutoApprove').value = (agent.autoApprove || []).join(', ');
+    document.getElementById('agentAutoApproveEdits').checked = !!agent.autoApproveEdits;
+    document.getElementById('agentPreviewEdits').checked = !!agent.previewEdits;
+    document.getElementById('agentContextBudget').value = String(agent.contextBudget ?? 32768);
+    document.getElementById('agentTabCompletion').checked = !!agent.tabCompletion;
+  }
+
   window.addEventListener('message', (e) => {
+    if (e.data.type === 'selectTab') {
+      selectTab(e.data.tab);
+      return;
+    }
     if (e.data.type === 'state') {
       state = e.data.state;
       governance = e.data.governance || governance;
+      agent = e.data.agent || agent;
       withPreservedScroll(() => {
         render();
         renderGov();
+        renderAgent();
       });
     }
   });
@@ -911,6 +1100,7 @@ export class AiSettingsPanel {
   }
 
   vscode.postMessage({ type: 'ready' });
+  selectTab(document.body.dataset.initialTab || 'models');
 </script>
 </body>
 </html>`;

@@ -242,3 +242,129 @@ const chatViewDescriptor: IViewDescriptor = {
 		}
 	}
 }
+
+// CodeForge: top-level Settings TOC entry "AI" (between Chat and Features).
+const settingsLayoutPath = path.join(
+	root,
+	'vscode',
+	'src',
+	'vs',
+	'workbench',
+	'contrib',
+	'preferences',
+	'browser',
+	'settingsLayout.ts'
+);
+if (fs.existsSync(settingsLayoutPath)) {
+	let layoutSrc = fs.readFileSync(settingsLayoutPath, 'utf8');
+	const aiTocUnifiedMarker = "id: 'ai/models'";
+	const featuresAnchor = `\t\t{
+			id: 'features',
+			label: localize('features', "Features"),`;
+	const aiNode = `\t\t{
+			id: 'ai',
+			label: localize('ai', "AI"),
+			children: [
+				{
+					id: 'ai/models',
+					label: localize('aiModels', "Models"),
+					settings: ['codeforge.ai.openModels']
+				},
+				{
+					id: 'ai/mcp',
+					label: localize('aiMcp', "MCP"),
+					settings: ['codeforge.ai.openMcp']
+				},
+				{
+					id: 'ai/guardrails',
+					label: localize('aiGuardrails', "Guardrails"),
+					settings: ['codeforge.ai.openGuardrails']
+				},
+				{
+					id: 'ai/agent',
+					label: localize('aiAgent', "Agent"),
+					settings: [
+						'codeforge.ai.enabled',
+						'codeforge.ai.mode',
+						'codeforge.ai.weakModelMode',
+						'codeforge.ai.agent*',
+						'codeforge.ai.collapse*',
+						'codeforge.ai.traceLevel',
+						'codeforge.ai.autoApprove*',
+						'codeforge.ai.previewEdits',
+						'codeforge.ai.contextBudget',
+						'codeforge.ai.tabCompletion'
+					]
+				}
+			]
+		},
+`;
+
+	if (layoutSrc.includes(aiTocUnifiedMarker) && layoutSrc.includes("localize('ai', \"AI\")")) {
+		console.log('AI Settings TOC (Models/MCP/Guardrails/Agent) already present in settingsLayout.ts');
+	} else {
+		const aiStart = layoutSrc.indexOf("\t\t{\n\t\t\tid: 'ai',");
+		const featuresStart = layoutSrc.indexOf(featuresAnchor);
+		if (aiStart >= 0 && featuresStart > aiStart) {
+			layoutSrc = layoutSrc.slice(0, aiStart) + aiNode + layoutSrc.slice(featuresStart);
+			fs.writeFileSync(settingsLayoutPath, layoutSrc, 'utf8');
+			console.log('Patched settingsLayout.ts: unified AI TOC with CodeForge Settings sections');
+		} else if (featuresStart >= 0) {
+			layoutSrc = layoutSrc.replace(featuresAnchor, aiNode + featuresAnchor);
+			fs.writeFileSync(settingsLayoutPath, layoutSrc, 'utf8');
+			console.log('Patched settingsLayout.ts: inserted AI TOC between Chat and Features');
+		} else {
+			console.warn('Could not find Features TOC anchor in settingsLayout.ts — upstream may have changed');
+		}
+	}
+}
+
+// CodeForge: promote extension settings into top-level AI TOC (core resolve drops empty AI node).
+const settingsEditor2Path = path.join(
+	root,
+	'vscode',
+	'src',
+	'vs',
+	'workbench',
+	'contrib',
+	'preferences',
+	'browser',
+	'settingsEditor2.ts'
+);
+if (fs.existsSync(settingsEditor2Path)) {
+	let editorSrc = fs.readFileSync(settingsEditor2Path, 'utf8');
+	const promoteMarker = 'CodeForge: extension settings are not matched by core tocData resolve';
+	if (editorSrc.includes(promoteMarker)) {
+		console.log('AI TOC promote patch already present in settingsEditor2.ts');
+	} else {
+		const promoteOld = `		resolvedSettingsRoot.children!.push(await createTocTreeForExtensionSettings(this.extensionService, extensionSettingsGroups, filter));
+
+		resolvedSettingsRoot.children!.unshift(getCommonlyUsedData(groups));`;
+		const promoteNew = `		// CodeForge: extension settings are not matched by core tocData resolve, so the AI node
+		// would disappear. Promote kortexio.codeforge into the top-level AI TOC (between Chat and Features).
+		const codeforgeExtId = 'kortexio.codeforge';
+		const codeforgeSettingsGroups = extensionSettingsGroups.filter(g => g.extensionInfo?.id.toLowerCase() === codeforgeExtId);
+		const otherExtensionSettingsGroups = extensionSettingsGroups.filter(g => g.extensionInfo?.id.toLowerCase() !== codeforgeExtId);
+		const aiTocTemplate = tocData.children?.find(child => child.id === 'ai');
+		if (aiTocTemplate && codeforgeSettingsGroups.length) {
+			const aiTree = resolveSettingsTree(aiTocTemplate, codeforgeSettingsGroups, filter, this.logService).tree;
+			const featuresIdx = resolvedSettingsRoot.children!.findIndex(child => child.id === 'features');
+			if (featuresIdx >= 0) {
+				resolvedSettingsRoot.children!.splice(featuresIdx, 0, aiTree);
+			} else {
+				resolvedSettingsRoot.children!.push(aiTree);
+			}
+		}
+
+		resolvedSettingsRoot.children!.push(await createTocTreeForExtensionSettings(this.extensionService, otherExtensionSettingsGroups, filter));
+
+		resolvedSettingsRoot.children!.unshift(getCommonlyUsedData(groups));`;
+		if (editorSrc.includes(promoteOld)) {
+			editorSrc = editorSrc.replace(promoteOld, promoteNew);
+			fs.writeFileSync(settingsEditor2Path, editorSrc, 'utf8');
+			console.log('Patched settingsEditor2.ts: promote CodeForge settings into AI TOC');
+		} else {
+			console.warn('Could not find settingsEditor2 extension TOC push — upstream may have changed');
+		}
+	}
+}

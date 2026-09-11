@@ -2,7 +2,7 @@
   "name": "codeforge",
   "displayName": "CodeForge AI",
   "description": "AI Agent sidebar and approval UI for CodeForge",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "publisher": "kortexio",
   "engines": {
     "vscode": "^1.90.0"
@@ -178,8 +178,13 @@
       }
     ],
     "configuration": {
-      "title": "CodeForge AI",
+      "title": "AI",
       "properties": {
+        "codeforge.ai.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable the CodeForge AI Agent. When disabled, the Agent sidebar will not run tasks."
+        },
         "codeforge.ai.provider": {
           "type": "string",
           "enum": [
@@ -194,32 +199,53 @@
             "custom"
           ],
           "default": "openai",
-          "description": "AI model provider"
+          "markdownDescription": "Mirror of the **active** server in [CodeForge Settings](command:codeforge.openSettings). Manage multiple providers there — this value is overwritten on save.",
+          "deprecationMessage": "Use CodeForge Settings (Models → Add Server) to manage providers. This setting only mirrors the active server."
         },
         "codeforge.ai.apiKey": {
           "type": "string",
           "default": "",
-          "description": "API key for the selected provider"
+          "scope": "application",
+          "markdownDescription": "Mirror of the active server API key. Edit keys in [CodeForge Settings](command:codeforge.openSettings).",
+          "deprecationMessage": "Use CodeForge Settings to manage API keys per server. This setting only mirrors the active server."
         },
         "codeforge.ai.model": {
           "type": "string",
           "default": "",
-          "description": "Model to use for AI tasks (set via CodeForge AI Settings)"
+          "markdownDescription": "Mirror of the active model. Pick models in [CodeForge Settings](command:codeforge.openSettings).",
+          "deprecationMessage": "Use CodeForge Settings to manage models per server. This setting only mirrors the active model."
         },
         "codeforge.ai.baseUrl": {
           "type": "string",
           "default": "",
-          "description": "Custom base URL for API requests (for self-hosted models)"
+          "markdownDescription": "Mirror of the active server base URL. Edit URLs in [CodeForge Settings](command:codeforge.openSettings).",
+          "deprecationMessage": "Use CodeForge Settings to manage base URLs per server. This setting only mirrors the active server."
         },
         "codeforge.ai.mode": {
           "type": "string",
           "enum": [
             "ask",
+            "plan",
             "agent",
             "auto"
           ],
           "default": "agent",
-          "description": "Default AI interaction mode (Ask = answers only, Agent = tools with approvals, Auto = agent + auto-approve edits and shell for the session)"
+          "description": "Default AI interaction mode (Ask = answers only, Plan = explore + wiki plan, Agent = tools with approvals, Auto = agent + auto-approve)"
+        },
+        "codeforge.ai.weakModelMode": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "force",
+            "off"
+          ],
+          "default": "auto",
+          "markdownDescription": "Weak-model harness: **auto** detects small/local models (~≤34B) and tightens guardrails; **force** always on; **off** disables."
+        },
+        "codeforge.ai.collapseToolCards": {
+          "type": "boolean",
+          "default": true,
+          "description": "Collapse completed tool cards in the Agent chat, keeping only running tools expanded"
         },
         "codeforge.ai.autoApprove": {
           "type": "array",
@@ -232,12 +258,12 @@
         "codeforge.ai.autoApproveEdits": {
           "type": "boolean",
           "default": false,
-          "description": "Cursor-like: automatically apply all file edits (write/rename/delete) without asking"
+          "description": "Automatically apply all file edits (write/rename/delete) without asking"
         },
         "codeforge.ai.previewEdits": {
           "type": "boolean",
           "default": false,
-          "description": "Show DiffPreview before writing existing files (off by default; Cursor-like apply-on-accept)"
+          "description": "Show DiffPreview before writing existing files (off by default)"
         },
         "codeforge.ai.traceLevel": {
           "type": "string",
@@ -259,20 +285,35 @@
           "default": 20,
           "minimum": 5,
           "maximum": 50,
-          "description": "Evaluate agent progress every N steps; extend budget on positive reviews"
+          "description": "Checkpoint every N steps: evaluate agent progress and extend budget on positive reviews"
         },
         "codeforge.ai.agentHardCap": {
           "type": "number",
           "default": 100,
           "minimum": 20,
           "maximum": 200,
-          "description": "Absolute maximum agent steps (checkpoints at 20/40/60/80/100…)"
+          "description": "Max steps per agent task (absolute hard cap)"
         },
         "codeforge.ai.contextBudget": {
           "type": "number",
           "default": 32768,
           "enum": [8192, 16384, 32768, 65536],
           "description": "Fallback context window (tokens) when the active server has no num_ctx. Prefer setting num_ctx per server in CodeForge AI Settings."
+        },
+        "codeforge.ai.openModels": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Manage API/local servers and models in **[CodeForge Settings → Models](command:codeforge.openSettings?%5B%22models%22%5D)** (Add Server, keys, fetch models). Same UI as the CodeForge Settings panel."
+        },
+        "codeforge.ai.openMcp": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Manage MCP servers in **[CodeForge Settings → MCP](command:codeforge.openSettings?%5B%22mcp%22%5D)**. Same UI as the CodeForge Settings panel."
+        },
+        "codeforge.ai.openGuardrails": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Manage Skills, Rules, Policies and Guardrails in **[CodeForge Settings → Guardrails](command:codeforge.openSettings?%5B%22guardrails%22%5D)**. Same UI as the CodeForge Settings panel."
         }
       }
     },

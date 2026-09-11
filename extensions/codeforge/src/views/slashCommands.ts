@@ -11,6 +11,7 @@ export const SLASH_COMMANDS: SlashCommand[] = [
 	{ name: 'help', description: 'List available slash commands' },
 	{ name: 'clear', description: 'Start a new chat' },
 	{ name: 'ask', description: 'Switch to Ask mode (no tools)' },
+	{ name: 'plan', description: 'Switch to Plan mode (explore + wiki plan only)' },
 	{ name: 'agent', description: 'Switch to Agent mode' },
 	{ name: 'auto', description: 'Switch to Auto mode (allow all this session)' },
 	{ name: 'permissions', description: 'Cycle Default → Assisted → Allow all' },

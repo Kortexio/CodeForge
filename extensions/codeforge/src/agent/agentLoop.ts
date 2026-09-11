@@ -631,7 +631,34 @@ export interface AgentLoopOptions {
 	/** Absolute hard cap (default 100). */
 	hardCap?: number;
 	depth?: number;
+	/** Weak-model harness for this run (auto-detected or forced). */
+	weakProfile?: boolean;
+	/**
+	 * Plan mode: allow explore + wiki tools only (no production writes/shell mutators).
+	 */
+	planMode?: boolean;
 }
+
+const PLAN_MODE_TOOLS = new Set([
+	'list',
+	'read',
+	'search',
+	'retrieve',
+	'diagnostics',
+	'symbols',
+	'references',
+	'definition',
+	'git_status',
+	'git_diff',
+	'git_log',
+	'git_blame',
+	'open',
+	'wiki_read',
+	'wiki_search',
+	'wiki_write',
+	'wiki_fact',
+	'wiki_facts',
+]);
 
 export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string> {
 	const checkpointSize = opts.maxSteps ?? 20;
@@ -646,10 +673,17 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 	const mcp = getMcp();
 	const mcpTools = mcp?.listTools() ?? [];
 	const governance = getGovernanceStore();
-	const gates = new GuardrailSession(governance.runtimeConfig());
+	const weakProfile = opts.weakProfile === true;
+	const gates = new GuardrailSession(
+		governance.runtimeConfig({
+			weakProfile,
+			requireFailingTestBeforeImpl: weakProfile,
+		})
+	);
 
+	const forceSkills = weakProfile ? ['skill.harness-weak-models'] : undefined;
 	const skillSection = [
-		governance.buildPromptSection(opts.task),
+		governance.buildPromptSection(opts.task, { forceSkillIds: forceSkills }),
 		getSkillsRules().buildPromptSection(
 			opts.task,
 			collectOpenFilePaths(opts.workspaceRoot)
@@ -661,6 +695,17 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 		? `MCP tools available via mcp_call: ${mcpTools.map(t => t.fullName).join(', ')}`
 		: '';
 	const agentsMdSection = await loadAgentsMdForPrompt();
+
+	const planModeHint = opts.planMode
+		? [
+				'### PLAN MODE (active)',
+				'You may explore the repo and write a plan to the wiki (wiki_write id=task-plan with checklist + Definition of Done).',
+				'Do NOT implement: no write/delete/rename of source files, no mutating shell. When the plan is saved, stop and summarize the plan.',
+			].join('\n')
+		: '';
+	const weakHint = weakProfile
+		? '### WEAK MODEL HARNESS: keep steps tiny; plan first; TDD; verify APIs; build after each write.'
+		: '';
 
 	const systemBase = [
 		'You are CodeForge Agent, a coding agent inside a VS Code-based IDE on Windows.',
@@ -687,6 +732,8 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 		opts.proseToolsOnly
 			? 'This model does NOT support native tools. You MUST reply with ONLY JSON tool_calls in content (no markdown). Example: {"tool_calls":[{"id":"call_1","type":"function","function":{"name":"retrieve","arguments":{"query":"..."}}}]}'
 			: '',
+		planModeHint,
+		weakHint,
 		agentsMdSection,
 		skillSection,
 		mcpHint,
@@ -1531,6 +1578,25 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					continue;
 				}
 
+				if (opts.planMode && !PLAN_MODE_TOOLS.has(name)) {
+					const planBlock =
+						`Blocked by Plan mode: tool "${name}" is not allowed. ` +
+						`Use explore/wiki tools only, save task-plan via wiki_write, then switch to Agent to implement.`;
+					messages.push({
+						role: 'tool',
+						tool_call_id: call.id,
+						name,
+						content: planBlock,
+					});
+					pendingNudges.push(planBlock);
+					actions.push(`${name} blocked (plan mode)`);
+					continue;
+				}
+
+				if (name === 'write' || name === 'delete' || name === 'rename') {
+					gates.markMutatingWriteAllowed();
+				}
+
 				const hookPre = await runAgentHooks(
 					'preToolUse',
 					{ tool: name, args, workspaceRoot: opts.workspaceRoot },
@@ -2038,7 +2104,9 @@ async function executeTool(
 					? `# ${doc.title}\n\n${doc.content}`
 					: `Wiki document not found: ${id}`;
 			}
-			case 'wiki_write': {
+		case 'wiki_write': {
+				const { ensureProjectWiki } = await import('../memory/projectWiki');
+				await ensureProjectWiki(opts.workspaceRoot);
 				const wiki = getProjectWikiStore();
 				const doc = await wiki.upsertDocument(
 					String(args.id),
@@ -2055,6 +2123,8 @@ async function executeTool(
 					: 'No wiki matches.';
 			}
 			case 'wiki_fact': {
+				const { ensureProjectWiki } = await import('../memory/projectWiki');
+				await ensureProjectWiki(opts.workspaceRoot);
 				const fact = await getProjectWikiStore().addFact(
 					String(args.key),
 					String(args.value),

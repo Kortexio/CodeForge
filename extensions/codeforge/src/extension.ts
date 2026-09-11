@@ -164,8 +164,10 @@ export async function activate(context: vscode.ExtensionContext) {
     );
 
     context.subscriptions.push(
-        vscode.commands.registerCommand('codeforge.openSettings', () => {
-            AiSettingsPanel.show(context, settingsStore, governance);
+        vscode.commands.registerCommand('codeforge.openSettings', (tab?: string) => {
+            const allowed = new Set(['models', 'mcp', 'guardrails', 'agent']);
+            const initial = allowed.has(String(tab)) ? (tab as 'models' | 'mcp' | 'guardrails' | 'agent') : 'models';
+            AiSettingsPanel.show(context, settingsStore, governance, initial);
         })
     );
 

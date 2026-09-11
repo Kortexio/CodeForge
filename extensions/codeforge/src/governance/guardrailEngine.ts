@@ -4,8 +4,10 @@
 
 import { GuardrailRuntimeConfig } from './types';
 import { getGovernanceStore } from './governanceStore';
+import { getProjectWikiStore } from '../memory/projectWiki';
 
 const EXPLORE = new Set(['list', 'read', 'retrieve', 'search', 'grep', 'glob']);
+const MUTATING_FILE = new Set(['write', 'delete', 'rename']);
 
 export function isBuildOrTestCommand(command: unknown): boolean {
 	const c = String(command ?? '').toLowerCase();
@@ -13,9 +15,35 @@ export function isBuildOrTestCommand(command: unknown): boolean {
 		/\bdotnet\s+build\b/.test(c) ||
 		/\bdotnet\s+test\b/.test(c) ||
 		/\bnpm\s+run\s+build\b/.test(c) ||
+		/\bnpm\s+(test|run\s+test)\b/.test(c) ||
+		/\bpytest\b/.test(c) ||
 		/\bmvn\s+(-B\s+)?(package|test|verify)\b/.test(c) ||
-		/\bgradlew?\s+build\b/.test(c) ||
-		/\bcargo\s+(build|test)\b/.test(c)
+		/\bgradlew?\s+(build|test)\b/.test(c) ||
+		/\bcargo\s+(build|test)\b/.test(c) ||
+		/\bgo\s+test\b/.test(c)
+	);
+}
+
+export function isTestCommand(command: unknown): boolean {
+	const c = String(command ?? '').toLowerCase();
+	return (
+		/\bdotnet\s+test\b/.test(c) ||
+		/\bnpm\s+(test|run\s+test)\b/.test(c) ||
+		/\bpytest\b/.test(c) ||
+		/\bmvn\s+(-B\s+)?test\b/.test(c) ||
+		/\bgradlew?\s+test\b/.test(c) ||
+		/\bcargo\s+test\b/.test(c) ||
+		/\bgo\s+test\b/.test(c)
+	);
+}
+
+export function isTestFilePath(pathArg: unknown): boolean {
+	const p = String(pathArg ?? '').replace(/\\/g, '/');
+	return (
+		/\/tests?\//i.test(p) ||
+		/\.(tests?|spec)\.[^.]+$/i.test(p) ||
+		/[\\/][^/]*Tests?[\\/]/i.test(p) ||
+		/[\\/][^/]*Test\.[^/]+$/i.test(p)
 	);
 }
 
@@ -27,20 +55,52 @@ export function extractBuildErrorLines(output: string, limit = 20): string[] {
 		.slice(0, limit);
 }
 
+function hasTaskPlan(): boolean {
+	try {
+		const wiki = getProjectWikiStore();
+		if (!wiki.isReady()) return false;
+		const doc = wiki.getDocument('task-plan');
+		if (doc && doc.content.trim().length >= 40) return true;
+		const facts = wiki.currentFacts();
+		return facts.some(
+			f =>
+				f.key === 'plan.ready' &&
+				/^(true|yes|1|ready)$/i.test(String(f.value).trim())
+		);
+	} catch {
+		return false;
+	}
+}
+
 export class GuardrailSession {
 	buildRed = false;
 	lastBuildErrors: string[] = [];
 	writesSinceBuild = 0;
 	consecutiveFileWrites = 0;
 	lastWritePath: string | null = null;
+	testRedSeen = false;
+	implWritesAfterRed = 0;
+	private mutatingWriteSeen = false;
 
 	constructor(public cfg: GuardrailRuntimeConfig) {}
 
 	refreshConfig(): void {
-		this.cfg = getGovernanceStore().runtimeConfig();
+		const weak = this.cfg.weakProfile;
+		const next = getGovernanceStore().runtimeConfig({ weakProfile: weak });
+		this.cfg = { ...next, weakProfile: weak };
 	}
 
 	onShellResult(command: unknown, success: boolean, output: string): string | null {
+		if (isTestCommand(command)) {
+			if (!success) {
+				this.testRedSeen = true;
+				this.implWritesAfterRed = 0;
+			} else if (this.testRedSeen) {
+				this.testRedSeen = false;
+				this.implWritesAfterRed = 0;
+			}
+		}
+
 		if (!isBuildOrTestCommand(command)) {
 			return null;
 		}
@@ -78,6 +138,9 @@ export class GuardrailSession {
 			this.consecutiveFileWrites = 1;
 		}
 		this.lastWritePath = p || this.lastWritePath;
+		if (this.cfg.requireFailingTestBeforeImpl && this.testRedSeen && !isTestFilePath(p)) {
+			this.implWritesAfterRed += 1;
+		}
 	}
 
 	/** Returns a block message if the tool call must be rejected. */
@@ -95,6 +158,39 @@ export class GuardrailSession {
 				`Read/fix the error files or run build — do not ${tool} for broad exploration.\n` +
 				(this.lastBuildErrors.slice(0, 8).join('\n') || '')
 			);
+		}
+
+		if (MUTATING_FILE.has(tool)) {
+			if (this.cfg.requirePlanBeforeWrites && !this.mutatingWriteSeen && !hasTaskPlan()) {
+				return (
+					`Blocked by guardrail require_plan_before_writes: no wiki plan yet. ` +
+					`Call wiki_write with id "task-plan", a numbered checklist, and a verifiable Definition of Done — then retry the write.`
+				);
+			}
+
+			if (tool === 'write' || tool === 'delete' || tool === 'rename') {
+				const pathArg =
+					tool === 'rename' ? args.to ?? args.path : args.path;
+				if (
+					this.cfg.requireFailingTestBeforeImpl &&
+					!isTestFilePath(pathArg)
+				) {
+					if (!this.testRedSeen) {
+						return (
+							`Blocked by guardrail require_failing_test_before_impl (TDD): ` +
+							`write a failing test first, run it (dotnet test / npm test / …), then implement. ` +
+							`Test files are always allowed.`
+						);
+					}
+					if (this.implWritesAfterRed >= this.cfg.maxImplWritesAfterRed) {
+						return (
+							`Blocked by guardrail require_failing_test_before_impl: ` +
+							`${this.implWritesAfterRed} production writes since the last red test. ` +
+							`Re-run tests before more implementation writes.`
+						);
+					}
+				}
+			}
 		}
 
 		if (tool === 'write') {
@@ -130,6 +226,11 @@ export class GuardrailSession {
 		}
 
 		return null;
+	}
+
+	/** Call after a mutating file tool was allowed (not blocked). */
+	markMutatingWriteAllowed(): void {
+		this.mutatingWriteSeen = true;
 	}
 
 	compactStickyExtra(): string {

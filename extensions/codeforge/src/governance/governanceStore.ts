@@ -134,7 +134,7 @@ export class GovernanceStore {
 		} satisfies GuardrailItem;
 	}
 
-	buildPromptSection(task: string): string {
+	buildPromptSection(task: string, opts?: { forceSkillIds?: string[] }): string {
 		const state = this.getState();
 		const q = task.toLowerCase();
 		const rules = state.rules.filter(r => r.enabled).slice(0, 12);
@@ -142,13 +142,22 @@ export class GovernanceStore {
 			.filter(s => s.enabled)
 			.filter(
 				s =>
+					opts?.forceSkillIds?.includes(s.id) ||
 					s.triggers.some(t => q.includes(t.toLowerCase())) ||
 					s.title.toLowerCase().split(/\s+/).some(w => w.length > 3 && q.includes(w))
 			)
-			.slice(0, 4);
+			.slice(0, 6);
 		const workflow = state.skills.find(s => s.id === 'skill.agent-workflow' && s.enabled);
 		if (workflow && !skills.some(s => s.id === workflow.id)) {
 			skills.unshift(workflow);
+		}
+		const weakSkill = state.skills.find(s => s.id === 'skill.harness-weak-models' && s.enabled);
+		if (
+			weakSkill &&
+			opts?.forceSkillIds?.includes('skill.harness-weak-models') &&
+			!skills.some(s => s.id === weakSkill.id)
+		) {
+			skills.unshift(weakSkill);
 		}
 		const parts: string[] = [];
 		if (rules.length) {
@@ -180,7 +189,7 @@ export class GovernanceStore {
 		return parts.join('\n');
 	}
 
-	runtimeConfig(): GuardrailRuntimeConfig {
+	runtimeConfig(overrides?: Partial<GuardrailRuntimeConfig>): GuardrailRuntimeConfig {
 		const state = this.getState();
 		const on = (gateId: string) =>
 			state.guardrails.some(g => g.enabled && g.gateId === gateId);
@@ -194,25 +203,35 @@ export class GovernanceStore {
 		const maxWrites =
 			numParam(guard('require_build_after_writes')?.params, 'maxWritesWithoutBuild') ??
 			numParam(policyWrite?.params, 'maxWritesWithoutBuild') ??
-			4;
+			1;
 		const maxConsecutive =
 			numParam(guard('block_mass_rewrite')?.params, 'maxConsecutiveFileWrites') ?? 5;
 		const blockExplore =
 			boolParam(guard('build_fix_gate')?.params, 'blockExploreWhileBuildRed') ??
 			boolParam(policyFail?.params, 'blockExploreWhileBuildRed') ??
 			true;
+		const maxImplWritesAfterRed =
+			numParam(guard('require_failing_test_before_impl')?.params, 'maxImplWritesAfterRed') ?? 3;
 
-		return {
+		const weak = overrides?.weakProfile === true;
+		const base: GuardrailRuntimeConfig = {
 			buildFixGate: on('build_fix_gate'),
 			requireBuildAfterWrites: on('require_build_after_writes'),
-			maxWritesWithoutBuild: maxWrites,
+			maxWritesWithoutBuild: weak ? Math.min(maxWrites, 1) : maxWrites,
 			preserveBuildErrorsOnCompact: on('preserve_build_errors_on_compact'),
 			blockMassRewrite: on('block_mass_rewrite'),
 			maxConsecutiveFileWrites: maxConsecutive,
 			oneStackDotnet: on('one_stack_dotnet'),
 			antiExploreLoop: on('anti_explore_loop'),
 			blockExploreWhileBuildRed: blockExplore,
+			requirePlanBeforeWrites: on('require_plan_before_writes') && weak,
+			requireFailingTestBeforeImpl:
+				(on('require_failing_test_before_impl') && weak) ||
+				overrides?.requireFailingTestBeforeImpl === true,
+			maxImplWritesAfterRed,
+			weakProfile: weak,
 		};
+		return { ...base, ...overrides, weakProfile: weak || overrides?.weakProfile === true };
 	}
 }
 

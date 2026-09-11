@@ -61,4 +61,11 @@ export interface GuardrailRuntimeConfig {
 	antiExploreLoop: boolean;
 	/** Soft: still nudge; hard block explore tools while build is red. */
 	blockExploreWhileBuildRed: boolean;
+	/** Require wiki task-plan (or plan.ready fact) before first mutating write. */
+	requirePlanBeforeWrites: boolean;
+	/** TDD: require a failing test before production writes (usually weak profile). */
+	requireFailingTestBeforeImpl: boolean;
+	maxImplWritesAfterRed: number;
+	/** Runtime: weak-model harness active for this run. */
+	weakProfile: boolean;
 }
