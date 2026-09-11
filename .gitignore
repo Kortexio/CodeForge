@@ -80,3 +80,6 @@ model-cache/
 
 # Code-OSS clone (setup via: npm run vscode:setup)
 vscode/
+
+# Local planning docs (keep offline)
+BLUEPRINT-02-Open-Source-AI-IDE-Revised-Embedded-AI-Platform.md
