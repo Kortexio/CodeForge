@@ -1,42 +1,43 @@
-# Contributing to OpenCodeIDE
+# Contributing to CodeForge
 
-Thank you for your interest in contributing to OpenCodeIDE! This document provides guidelines for contributing.
+Thank you for your interest in contributing to CodeForge! This document provides guidelines for contributing.
 
 ## Getting Started
 
 ### Prerequisites
 
-- Node.js >= 20.0.0
-- npm >= 10.0.0
+- Node.js matching `vscode/.nvmrc` for full IDE builds (Node 20+ for extension-only work)
+- npm
 - Git
+- On Windows (full IDE): Visual Studio C++ workload + Spectre-mitigated libs
 
 ### Development Setup
 
 ```bash
-# Clone the repository
-git clone https://github.com/Kortexio/OpenCodeIDE.git
-cd OpenCodeIDE
-
-# Install dependencies
+git clone https://github.com/Kortexio/CodeForge.git
+cd CodeForge
 npm install
-
-# Build
-npm run build
-
-# Run tests
+npm run build:extensions
 npm test
+```
+
+Full IDE:
+
+```bash
+npm run vscode:setup
+npm run vscode:compile
+npm run vscode:dev
 ```
 
 ## Development Workflow
 
 1. Fork the repository
 2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Make your changes
+3. Make your changes **in `extensions/codeforge/`** (source of truth)
 4. Run tests (`npm test`)
 5. Run linting (`npm run lint`)
-6. Commit your changes (`git commit -m 'Add amazing feature'`)
-7. Push to the branch (`git push origin feature/amazing-feature`)
-8. Open a Pull Request
+6. Commit your changes
+7. Push and open a Pull Request
 
 ## Code Style
 
@@ -49,26 +50,22 @@ npm test
 ## Project Structure
 
 ```
-src/
-├── ai/                    # AI Platform
-│   ├── agent/            # Agent runtime
-│   ├── context/          # Context engine
-│   ├── memory/           # Memory engine
-│   ├── tools/            # Native tools
-│   ├── mcp/              # MCP runtime
-│   ├── skills/           # Skills engine
-│   ├── rules/            # Rules engine
-│   ├── policy/           # Policy engine
-│   ├── sandbox/          # Sandbox runtime
-│   ├── artifacts/        # Artifact store
-│   ├── subagents/        # Subagent orchestration
-│   ├── models/           # Model router
-│   └── trace/            # Trace service
-├── code-intelligence/    # Code understanding
-├── git-intelligence/     # Git integration
-├── browser/              # Browser automation
-└── terminal/             # Terminal integration
+extensions/codeforge/   # Shipped AI platform (ONLY product surface)
+├── src/agent/               # Agent loop, context packet, state machine
+├── src/memory/              # Session + project wiki + temporal facts
+├── src/storage/             # ~/.CodeForge paths, sessions, artifacts, traces
+├── src/context/             # Context budget / ranking
+├── src/sandbox/             # Shell isolation
+├── src/intelligence/        # Index, embeddings, LSP, git
+├── src/browser/             # Browser agent (Playwright optional)
+├── src/mcp/                 # Inbound + outbound MCP
+└── src/governance/          # Skills, rules, guardrails, HITL
+docs/
+tests/
+scripts/                     # Code-OSS setup / package
 ```
+
+Do **not** add features under a legacy `src/` tree — it was removed.
 
 ## Testing
 
@@ -87,4 +84,4 @@ Please use the GitHub issue tracker to report bugs or request features. Include:
 
 ## License
 
-By contributing to OpenCodeIDE, you agree that your contributions will be licensed under the MIT License.
+By contributing to CodeForge, you agree that your contributions will be licensed under the MIT License.

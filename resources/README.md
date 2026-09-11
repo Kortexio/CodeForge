@@ -1,6 +1,6 @@
 # Native Dependencies Bundle
 
-OpenCodeIDE bundles platform-specific native binaries under `resources/binaries/{platform}/`.
+CodeForge bundles platform-specific native binaries under `resources/binaries/{platform}/`.
 
 ## Required binaries
 

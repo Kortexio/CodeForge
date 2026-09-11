@@ -1,0 +1,12 @@
+---
+description: Safety defaults for all agent work
+alwaysApply: true
+---
+
+# Safety defaults
+
+- Prefer relative workspace paths.
+- Do not run destructive shell commands without approval.
+- Prefer small, reviewable file changes.
+- Do not invent APIs, helpers, or alternate project roots.
+- Prefer `diagnostics` / `dotnet build` after edits.

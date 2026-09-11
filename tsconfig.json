@@ -1,47 +1,24 @@
 {
   "compilerOptions": {
     "target": "ES2022",
-    "module": "NodeNext",
-    "moduleResolution": "NodeNext",
-    "lib": ["ES2022", "DOM"],
-    "outDir": "./out",
-    "rootDir": "./src",
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "lib": ["ES2022"],
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
-    "declaration": true,
-    "declarationMap": true,
-    "sourceMap": true,
     "resolveJsonModule": true,
-    "allowSyntheticDefaultImports": true,
-    "experimentalDecorators": true,
-    "emitDecoratorMetadata": true,
-    "noImplicitAny": true,
-    "noImplicitReturns": true,
-    "noFallthroughCasesInSwitch": true,
-    "noUnusedLocals": true,
-    "noUnusedParameters": true,
-    "strictNullChecks": true,
-    "strictPropertyInitialization": true,
-    "baseUrl": ".",
-    "paths": {
-      "@ai/*": ["src/ai/*"],
-      "@code-intelligence/*": ["src/code-intelligence/*"],
-      "@git-intelligence/*": ["src/git-intelligence/*"],
-      "@browser/*": ["src/browser/*"],
-      "@terminal/*": ["src/terminal/*"]
-    }
+    "noEmit": true
   },
   "include": [
-    "src/**/*"
+    "extensions/codeforge/src/**/*",
+    "tests/**/*"
   ],
   "exclude": [
     "node_modules",
-    "out",
-    "dist",
-    "tests",
-    "extensions",
-    "src/core"
+    "vscode",
+    "VSCode-win32-x64",
+    "extensions/codeforge/out"
   ]
 }

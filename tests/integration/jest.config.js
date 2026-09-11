@@ -5,28 +5,26 @@ module.exports = {
     rootDir: '.',
     testMatch: ['**/*.test.ts'],
     moduleFileExtensions: ['ts', 'tsx', 'js', 'jsx', 'json', 'node'],
-    collectCoverage: true,
-    coverageDirectory: '../../coverage/integration',
-    coverageReporters: ['text', 'lcov', 'html'],
+    collectCoverage: false,
     testTimeout: 30000,
     transform: {
-        '^.+\\.tsx?$': ['ts-jest', {
-            tsconfig: {
-                target: 'ES2022',
-                module: 'commonjs',
-                moduleResolution: 'node',
-                esModuleInterop: true,
-                strict: true,
-                skipLibCheck: true,
-                resolveJsonModule: true,
+        '^.+\\.tsx?$': [
+            'ts-jest',
+            {
+                tsconfig: {
+                    target: 'ES2022',
+                    module: 'commonjs',
+                    moduleResolution: 'node',
+                    esModuleInterop: true,
+                    strict: true,
+                    skipLibCheck: true,
+                    resolveJsonModule: true,
+                },
             },
-        }],
+        ],
     },
     moduleNameMapper: {
+        '^vscode$': '<rootDir>/../unit/vscode-mock.js',
         '^(\\.{1,2}/.*)\\.js$': '$1',
-        '^@ai/(.*)$': '<rootDir>/../../src/ai/$1',
-        '^@code-intelligence/(.*)$': '<rootDir>/../../src/code-intelligence/$1',
-        '^@git-intelligence/(.*)$': '<rootDir>/../../src/git-intelligence/$1',
-        '^@browser/(.*)$': '<rootDir>/../../src/browser/$1',
     },
 };

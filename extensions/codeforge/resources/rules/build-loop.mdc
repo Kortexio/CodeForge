@@ -1,0 +1,10 @@
+---
+description: Build/fix loop after code changes
+globs: ["**/*.{cs,ts,tsx,js,jsx,py}"]
+alwaysApply: false
+---
+
+# Build loop
+
+- After meaningful edits, run the project build/test and fix errors before adding features.
+- Prefer the smallest failing command that validates the change.

@@ -1,6 +1,6 @@
-# OpenCodeIDE Benchmarks
+# CodeForge Benchmarks
 
-This directory contains benchmark suites for evaluating OpenCodeIDE's AI capabilities.
+This directory contains benchmark suites for evaluating CodeForge's AI capabilities.
 
 ## Categories
 

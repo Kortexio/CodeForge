@@ -1,5 +1,5 @@
 /**
- * Launch Code-OSS with OpenCodeIDE AI extension in development mode
+ * Launch Code-OSS with CodeForge AI extension in development mode
  */
 
 import { spawn } from 'child_process';
@@ -10,7 +10,7 @@ import { fileURLToPath } from 'url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(__dirname, '..');
 const vscodeDir = path.join(root, 'vscode');
-const extensionPath = path.join(root, 'extensions', 'opencodeide-ai');
+const extensionPath = path.join(root, 'extensions', 'codeforge');
 
 if (!fs.existsSync(vscodeDir)) {
 	console.error('vscode/ not found. Run: npm run vscode:setup');
@@ -45,7 +45,7 @@ const args = [
 	...process.argv.slice(2),
 ];
 
-console.log(`Launching OpenCodeIDE (Code-OSS + AI extension)...`);
+console.log(`Launching CodeForge (Code-OSS + AI extension)...`);
 console.log(`  ${script} ${args.join(' ')}`);
 
 const child = spawn(script, args, {

@@ -6,57 +6,50 @@ on:
       - 'v*'
 
 jobs:
-  release:
-    runs-on: ${{ matrix.os }}
-    
-    strategy:
-      matrix:
-        include:
-          - os: ubuntu-latest
-            platform: linux
-          - os: windows-latest
-            platform: win
-          - os: macos-latest
-            platform: mac
-
+  windows:
+    runs-on: windows-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
-          node-version: 20.x
+          node-version: '24'
           cache: 'npm'
 
       - name: Install dependencies
         run: npm ci
 
-      - name: Build
-        run: npm run build
+      - name: Install Inno Setup
+        run: winget install -e --id JRSoftware.InnoSetup --accept-package-agreements --accept-source-agreements
 
-      - name: Package
-        run: npm run package:${{ matrix.platform }}
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Setup Code-OSS
+        run: npm run vscode:setup
 
-      - name: Upload artifacts
+      - name: Build extensions
+        run: npm run build:extensions
+
+      - name: Package Windows (portable + installer)
+        run: npm run vscode:package:win
+
+      - name: Upload Windows artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: release-${{ matrix.platform }}
-          path: dist/*
+          name: codeforge-windows
+          path: |
+            dist/codeforge-win32-x64/*.exe
+            dist/codeforge-win32-x64/*.zip
+            dist/codeforge-win32-x64/*.txt
 
   publish:
-    needs: release
+    needs: [windows]
     runs-on: ubuntu-latest
-    
     steps:
-      - name: Download all artifacts
+      - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
 
-      - name: Create Release
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v1
         with:
           files: artifacts/**/*

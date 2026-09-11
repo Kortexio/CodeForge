@@ -1,0 +1,10 @@
+---
+description: Prefer one ASP.NET stack; apply when editing .NET web files
+globs: ["**/*.{cs,cshtml,razor}", "**/Pages/**", "**/Views/**", "**/Controllers/**"]
+alwaysApply: false
+---
+
+# One stack (.NET)
+
+- Pick ONE stack: Razor Pages (`Pages/` + `@page` first) OR MVC (`Views/` + Controllers). Never mix mid-task.
+- Do not introduce a second UI framework in the same feature.

@@ -1,26 +1,29 @@
-# OpenCodeIDE Architecture
+# CodeForge Architecture
 
 ## Overview
 
-OpenCodeIDE is an AI-native code editor built on Code-OSS with a fully embedded AI platform. The architecture follows the principle of **one product, one installation** - all AI capabilities are built into the IDE without requiring external services.
+CodeForge is an AI-native code editor built on Code-OSS with a fully embedded AI platform. The architecture follows the principle of **one product, one installation** — all AI capabilities live in the built-in extension `extensions/codeforge/`.
+
+> **Source of truth:** the shipped IDE runs only `extensions/codeforge/`. The legacy `src/` tree is frozen and scheduled for removal; do not add features there.
 
 ## Core Principles
 
 1. **Single Application**: Everything runs within the IDE process or managed child processes
-2. **No External Dependencies**: No Docker, no separate ContextMemory service
+2. **No External Dependencies**: No Docker required by default, no separate ContextMemory service
 3. **Model Independence**: Works with any LLM provider
 4. **Local-First**: Full functionality without cloud services
+5. **Extension-native**: Packaging syncs one built-in extension into Code-OSS
 
 ## Architecture Diagram
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                      OpenCodeIDE                            │
+│                      CodeForge                              │
 │                      Code-OSS Base                          │
 ├─────────────────────────────────────────────────────────────┤
 │  Editor │ Explorer │ Git │ Terminal │ Debug │ Extensions   │
 ├─────────────────────────────────────────────────────────────┤
-│                  Embedded AI Platform                       │
+│         Embedded AI Platform (codeforge)               │
 │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐      │
 │  │  Agent   │ │ Context  │ │  Memory  │ │  Tools   │      │
 │  │ Runtime  │ │  Engine  │ │  Engine  │ │ Runtime  │      │
@@ -35,6 +38,7 @@ OpenCodeIDE is an AI-native code editor built on Code-OSS with a fully embedded 
 │  └──────────┘ └──────────┘ └──────────┘ └──────────┘      │
 ├─────────────────────────────────────────────────────────────┤
 │              Code Intelligence │ Git Intelligence           │
+│              Browser Agent                                  │
 ├─────────────────────────────────────────────────────────────┤
 │                    Model Providers                          │
 │     Cloud (OpenAI/Anthropic) │ Local (Ollama) │ Custom     │
@@ -45,76 +49,75 @@ OpenCodeIDE is an AI-native code editor built on Code-OSS with a fully embedded 
 
 ### Agent Runtime
 
-The agent runtime executes tasks using an iterative loop with a formal state machine:
+Iterative tool-calling loop with checkpoints and recovery:
 
-- **State Machine**: Manages lifecycle (created → planning → executing → completed)
-- **Tool Execution**: Runs native and MCP tools
-- **Compaction**: Manages context window through rolling summaries
-- **Recovery**: Handles errors and retries
+- Lifecycle states (created → planning → executing → completed / failed)
+- Native + MCP tools
+- Rolling compaction + session wiki facts that survive compaction
+- Progress review / budget extension
 
 ### Context Engine
 
 Builds enriched context for LLM requests:
 
-- **Budget Allocation**: Distributes tokens across context sources
-- **Source Ranking**: Prioritizes relevant information
-- **Compression**: Summarizes long histories
+- Budget allocation across wiki, IDE, retrieve, git, MCP, history
+- Source ranking (active wiki / open file first)
+- Compression via rolling summary + wiki
 
 ### Memory Engine
 
 Persistent memory across sessions:
 
-- **Session Wiki**: Per-task memory with pages and working memory
-- **Project Wiki**: Cross-session project knowledge
-- **Temporal Facts**: Track changes over time
+- **Session Wiki**: Per-session Markdown pages + working memory
+- **Project Wiki**: Cross-session project knowledge under `{workspace}/.CodeForge/memory/`
+- **Temporal Facts**: `validFrom` / `validTo` with supersede
 
 ### Tool Runtime
 
 Native tools for workspace operations:
 
 - File operations (read, write, delete, rename)
-- Search (ripgrep-based)
-- Shell execution (sandboxed)
-- Editor integration
+- Search (ripgrep-based) + hybrid retrieve
+- Shell execution (sandboxed levels)
+- Editor / LSP / Git / Browser / Wiki
 
 ### Model Router
 
 Routes requests to LLM providers:
 
-- **Harness Modes**: Strong (native tool calls) vs Weak (prose parsing)
-- **Capability Normalization**: Handles provider differences
-- **Multiple Providers**: OpenAI, Anthropic, Ollama, custom
+- Strong (native tool calls) vs Weak (prose parsing)
+- OpenAI, Anthropic, Google, xAI, OpenRouter, Ollama, vLLM, LM Studio, custom
 
 ### Policy Engine
 
 Security and permissions:
 
-- **Guardrails**: Prevent dangerous operations
-- **HITL**: Human-in-the-loop approvals
-- **Risk Assessment**: Evaluate tool call safety
+- Guardrails, HITL approvals, auto-approve modes
+- Risk-aware sandbox level selection
+- Secret scrubbing from child process env
 
 ### MCP Runtime
 
-Model Context Protocol integration:
-
 - **Inbound**: IDE consumes external MCP tools
-- **Outbound**: IDE exposes wiki to external clients
-- **Transport**: HTTP and stdio support
+- **Outbound**: IDE exposes wiki + retrieve to external clients
+- Transport: HTTP and stdio
 
 ### Sandbox Runtime
 
-Secure command execution:
+- Levels: `safe-local`, `restricted`, `isolated`, `container` (Docker optional)
+- Platform helpers: Windows Job Objects, Linux bwrap/seccomp, macOS sandbox-exec
+- Default: native isolation, no Docker required
 
-- **Levels**: safe-local, restricted, isolated, container
-- **Platform-specific**: Windows Job Objects, Linux seccomp, macOS sandbox-exec
-- **No Docker Required**: Native isolation by default
+### Artifacts / Traces
+
+Large tool/LLM outputs and execution traces under `~/.CodeForge/ai/`.
 
 ## Data Flow
 
 1. **User Request** → Agent Runtime
 2. **Context Assembly** → Context Engine + Memory Engine
 3. **LLM Request** → Model Router → Provider
-4. **Tool Calls** → Tool Runtime / MCP Runtime
+4. **Tool Calls** → Tool Runtime / MCP Runtime / Sandbox
 5. **Validation** → Policy Engine
 6. **Memory Update** → Memory Engine
 7. **Response** → User
@@ -122,17 +125,20 @@ Secure command execution:
 ## Storage
 
 ```
-~/.opencodeide/
-├── settings/           # User preferences
+~/.CodeForge/
+├── skills/                 # User skills
+├── rules/                  # User rules
 ├── ai/
-│   ├── sessions/      # Session data
-│   ├── memory/        # Project memory
-│   ├── artifacts/     # Large outputs
-│   ├── traces/        # Execution logs
-│   ├── policies/      # Custom policies
-│   └── skills/        # Installed skills
-├── code-index/        # Repository index
-└── model-cache/       # Cached models
+│   ├── sessions/{id}/      # Chat + session wiki
+│   ├── memory/{wsHash}/    # Fallback project memory
+│   ├── artifacts/          # Large outputs
+│   ├── traces/             # Execution logs
+│   └── policies/           # Custom policies
+├── code-index/{wsHash}/    # Repository index
+└── model-cache/            # Cached embeddings / models
+
+{workspace}/.CodeForge/
+└── memory/                 # Project wiki + temporal facts
 ```
 
 ## Security Model
@@ -140,5 +146,5 @@ Secure command execution:
 1. **Policy Evaluation**: Before each tool call
 2. **Approval Flow**: For dangerous operations
 3. **Sandbox Execution**: For shell commands
-4. **Secret Protection**: API keys isolated from agent
-5. **Network Control**: Configurable egress rules
+4. **Secret Protection**: API keys not forwarded to shell env
+5. **Network Control**: Configurable egress hints at restricted+ levels

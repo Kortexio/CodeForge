@@ -1,0 +1,406 @@
+{
+  "name": "codeforge",
+  "displayName": "CodeForge AI",
+  "description": "AI Agent sidebar and approval UI for CodeForge",
+  "version": "0.1.0",
+  "publisher": "kortexio",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "secondarySidebar": [
+        {
+          "id": "codeforge",
+          "title": "AI",
+          "icon": "resources/ai-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "codeforge": [
+        {
+          "type": "webview",
+          "id": "codeforge.chat",
+          "name": "Agent",
+          "visibility": "visible",
+          "initialSize": 3
+        },
+        {
+          "id": "codeforge.sessions",
+          "name": "Sessions",
+          "visibility": "collapsed",
+          "initialSize": 1
+        },
+        {
+          "id": "codeforge.tasks",
+          "name": "Tasks",
+          "visibility": "collapsed",
+          "initialSize": 1
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "codeforge.focusChat",
+        "title": "Focus AI Chat",
+        "category": "CodeForge AI",
+        "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "codeforge.newChat",
+        "title": "New Chat",
+        "category": "CodeForge AI",
+        "icon": "$(add)"
+      },
+      {
+        "command": "codeforge.runTask",
+        "title": "Run AI Task",
+        "category": "CodeForge AI"
+      },
+      {
+        "command": "codeforge.cancelTask",
+        "title": "Cancel AI Task",
+        "category": "CodeForge AI"
+      },
+      {
+        "command": "codeforge.openSettings",
+        "title": "Settings",
+        "category": "CodeForge AI",
+        "icon": "$(gear)"
+      },
+      {
+        "command": "codeforge.switchModel",
+        "title": "Switch Model",
+        "category": "CodeForge AI",
+        "icon": "$(symbol-misc)"
+      },
+      {
+        "command": "codeforge.configureProvider",
+        "title": "Settings (Servers & Models)",
+        "category": "CodeForge AI"
+      },
+      {
+        "command": "codeforge.resumeSession",
+        "title": "Open Session",
+        "category": "CodeForge AI"
+      },
+      {
+        "command": "codeforge.deleteSession",
+        "title": "Delete Session",
+        "category": "CodeForge AI"
+      },
+      {
+        "command": "codeforge.clearSessions",
+        "title": "Clear All Sessions",
+        "category": "CodeForge AI"
+      },
+      {
+        "command": "codeforge.exportSession",
+        "title": "Export Session",
+        "category": "CodeForge AI"
+      },
+      {
+        "command": "codeforge.importSession",
+        "title": "Import Session",
+        "category": "CodeForge AI"
+      },
+      {
+        "command": "codeforge.showTrace",
+        "title": "Show Execution Trace",
+        "category": "CodeForge AI"
+      },
+      {
+        "command": "codeforge.reloadSkills",
+        "title": "Reload Skills & Rules",
+        "category": "CodeForge AI"
+      },
+      {
+        "command": "codeforge.refreshMcp",
+        "title": "Refresh MCP Servers",
+        "category": "CodeForge AI"
+      },
+      {
+        "command": "codeforge.clearCompletedTasks",
+        "title": "Clear Completed Tasks",
+        "category": "CodeForge AI"
+      },
+      {
+        "command": "codeforge.toggleAutoApproveEdits",
+        "title": "Toggle Auto-Approve File Edits",
+        "category": "CodeForge AI"
+      },
+      {
+        "command": "codeforge.inspectWorkspace",
+        "title": "Inspect Workspace",
+        "category": "CodeForge AI"
+      },
+      {
+        "command": "codeforge.indexEmbeddings",
+        "title": "Index Semantic Embeddings",
+        "category": "CodeForge AI"
+      },
+      {
+        "command": "codeforge.generateInstructions",
+        "title": "Generate Agent Instructions",
+        "category": "CodeForge AI"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "codeforge.focusChat",
+        "key": "ctrl+l",
+        "mac": "cmd+l",
+        "when": "!editorReadonly || editorFocus || !editorFocus"
+      },
+      {
+        "command": "codeforge.switchModel",
+        "key": "ctrl+shift+/",
+        "mac": "cmd+shift+/"
+      },
+      {
+        "command": "codeforge.openSettings",
+        "key": "ctrl+shift+,",
+        "mac": "cmd+shift+,"
+      },
+      {
+        "command": "codeforge.newChat",
+        "key": "ctrl+n",
+        "mac": "cmd+n",
+        "when": "view == codeforge.chat || focusedView == codeforge.chat"
+      }
+    ],
+    "configuration": {
+      "title": "CodeForge AI",
+      "properties": {
+        "codeforge.ai.provider": {
+          "type": "string",
+          "enum": [
+            "openai",
+            "anthropic",
+            "google",
+            "xai",
+            "openrouter",
+            "ollama",
+            "vllm",
+            "lmstudio",
+            "custom"
+          ],
+          "default": "openai",
+          "description": "AI model provider"
+        },
+        "codeforge.ai.apiKey": {
+          "type": "string",
+          "default": "",
+          "description": "API key for the selected provider"
+        },
+        "codeforge.ai.model": {
+          "type": "string",
+          "default": "",
+          "description": "Model to use for AI tasks (set via CodeForge AI Settings)"
+        },
+        "codeforge.ai.baseUrl": {
+          "type": "string",
+          "default": "",
+          "description": "Custom base URL for API requests (for self-hosted models)"
+        },
+        "codeforge.ai.mode": {
+          "type": "string",
+          "enum": [
+            "ask",
+            "agent",
+            "auto"
+          ],
+          "default": "agent",
+          "description": "Default AI interaction mode (Ask = answers only, Agent = tools with approvals, Auto = agent + auto-approve edits and shell for the session)"
+        },
+        "codeforge.ai.autoApprove": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "List of tools to auto-approve"
+        },
+        "codeforge.ai.autoApproveEdits": {
+          "type": "boolean",
+          "default": false,
+          "description": "Cursor-like: automatically apply all file edits (write/rename/delete) without asking"
+        },
+        "codeforge.ai.previewEdits": {
+          "type": "boolean",
+          "default": false,
+          "description": "Show DiffPreview before writing existing files (off by default; Cursor-like apply-on-accept)"
+        },
+        "codeforge.ai.traceLevel": {
+          "type": "string",
+          "enum": [
+            "none",
+            "basic",
+            "detailed"
+          ],
+          "default": "basic",
+          "description": "Level of execution tracing (none/basic/detailed)"
+        },
+        "codeforge.ai.tabCompletion": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable LLM-backed inline tab completion"
+        },
+        "codeforge.ai.agentCheckpointSteps": {
+          "type": "number",
+          "default": 20,
+          "minimum": 5,
+          "maximum": 50,
+          "description": "Evaluate agent progress every N steps; extend budget on positive reviews"
+        },
+        "codeforge.ai.agentHardCap": {
+          "type": "number",
+          "default": 100,
+          "minimum": 20,
+          "maximum": 200,
+          "description": "Absolute maximum agent steps (checkpoints at 20/40/60/80/100…)"
+        },
+        "codeforge.ai.contextBudget": {
+          "type": "number",
+          "default": 32768,
+          "enum": [8192, 16384, 32768, 65536],
+          "description": "Fallback context window (tokens) when the active server has no num_ctx. Prefer setting num_ctx per server in CodeForge AI Settings."
+        }
+      }
+    },
+    "configurationDefaults": {
+      "workbench.sideBar.location": "left",
+      "workbench.secondarySideBar.defaultVisibility": "visible",
+      "workbench.activityBar.location": "default",
+      "chat.commandCenter.enabled": false,
+      "chat.disableAIFeatures": true
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "codeforge.newChat",
+          "when": "view == codeforge.chat",
+          "group": "navigation"
+        },
+        {
+          "command": "codeforge.switchModel",
+          "when": "view == codeforge.chat",
+          "group": "navigation"
+        },
+        {
+          "command": "codeforge.openSettings",
+          "when": "view == codeforge.chat",
+          "group": "navigation"
+        },
+        {
+          "command": "codeforge.clearSessions",
+          "when": "view == codeforge.sessions",
+          "group": "navigation"
+        },
+        {
+          "command": "codeforge.importSession",
+          "when": "view == codeforge.sessions",
+          "group": "navigation"
+        },
+        {
+          "command": "codeforge.clearCompletedTasks",
+          "when": "view == codeforge.tasks",
+          "group": "navigation"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "codeforge.deleteSession",
+          "when": "view == codeforge.sessions && viewItem == session",
+          "group": "inline"
+        },
+        {
+          "command": "codeforge.exportSession",
+          "when": "view == codeforge.sessions && viewItem == session",
+          "group": "inline"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "codeforge.runTask",
+          "group": "CodeForge"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "codeforge.focusChat"
+        }
+      ]
+    },
+    "walkthroughs": [
+      {
+        "id": "codeforgeAiSetup",
+        "title": "Set up CodeForge AI",
+        "description": "Add a server, pick a model, and start building with Agent",
+        "steps": [
+          {
+            "id": "openAiSettings",
+            "title": "Open AI Settings",
+            "description": "CodeForge uses your own models — OpenAI, Anthropic, Ollama, LM Studio, or any OpenAI-compatible endpoint.\n\n[Open AI Settings](command:codeforge.openSettings)",
+            "media": {
+              "markdown": "walkthrough/ai-settings.md"
+            },
+            "completionEvents": [
+              "onCommand:codeforge.openSettings"
+            ]
+          },
+          {
+            "id": "addServer",
+            "title": "Add a server",
+            "description": "In **Models**, click **Add server**, enter your API key or local base URL, then **Fetch models**.\n\n[Open AI Settings](command:codeforge.openSettings)",
+            "media": {
+              "markdown": "walkthrough/ai-settings.md"
+            },
+            "completionEvents": [
+              "onCommand:codeforge.openSettings"
+            ]
+          },
+          {
+            "id": "pickModel",
+            "title": "Pick your model",
+            "description": "Use the model chip in the AI panel to switch models while you work.\n\n[Switch model](command:codeforge.switchModel)",
+            "media": {
+              "markdown": "walkthrough/ai-agent.md"
+            },
+            "completionEvents": [
+              "onCommand:codeforge.switchModel"
+            ]
+          },
+          {
+            "id": "openAgent",
+            "title": "Open the AI Agent",
+            "description": "The Agent lives in the right sidebar. Ask questions, plan changes, and edit across your workspace.\n\n[Focus AI Agent](command:codeforge.focusChat)",
+            "media": {
+              "markdown": "walkthrough/ai-agent.md"
+            },
+            "completionEvents": [
+              "onCommand:codeforge.focusChat"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.136.0",
+    "typescript": "^5.9.3"
+  }
+}

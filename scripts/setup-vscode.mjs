@@ -1,8 +1,8 @@
 /**
- * Setup Code-OSS for OpenCodeIDE development
+ * Setup Code-OSS for CodeForge development
  *
  * - Clones microsoft/vscode into ./vscode (if missing)
- * - Applies OpenCodeIDE branding
+ * - Applies CodeForge branding
  * - Installs vscode dependencies (npm)
  *
  * Usage: node scripts/setup-vscode.mjs [--skip-install]
@@ -39,6 +39,7 @@ if (!fs.existsSync(vscodeDir)) {
 
 run('node', [path.join('scripts', 'apply-branding.mjs')], root);
 run('node', [path.join('scripts', 'apply-vscode-patches.mjs')], root);
+run('node', [path.join('scripts', 'sync-builtin-extension.mjs')], root);
 
 if (!skipInstall) {
 	console.log('\nInstalling Code-OSS dependencies (this can take 10–20 minutes)...');
@@ -50,5 +51,6 @@ if (!skipInstall) {
 
 console.log('\nSetup complete.');
 console.log('Next:');
-console.log('  npm run vscode:compile   # compile Code-OSS');
-console.log('  npm run vscode:dev       # launch with AI extension');
+console.log('  npm run vscode:compile      # compile Code-OSS');
+console.log('  npm run vscode:dev          # launch with AI extension (dev)');
+console.log('  npm run vscode:package:win  # build installable Windows product');

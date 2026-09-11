@@ -1,17 +1,16 @@
-# Code-OSS Integration — OpenCodeIDE
+# Code-OSS Integration — CodeForge
 
 ## Goal
 
-Run OpenCodeIDE as a **branded Code-OSS** with the embedded AI extension loaded.
+Run CodeForge as a **branded Code-OSS** with the embedded AI extension loaded.
 
 ## Architecture
 
 ```
 CodeForge/
 ├── vscode/                      # microsoft/vscode clone (gitignored)
-│   └── product.json             # patched → OpenCodeIDE branding
-├── extensions/opencodeide-ai/   # AI sidebar + VS Code bridge
-├── src/ai/                      # Embedded AI Platform (shared logic)
+│   └── product.json             # patched → CodeForge branding
+├── extensions/codeforge/   # AI sidebar + full AI platform (source of truth)
 └── scripts/
     ├── setup-vscode.mjs         # clone + brand + patches + npm install
     ├── apply-branding.mjs       # product.json branding
@@ -19,6 +18,7 @@ CodeForge/
     └── dev-vscode.mjs           # launch Code-OSS + extension
 ```
 
+> All AI runtime code lives in `extensions/codeforge/`. There is no separate `src/ai` package in the shipped product.
 ## Prerequisites (Windows)
 
 | Requirement | Details |
@@ -49,7 +49,7 @@ Start-Process $setup -Verb RunAs -Wait -ArgumentList @(
 )
 ```
 
-> OpenCodeIDE patches Code-OSS `preinstall.ts` to accept **Visual Studio 2026** (`18`), which upstream does not list yet.
+> CodeForge patches Code-OSS `preinstall.ts` to accept **Visual Studio 2026** (`18`), which upstream does not list yet.
 
 ## One-time setup
 
@@ -60,7 +60,7 @@ npm run vscode:setup
 This will:
 
 1. Clone `microsoft/vscode` into `vscode/` (shallow)
-2. Apply OpenCodeIDE branding
+2. Apply CodeForge branding
 3. Apply toolchain patches (VS 2026)
 4. Run full `npm install` (native modules included)
 
@@ -77,15 +77,15 @@ npm run vscode:install
 ```bash
 npm run build:extensions   # compile AI extension
 npm run vscode:compile     # compile editor (first time is slow)
-npm run vscode:dev         # launch OpenCodeIDE with AI sidebar
+npm run vscode:dev         # launch CodeForge with AI sidebar
 ```
 
 What you should see:
 
-- Product name: **OpenCodeIDE**
-- Activity bar: **AI Agent**
-- Chat: `list files` · `read README.md` · `search TODO`
-- Command Palette → **OpenCodeIDE AI: Configure AI Provider**
+- Product name: **CodeForge**
+- Layout: **Explorer left · Editor center · AI Agent right** (Secondary Side Bar)
+- Chat modes: **Agent** / **Ask**, model chip, `Ctrl+L` to focus
+- Command Palette → **CodeForge AI: Configure AI Provider**
 
 ## Scripts
 
@@ -96,15 +96,40 @@ What you should see:
 | `npm run vscode:install` | `npm install` inside `vscode/` |
 | `npm run vscode:compile` | `compile-client` |
 | `npm run vscode:dev` | Launch with `--extensionDevelopmentPath` |
+| `npm run vscode:sync-ext` | Copy AI extension into `vscode/extensions/` as built-in |
+| `npm run vscode:package:win` | Build portable app + user installer (Windows x64) |
+| `npm run vscode:package:win:portable` | Portable folder only (no Inno Setup) |
 
-## Next hardening steps
+## Installable product (Windows)
 
-1. Register `opencodeide-ai` in `gulpfile.extensions.ts` as built-in
-2. Package via Code-OSS gulp (replace Electron placeholder)
-3. Wire full `src/ai` Agent Runtime into the extension host
-4. Continuous rebase against upstream `microsoft/vscode`
+Distribution artifact is an **Inno Setup installer**:
+
+```bash
+# Full pipeline (portable + zip + Setup.exe) — 30–90+ min first time
+npm run vscode:package:win
+
+# If portable folder already exists:
+npm run installer:win
+```
+
+Requires [Inno Setup 6+](https://jrsoftware.org/isdl.php) (`winget install JRSoftware.InnoSetup`).
+
+Outputs:
+
+| Artifact | Location |
+|----------|----------|
+| **Installer (primary)** | `dist/codeforge-win32-x64/CodeForge-Setup-<ver>-win32-x64.exe` |
+| Portable app | `VSCode-win32-x64/CodeForge.exe` |
+| ZIP | `dist/codeforge-win32-x64/CodeForge-<ver>-win32-x64.zip` |
+
+Installer features: per-user install (no admin by default), Start Menu, optional desktop icon + PATH (`codeforge`), `codeforge://` protocol, uninstaller.
+
+The AI sidebar ships **built-in** (no `--extensionDevelopmentPath`).
+
+Script reference: [`build/windows/codeforge.iss`](../build/windows/codeforge.iss), [`scripts/build-installer-windows.mjs`](../scripts/build-installer-windows.mjs).
 
 ## Notes
 
 - `vscode/` is **not committed** (too large). Use `npm run vscode:setup` on each machine.
 - Do **not** use `--ignore-scripts` for vscode install — native modules must build.
+- First Windows package can take **30–90+ minutes** (Electron download, minify, extensions).

@@ -1,39 +1,36 @@
-# OpenCodeIDE
+# CodeForge
 
 **An open-source, model-independent, memory-native, agentic coding IDE.**
 
-OpenCodeIDE is an AI-native code editor built on Code-OSS with a fully embedded AI platform. One installation, no external dependencies, no Docker required.
+CodeForge is an AI-native code editor built on Code-OSS with a fully embedded AI platform. One installation, no Docker required.
+
+> **Shipped surface:** `extensions/codeforge/` (built into `CodeForge.exe`). The legacy `src/` tree is frozen reference code and will be removed.
 
 ## Features
 
 - **Embedded AI Platform**: Complete AI capabilities built into the IDE
 - **Model Independence**: Use OpenAI, Anthropic, Google, Ollama, or any OpenAI-compatible provider
-- **Persistent Memory**: Project Brain and session memory that persists across sessions
+- **Persistent Memory**: Session wiki, project wiki, and temporal facts on disk
 - **Multi-file Agent**: AI agent that can plan, edit, and validate changes across your codebase
-- **Code Intelligence**: Hybrid search combining lexical, structural, and semantic retrieval
-- **MCP Support**: Model Context Protocol for extensibility
-- **Tab Completion**: Low-latency inline completions
-- **Browser Agent**: Visual testing and web automation
-- **Git Intelligence**: AI-powered commit messages, PR descriptions, and conflict resolution
+- **Code Intelligence**: Hybrid search (lexical + semantic embeddings)
+- **MCP Support**: Inbound tools + outbound wiki server
+- **Tab Completion**: Low-latency inline completions with your model
+- **Browser Agent**: Visual testing and web automation (Playwright optional)
+- **Git Intelligence**: Status, diff, blame, conflicts, commit messages
+- **Sandbox**: safe-local / restricted / isolated shell levels
 
 ## Quick Start
-
-### AI Platform only (library + Electron shell)
-
-```bash
-git clone https://github.com/Kortexio/OpenCodeIDE.git
-cd OpenCodeIDE
-npm install
-npm run verify
-npm start
-```
 
 ### Full IDE (Code-OSS + AI extension)
 
 ```bash
+git clone https://github.com/Kortexio/CodeForge.git
+cd CodeForge
+npm install
 npm run vscode:setup      # clone Code-OSS, brand, install deps
-npm run vscode:compile    # compile editor (first time is slow)
-npm run vscode:dev        # launch OpenCodeIDE with AI sidebar
+npm run build:extensions # compile AI extension
+npm run vscode:compile   # compile editor (first time is slow)
+npm run vscode:dev       # launch CodeForge with AI sidebar
 ```
 
 See [docs/code-oss-integration.md](docs/code-oss-integration.md) for details.
@@ -41,43 +38,35 @@ See [docs/code-oss-integration.md](docs/code-oss-integration.md) for details.
 ## Architecture
 
 ```
-OpenCodeIDE/
-├── src/
-│   ├── ai/                    # Embedded AI Platform
-│   │   ├── agent/             # Agent Runtime + State Machine
-│   │   ├── context/           # Context Engine + Budget
-│   │   ├── memory/            # Session + Project Memory
-│   │   ├── tools/             # Native Tools
-│   │   ├── mcp/               # MCP Runtime
-│   │   ├── skills/            # Skills Engine
-│   │   ├── rules/             # Rules Engine
-│   │   ├── policy/            # Guardrails + HITL
-│   │   ├── sandbox/           # Execution Sandbox
-│   │   ├── artifacts/         # Artifact Management
-│   │   ├── subagents/         # Subagent Orchestration
-│   │   ├── models/            # Model Router + Providers
-│   │   └── trace/             # Execution Tracing
-│   ├── code-intelligence/     # AST, LSP, Semantic Search
-│   ├── git-intelligence/      # Git Reasoning
-│   ├── browser/               # Browser Automation
-│   └── terminal/              # Terminal Integration
-├── extensions/                # VS Code compatible extensions
-├── docs/                      # Documentation
-├── tests/                     # Test suites
-└── benchmarks/                # Performance benchmarks
+CodeForge/
+├── extensions/codeforge/   # Shipped AI platform (source of truth)
+│   ├── src/agent/               # Agent loop, context, wiki hooks
+│   ├── src/memory/              # Session + project wiki + temporal facts
+│   ├── src/storage/             # ~/.CodeForge paths, sessions, artifacts, traces
+│   ├── src/context/             # Context budget / ranking
+│   ├── src/sandbox/             # Shell isolation levels
+│   ├── src/intelligence/        # Index, LSP, git, embeddings
+│   ├── src/browser/             # Browser agent
+│   ├── src/mcp/                 # Inbound + outbound MCP
+│   └── src/governance/          # Skills, rules, guardrails, HITL
+├── docs/                        # Documentation
+├── tests/                       # Test suites
+└── scripts/                     # Code-OSS setup / package
 ```
+
+See [docs/architecture.md](docs/architecture.md) for the full component model.
 
 ## Configuration
 
 ### Model Providers
 
-Configure your preferred AI model provider in Settings:
+Configure your preferred AI model provider in **CodeForge AI Settings** (or Settings JSON):
 
 ```json
 {
-  "opencodeide.ai.provider": "anthropic",
-  "opencodeide.ai.apiKey": "your-api-key",
-  "opencodeide.ai.model": "claude-3-sonnet-20240229"
+  "codeforge.ai.provider": "anthropic",
+  "codeforge.ai.apiKey": "your-api-key",
+  "codeforge.ai.model": "claude-3-sonnet-20240229"
 }
 ```
 
@@ -94,11 +83,9 @@ Supported providers:
 
 ### MCP Servers
 
-Configure MCP servers for extended capabilities:
-
 ```json
 {
-  "opencodeide.mcp.servers": [
+  "CodeForge.mcp.servers": [
     {
       "name": "github",
       "transport": "stdio",
@@ -113,54 +100,32 @@ Configure MCP servers for extended capabilities:
 
 ### Prerequisites
 
-- Node.js >= 20.0.0
-- npm >= 10.0.0
+- Node.js matching `vscode/.nvmrc` (for full IDE builds)
+- npm
 - Git
+- On Windows: Visual Studio C++ workload + Spectre-mitigated libs
 
 ### Building
 
 ```bash
-# Install dependencies
 npm install
-
-# Build all components
-npm run build
-
-# Watch mode for development
-npm run watch
-```
-
-### Testing
-
-```bash
-# Run all tests
+npm run build:extensions
 npm test
-
-# Run unit tests only
-npm run test:unit
-
-# Run integration tests
-npm run test:integration
-
-# Run E2E tests
-npm run test:e2e
 ```
 
-### Packaging
+### Packaging (Windows)
 
 ```bash
-# Package for current platform
-npm run package
+# Installer + portable + zip (recommended for distribution)
+npm run vscode:package:win
 
-# Package for Windows
-npm run package:win
-
-# Package for macOS
-npm run package:mac
-
-# Package for Linux
-npm run package:linux
+# Installer only (from existing portable build)
+npm run installer:win
 ```
+
+Requires Inno Setup: `winget install JRSoftware.InnoSetup`
+
+Artifact: `dist/codeforge-win32-x64/CodeForge-Setup-<version>-win32-x64.exe`
 
 ## License
 

@@ -7,6 +7,14 @@ node_modules/
 out/
 dist/
 *.tsbuildinfo
+compile-out.txt
+test-results/
+playwright-report/
+
+# Packaged Code-OSS / portable app (large; generate via package scripts)
+VSCode-win32-x64/
+VSCode-darwin-*/
+VSCode-linux-*/
 
 # IDE and editor
 .vscode/
@@ -55,6 +63,7 @@ release/
 
 # Local development
 .opencodeide/
+.CodeForge/
 
 # Secrets
 *.key

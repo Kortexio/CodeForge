@@ -1,8 +1,8 @@
-# Licensing Notes — OpenCodeIDE
+# Licensing Notes — CodeForge
 
 ## Decision
 
-**OpenCodeIDE uses the MIT License.**
+**CodeForge uses the MIT License.**
 
 ContextMemory (used only as architectural reference) is licensed under **AGPL-3.0**.
 
@@ -12,12 +12,12 @@ ContextMemory (used only as architectural reference) is licensed under **AGPL-3.
 |-------|----------|
 | Reuse ContextMemory source? | **No** — reimplement concepts from scratch |
 | Language | TypeScript (native IDE integration) |
-| OpenCodeIDE license | MIT |
+| CodeForge license | MIT |
 | AGPL inheritance risk | Avoided by not porting AGPL code |
 
 ## Rationale
 
-Copying or translating ContextMemory code into OpenCodeIDE would likely require OpenCodeIDE to also be AGPL-3.0. To maximize adoption and keep distribution simple, the team reimplements the same ideas (agent loop, wiki memory, compaction, harness modes, etc.) as original TypeScript.
+Copying or translating ContextMemory code into CodeForge would likely require CodeForge to also be AGPL-3.0. To maximize adoption and keep distribution simple, the team reimplements the same ideas (agent loop, wiki memory, compaction, harness modes, etc.) as original TypeScript.
 
 ## Guidance
 

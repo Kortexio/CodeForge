@@ -1,5 +1,5 @@
 /**
- * Apply OpenCodeIDE branding to Code-OSS product.json
+ * Apply CodeForge branding to Code-OSS product.json
  *
  * Usage: node scripts/apply-branding.mjs
  */
@@ -20,32 +20,42 @@ if (!fs.existsSync(productPath)) {
 const product = JSON.parse(fs.readFileSync(productPath, 'utf8'));
 
 const branding = {
-	nameShort: 'OpenCodeIDE',
-	nameLong: 'OpenCodeIDE - AI-Native Code Editor',
-	applicationName: 'opencodeide',
-	dataFolderName: '.opencodeide',
-	sharedDataFolderName: '.opencodeide-shared',
-	win32MutexName: 'opencodeide',
+	nameShort: 'CodeForge',
+	nameLong: 'CodeForge - AI-Native Code Editor',
+	applicationName: 'codeforge',
+	dataFolderName: '.codeforge',
+	sharedDataFolderName: '.codeforge-shared',
+	win32MutexName: 'codeforge',
 	licenseName: 'MIT',
-	licenseUrl: 'https://github.com/Kortexio/OpenCodeIDE/blob/main/LICENSE',
-	serverLicenseUrl: 'https://github.com/Kortexio/OpenCodeIDE/blob/main/LICENSE',
-	serverApplicationName: 'opencodeide-server',
-	serverDataFolderName: '.opencodeide-server',
-	tunnelApplicationName: 'opencodeide-tunnel',
-	win32DirName: 'OpenCodeIDE',
-	win32NameVersion: 'OpenCodeIDE',
-	win32RegValueName: 'OpenCodeIDE',
-	win32AppUserModelId: 'Kortexio.OpenCodeIDE',
-	win32ShellNameShort: 'OpenCodeIDE',
-	win32TunnelServiceMutex: 'opencodeide-tunnelservice',
-	win32TunnelMutex: 'opencodeide-tunnel',
-	darwinBundleIdentifier: 'com.kortexio.opencodeide',
-	linuxIconName: 'com.kortexio.opencodeide',
-	reportIssueUrl: 'https://github.com/Kortexio/OpenCodeIDE/issues/new',
-	urlProtocol: 'opencodeide',
+	licenseUrl: 'https://github.com/Kortexio/CodeForge/blob/main/LICENSE',
+	serverLicenseUrl: 'https://github.com/Kortexio/CodeForge/blob/main/LICENSE',
+	serverApplicationName: 'codeforge-server',
+	serverDataFolderName: '.codeforge-server',
+	tunnelApplicationName: 'codeforge-tunnel',
+	win32DirName: 'CodeForge',
+	win32NameVersion: 'CodeForge',
+	win32RegValueName: 'CodeForge',
+	win32AppUserModelId: 'Kortexio.CodeForge',
+	win32ShellNameShort: 'CodeForge',
+	win32TunnelServiceMutex: 'codeforge-tunnelservice',
+	win32TunnelMutex: 'codeforge-tunnel',
+	darwinBundleIdentifier: 'com.kortexio.codeforge',
+	linuxIconName: 'com.kortexio.codeforge',
+	reportIssueUrl: 'https://github.com/Kortexio/CodeForge/issues/new',
+	urlProtocol: 'codeforge',
+	// Avoid 'stable'/'insider' here — those require AppX context-menu packages.
+	quality: 'exploration',
 };
 
 Object.assign(product, branding);
+
+product.configurationDefaults = {
+	...(product.configurationDefaults || {}),
+	'workbench.sideBar.location': 'left',
+	'workbench.secondarySideBar.defaultVisibility': 'visible',
+	'chat.commandCenter.enabled': false,
+	'chat.disableAIFeatures': true,
+};
 
 // Keep existing AppIds / UUIDs from upstream if present; only set if missing
 if (!product.win32x64AppId) {
@@ -62,7 +72,8 @@ if (!product.win32arm64UserAppId) {
 }
 
 fs.writeFileSync(productPath, JSON.stringify(product, null, '\t') + '\n', 'utf8');
-console.log('Applied OpenCodeIDE branding to vscode/product.json');
+console.log('Applied CodeForge branding to vscode/product.json');
 console.log(`  nameShort: ${product.nameShort}`);
 console.log(`  applicationName: ${product.applicationName}`);
 console.log(`  dataFolderName: ${product.dataFolderName}`);
+console.log(`  chat.disableAIFeatures: ${product.configurationDefaults['chat.disableAIFeatures']}`);
