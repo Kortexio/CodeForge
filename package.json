@@ -1,6 +1,6 @@
 {
   "name": "codeforge",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "CodeForge - An open-source, model-independent, memory-native, agentic coding IDE",
   "author": {
     "name": "Kortexio",
@@ -30,7 +30,7 @@
   },
   "scripts": {
     "build": "npm run build:extensions",
-    "build:extensions": "tsc -p extensions/codeforge/tsconfig.json",
+    "build:extensions": "npm --prefix extensions/codeforge ci && tsc -p extensions/codeforge/tsconfig.json",
     "watch": "npm run watch:extensions",
     "watch:extensions": "tsc -p extensions/codeforge/tsconfig.json --watch",
     "test": "npm run test:unit",

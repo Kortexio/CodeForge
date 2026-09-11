@@ -159,9 +159,10 @@ async function gatherIdeState(): Promise<{
 
 	let openRelative: string | undefined;
 	if (editor) {
-		openRelative = vscode.workspace.asRelativePath(editor.document.uri);
-		editorPaths.push(openRelative);
-		lines.push(`- Open: ${openRelative} (${editor.document.languageId})`);
+		const rel = vscode.workspace.asRelativePath(editor.document.uri);
+		openRelative = rel;
+		editorPaths.push(rel);
+		lines.push(`- Open: ${rel} (${editor.document.languageId})`);
 		const sel = editor.document.getText(editor.selection);
 		if (sel.trim()) {
 			lines.push(`- Selection:\n\`\`\`\n${sel.slice(0, 2000)}\n\`\`\``);
@@ -171,15 +172,15 @@ async function gatherIdeState(): Promise<{
 	}
 
 	const tabs = vscode.window.tabGroups.all
-		.flatMap(g => g.tabs)
-		.map(t => {
+		.flatMap((g: vscode.TabGroup) => g.tabs)
+		.map((t: vscode.Tab) => {
 			const input = t.input as { uri?: vscode.Uri } | undefined;
 			return input?.uri ? vscode.workspace.asRelativePath(input.uri) : undefined;
 		})
 		.filter((p): p is string => !!p);
 	const dirty = vscode.workspace.textDocuments
-		.filter(d => d.isDirty && !d.isUntitled)
-		.map(d => vscode.workspace.asRelativePath(d.uri));
+		.filter((d: vscode.TextDocument) => d.isDirty && !d.isUntitled)
+		.map((d: vscode.TextDocument) => vscode.workspace.asRelativePath(d.uri));
 	for (const p of [...dirty, ...tabs]) {
 		if (!editorPaths.includes(p)) editorPaths.push(p);
 	}

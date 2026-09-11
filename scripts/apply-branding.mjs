@@ -55,6 +55,8 @@ product.configurationDefaults = {
 	'workbench.secondarySideBar.defaultVisibility': 'visible',
 	'chat.commandCenter.enabled': false,
 	'chat.disableAIFeatures': true,
+	// Code-OSS lacks Microsoft's extension signing infrastructure.
+	'extensions.verifySignature': false,
 };
 
 // Keep existing AppIds / UUIDs from upstream if present; only set if missing
@@ -77,3 +79,4 @@ console.log(`  nameShort: ${product.nameShort}`);
 console.log(`  applicationName: ${product.applicationName}`);
 console.log(`  dataFolderName: ${product.dataFolderName}`);
 console.log(`  chat.disableAIFeatures: ${product.configurationDefaults['chat.disableAIFeatures']}`);
+console.log(`  extensions.verifySignature: ${product.configurationDefaults['extensions.verifySignature']}`);
