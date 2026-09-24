@@ -19,11 +19,20 @@ resources/
     linux/
     darwin/
   icons/
-    win/
+    src/          # master PNG + SVG
+    win/          # code.ico + size PNGs
     mac/
     linux/
+    codeforge.png # 256px convenience copy
 ```
 
+## App icon
+
+Primary mark: teal anvil + code chevrons + amber spark on charcoal tile.
+
+- Source: `resources/icons/src/codeforge-icon-1024.png`
+- Windows: `resources/icons/win/code.ico` (also copied to Code-OSS `resources/win32/code.ico` at package time)
+- Alt concept kept at `resources/icons/src/codeforge-icon-alt-1024.png`
 ## Build notes
 
 - Prefer prebuilt binaries per platform in CI

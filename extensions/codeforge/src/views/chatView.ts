@@ -7,7 +7,10 @@
 import * as vscode from 'vscode';
 import { VSCodeAIBridge } from '../bridge/vscodeBridge';
 import { AiSettingsStore } from '../settings/aiSettingsStore';
-import { runAgentWithTools, AgentActivityEvent } from '../agent/agentLoop';
+import { runAgentWithTools, AgentActivityEvent, type AgentLoopOptions } from '../agent/agentLoop';
+import { runOrchestrated } from '../agent/orchestratorRun';
+import { runReviewPipeline } from '../agent/reviewPipeline';
+import { isReviewTask } from '../agent/toolsets';
 import { SessionStore } from '../sessions/sessionStore';
 import { getApprovalPolicy, PermissionLevel } from '../policy/approvalPolicy';
 import { ensureWorkspaceIndex, getIndexedCount } from '../intelligence/workspaceIndex';
@@ -68,6 +71,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 	private _hasAgentsMd = false;
 	private _running = false;
 	private _queue: Array<{ id: string; text: string; mode?: AgentMode }> = [];
+	/** Set by /cards, /plan-run and /review for the next run only. */
+	private _runKind?: 'cards' | 'plan-run' | 'review';
 
 	constructor(
 		extensionUri: vscode.Uri,
@@ -472,7 +477,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		const next = this._queue.shift();
 		this.pushQueue();
 		if (!next) return;
-		await this.runTask(next.text, next.mode);
+		await this.handleUserMessage(next.text, next.mode);
 	}
 
 	async cancelTask() {
@@ -768,7 +773,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 				onTaskUpdate: this._onTaskUpdate,
 				sessionStore: this._sessions,
 				sessionId: this._currentSessionId,
-				maxSteps: cfgAgentPlan.get<number>('agentCheckpointSteps') ?? 20,
+				maxSteps: cfgAgentPlan.get<number>('agentCheckpointSteps') ?? 30,
 				hardCap: cfgAgentPlan.get<number>('agentHardCap') ?? 100,
 				weakProfile,
 				planMode: true,
@@ -821,7 +826,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		}
 
 		const cfgAgent = vscode.workspace.getConfiguration('codeforge.ai');
-		return runAgentWithTools({
+		const runKind = this._runKind;
+		this._runKind = undefined;
+		const agentOpts: AgentLoopOptions = {
 			bridge: this._bridge,
 			provider,
 			apiKey,
@@ -850,10 +857,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			onTaskUpdate: this._onTaskUpdate,
 			sessionStore: this._sessions,
 			sessionId: this._currentSessionId,
-			maxSteps: cfgAgent.get<number>('agentCheckpointSteps') ?? 20,
+			maxSteps: cfgAgent.get<number>('agentCheckpointSteps') ?? 30,
 			hardCap: cfgAgent.get<number>('agentHardCap') ?? 100,
 			weakProfile,
-		});
+		};
+		if (runKind === 'review' || (!runKind && weakProfile && isReviewTask(task))) {
+			const reviewed = await runReviewPipeline(agentOpts, { forced: runKind === 'review' });
+			if (reviewed) return reviewed;
+		}
+		if (runKind !== 'review') {
+			const orchestrated = await runOrchestrated(agentOpts, { forced: !!runKind });
+			if (orchestrated) return orchestrated;
+		}
+		return runAgentWithTools(agentOpts);
 	}
 
 	private _onTaskUpdate?: (update: {
@@ -1029,8 +1045,31 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		await this.runTask(text, mode);
 	}
 
-	private async dispatchSlash(command: string, _args: string): Promise<boolean> {
+	private async dispatchSlash(command: string, args: string): Promise<boolean> {
 		switch (command) {
+			case 'cards':
+			case 'plan-run':
+			case 'review': {
+				if (this._running) {
+					this.enqueueMessage(`/${command}${args ? ` ${args}` : ''}`);
+					return true;
+				}
+				const fallback =
+					command === 'cards'
+						? 'Implement the cards in docs/ in dependency order.'
+						: command === 'review'
+							? 'Review the code in this workspace and find bugs.'
+							: '';
+				const task = args || fallback;
+				if (!task) {
+					this.addMessage('user', '/plan-run');
+					this.addMessage('assistant', 'Usage: /plan-run <what to build>');
+					return true;
+				}
+				this._runKind = command;
+				await this.runTask(task, this._mode === 'ask' || this._mode === 'plan' ? 'agent' : undefined);
+				return true;
+			}
 			case 'help':
 				this.addMessage('user', '/help');
 				this.addMessage('assistant', formatSlashHelp());

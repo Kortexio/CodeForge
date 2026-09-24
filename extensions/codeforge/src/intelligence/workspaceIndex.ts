@@ -8,6 +8,7 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import { codeIndexDir, ensureDir } from '../storage/paths';
 import { embedTexts } from './embeddings';
+import { LexicalFile, lexicalSearch, queryTerms } from './lexicalScore';
 
 export interface RetrieveHit {
 	path: string;
@@ -42,6 +43,9 @@ interface IndexFile {
 const EXCLUDE = '**/{node_modules,.git,bin,obj,dist,out,.vs,coverage,.next,target}/**';
 const SCAN_FILE_CAP = 800;
 const SCAN_BYTES_CAP = 400_000;
+const LEXICAL_FILE_CAP = 500;
+const BINARY_EXT =
+	/\.(png|jpe?g|gif|ico|webp|bmp|pdf|zip|gz|7z|tar|exe|dll|pdb|so|dylib|bin|woff2?|ttf|otf|eot|mp[34]|wav|db|sqlite|lock|nupkg|snk|pfx)$/i;
 
 let memoryPaths: string[] = [];
 let embeddingChunks: EmbeddingChunk[] = [];
@@ -113,6 +117,10 @@ export function getIndexedCount(): number {
 	return memoryPaths.length;
 }
 
+export function hasSemanticEmbeddings(): boolean {
+	return embeddingChunks.length > 0;
+}
+
 export async function retrieveSnippets(query: string, k = 6): Promise<RetrieveHit[]> {
 	const lexical = await lexicalRetrieve(query, k);
 	const semantic = await semanticRetrieve(query, Math.max(2, Math.floor(k / 2)));
@@ -132,42 +140,24 @@ export async function retrieveSnippets(query: string, k = 6): Promise<RetrieveHi
 async function lexicalRetrieve(query: string, k: number): Promise<RetrieveHit[]> {
 	const folder = vscode.workspace.workspaceFolders?.[0];
 	if (!folder) return [];
-	const pattern = query.trim().slice(0, 80) || '.';
+	if (!queryTerms(query).length) return [];
 	try {
-		const hits = await vscode.workspace.findFiles('**/*', EXCLUDE, 200);
-		const out: RetrieveHit[] = [];
-		let re: RegExp;
-		try {
-			re = new RegExp(pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
-		} catch {
-			re = /./i;
-		}
-		for (const uri of hits) {
-			if (out.length >= k * 3) break;
+		const uris = await vscode.workspace.findFiles('**/*', EXCLUDE, LEXICAL_FILE_CAP);
+		const files: LexicalFile[] = [];
+		for (const uri of uris) {
+			if (BINARY_EXT.test(uri.fsPath)) continue;
 			try {
 				const bytes = await vscode.workspace.fs.readFile(uri);
 				if (bytes.byteLength > SCAN_BYTES_CAP) continue;
-				const text = Buffer.from(bytes).toString('utf8');
-				const lines = text.split(/\r?\n/);
-				for (let i = 0; i < lines.length; i++) {
-					if (re.test(lines[i])) {
-						const start = Math.max(0, i - 1);
-						const snippet = lines.slice(start, i + 3).join('\n');
-						out.push({
-							path: vscode.workspace.asRelativePath(uri),
-							startLine: i + 1,
-							text: snippet,
-							score: 1,
-							source: 'lexical',
-						});
-						break;
-					}
-				}
+				files.push({
+					path: vscode.workspace.asRelativePath(uri),
+					text: Buffer.from(bytes).toString('utf8'),
+				});
 			} catch {
 				/* skip */
 			}
 		}
-		return out.slice(0, k);
+		return lexicalSearch(files, query, k).map(h => ({ ...h, source: 'lexical' as const }));
 	} catch {
 		return [];
 	}
@@ -289,5 +279,6 @@ export function formatRetrievedBlock(hits: RetrieveHit[]): string {
 					h.score !== undefined ? ` score=${h.score.toFixed(3)}` : ''
 				})\n\`\`\`\n${h.text.slice(0, 600)}\n\`\`\``
 		),
+		'Open a hit with read { path, startLine } to see the surrounding code.',
 	].join('\n\n');
 }

@@ -35,6 +35,7 @@
     "watch:extensions": "tsc -p extensions/codeforge/tsconfig.json --watch",
     "test": "npm run test:unit",
     "test:unit": "jest --config tests/unit/jest.config.js --passWithNoTests",
+    "bench": "node benchmarks/bench.mjs",
     "test:integration": "jest --config tests/integration/jest.config.js --passWithNoTests",
     "test:e2e": "playwright test -c playwright.config.ts",
     "lint": "eslint extensions/codeforge/src --ext .ts --max-warnings 50",

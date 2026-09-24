@@ -43,7 +43,8 @@ export interface GuardrailItem extends GovernanceItemBase {
 export type GovernanceItem = SkillItem | RuleItem | PolicyItem | GuardrailItem;
 
 export interface GovernanceState {
-	version: 1;
+	/** Bump when built-in defaults must be re-applied for existing installs. */
+	version: number;
 	skills: SkillItem[];
 	rules: RuleItem[];
 	policies: PolicyItem[];

@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-label="CodeForge">
+  <rect width="1024" height="1024" rx="224" fill="#1A1F26"/>
+  <!-- < -->
+  <path fill="#2DD4BF" stroke-linejoin="round" d="
+    M380 512
+    L560 300
+    L480 300
+    L260 512
+    L480 724
+    L560 724
+    Z
+  "/>
+  <!-- > -->
+  <path fill="#2DD4BF" d="
+    M644 512
+    L464 300
+    L544 300
+    L764 512
+    L544 724
+    L464 724
+    Z
+  "/>
+  <!-- spark * -->
+  <path fill="#F59E0B" d="
+    M512 360
+    L548 470
+    L664 490
+    L576 568
+    L604 680
+    L512 618
+    L420 680
+    L448 568
+    L360 490
+    L476 470
+    Z
+  "/>
+</svg>

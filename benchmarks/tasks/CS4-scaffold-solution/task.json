@@ -1,0 +1,19 @@
+{
+  "id": "CS4-scaffold-solution",
+  "category": "scaffold",
+  "fixture": "scaffold",
+  "runtime": "dotnet",
+  "title": "Create solution + Domain/Application projects (C01-lite)",
+  "prompt": "Read `docs/C01.md` and create the .NET solution it describes (projects, references and architecture test). Confirm with `dotnet test`.",
+  "protected": ["docs/"],
+  "checks": [
+    { "type": "exists", "file": "src/Acme.Router.Domain/Acme.Router.Domain.csproj", "why": "Domain project" },
+    { "type": "exists", "file": "src/Acme.Router.Application/Acme.Router.Application.csproj", "why": "Application project" },
+    { "type": "exists", "file": "tests/Acme.Router.ArchitectureTests/Acme.Router.ArchitectureTests.csproj", "why": "Architecture test project" },
+    { "type": "contains", "file": "src/Acme.Router.Application/Acme.Router.Application.csproj", "pattern": "Acme\\.Router\\.Domain", "why": "Application references Domain" },
+    { "type": "absent", "dir": "src/Acme.Router.Domain", "pattern": "Acme\\.Router\\.Application", "why": "Domain must not reference Application" }
+  ],
+  "bonus": [
+    { "type": "exists", "file": "Directory.Build.props", "why": "shared build props" }
+  ]
+}

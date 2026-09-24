@@ -10,9 +10,21 @@ import { getApprovalPolicy } from '../policy/approvalPolicy';
 import { getTrace } from '../trace/traceService';
 import { getMcp } from '../mcp/mcpClient';
 import { SessionStore } from '../sessions/sessionStore';
+import { buildPriorAgentTranscript } from './priorContext';
+import {
+	calibratedTokens,
+	isContextOverflowError,
+	parseOverflowTokens,
+	updateTokenCalibration,
+} from './contextOverflow';
+import {
+	filterAnthropicToolResults,
+	midCompactMessages,
+	normalizeToolProtocolHistory,
+	softCompactToolResults,
+} from './toolHistory';
 import * as lsp from '../intelligence/lspBridge';
 import * as git from '../intelligence/gitTools';
-import { ProgressEval, ProgressReviewDialog } from './progressReview';
 import {
 	StableFacts,
 	emptyStableFacts,
@@ -33,15 +45,55 @@ import { GuardrailSession } from '../governance/guardrailEngine';
 import { getSkillsRules } from '../skills/skillsRulesLoader';
 import { runAgentHooks } from '../hooks/hooksRunner';
 import { getSessionWikiStore } from '../memory/sessionWiki';
+import { learnFromShellFailure, isShellNoiseFailure } from '../memory/extendedMemory';
 import { getProjectWikiStore } from '../memory/projectWiki';
 import { getArtifactStore } from '../storage/artifacts';
 import { AgentStateMachine } from './stateMachine';
 import { DEFAULT_BUDGET } from '../context/engine';
 import * as browser from '../browser/agent';
+import {
+	claimsBuildOrTestGreen,
+	EMPTY_TURN_NOTE,
+	finalReplyNote,
+	LENGTH_CAP_NOTE,
+	oracleRejectNote,
+	parseBlockedClaim,
+} from './nudges';
+import { clipData, clipToolOutput } from './clip';
+import {
+	canonicalizePathKey,
+	invalidatePaths,
+	parseReadCoverage,
+	readAliasesFor,
+	rememberedReadWindow,
+} from './readMemory';
+import { detectOracle, exitCodeOf, formatOracleResult, nodeOracleFs, runOracle, type OracleResult } from './oracle';
+import {
+	buildDotnetCommand,
+	currentPhase,
+	DOTNET_TOOL,
+	isPartialRewrite,
+	LARGE_FILE_LINES,
+	mentionsErrorFile,
+	toolNamesFor,
+	type AgentPhase,
+} from './toolsets';
+
+/** Oracle result plus the cookbook fix for each error code present (only those). */
+export function oracleNote(result: OracleResult, reason: string): string {
+	const hints = result.ok ? [] : getSkillsRules().cookbookHints(result.errors.map(e => e.code)).slice(0, 6);
+	return formatOracleResult(result, reason) + (hints.length ? `\n\nKnown fixes:\n${hints.map(h => `- ${h}`).join('\n')}` : '');
+}
+import { applyEdit } from './editTool';
+
+function dotnetCommandLine(args: Record<string, unknown>): string {
+	const built = buildDotnetCommand(args);
+	return 'command' in built ? built.command : '';
+}
 
 // Note: subagent is inlined via recursive runAgentWithTools — no separate import (avoids cycles).
 
-const MUTATING = new Set(['write', 'delete', 'rename', 'shell', 'wiki_write', 'wiki_fact', 'browser_navigate', 'browser_click', 'browser_type']);
+const MUTATING = new Set(['write', 'edit', 'dotnet', 'delete', 'rename', 'shell', 'wiki_write', 'wiki_fact', 'browser_navigate', 'browser_click', 'browser_type']);
 const READONLY_TOOLS = new Set([
 	'read',
 	'list',
@@ -71,6 +123,32 @@ function normalizeShellCommand(cmd: string): string {
 		.replace(/\s+/g, ' ')
 		.trim()
 		.toLowerCase();
+}
+
+/** Strip Unix pipes that break on Windows cmd.exe; return cleaned command + note. */
+export function stripUnixPipes(command: string): { command: string; note?: string } {
+	const cleaned = command.replace(/\s*\|\s*(tail|head|grep)\b[^|&;]*/gi, '').trim();
+	if (cleaned === command.trim()) return { command: command.trim() };
+	return {
+		command: cleaned,
+		note: 'Removed Unix pipe (tail/head/grep) — shell is cmd.exe on Windows.',
+	};
+}
+
+function annotateRetrieveWithReadMemory(
+	output: string,
+	readPathsSeen: Set<string>,
+	readMaxEnd: Map<string, number>
+): string {
+	if (!output.startsWith('### RETRIEVED') || !readPathsSeen.size) return output;
+	return output.replace(/^####\s+(\S+):(\d+)/gm, (full, filePath: string, line: string) => {
+		const key = canonicalizePathKey(filePath);
+		const alt = key.startsWith('docs/') ? key.slice(5) : `docs/${key}`;
+		const seen = readPathsSeen.has(key) || readPathsSeen.has(alt);
+		if (!seen) return full;
+		const end = readMaxEnd.get(key) ?? readMaxEnd.get(alt);
+		return `${full} (already read${end ? ` ~L${end}` : ''} — prefer acting)`;
+	});
 }
 
 function simpleHash(text: string): string {
@@ -107,20 +185,56 @@ function getContextBudget(override?: number): number {
 	return n && n > 0 ? n : 32768;
 }
 
+/** Reserve completion headroom so prompt + max_tokens cannot exceed numCtx. */
+function outputTokenReserve(budget: number, maxTokens = 8192): number {
+	return Math.max(Math.floor(budget * 0.25), Math.min(maxTokens, Math.floor(budget * 0.4)));
+}
+
+/** Effective prompt budget after reserving space for the completion. */
+function promptTokenBudget(budget: number, maxTokens = 8192): number {
+	return Math.max(2048, budget - outputTokenReserve(budget, maxTokens));
+}
+
+function completionMaxTokens(budget: number): number {
+	if (budget <= 16384) return 4096;
+	if (budget <= 24576) return 6144;
+	return 8192;
+}
+
 function toolResultCharCap(budget: number): number {
-	// Scale with window; keep a hard ceiling so one tool dump cannot dominate.
-	const soft = Math.floor(budget * 0.25);
-	return Math.min(12000, Math.max(3000, soft));
+	// Use a real slice of the window — 32k should keep substantial tool bodies (Cursor-style).
+	const usable = promptTokenBudget(budget);
+	const soft = Math.floor(usable * 0.28);
+	const ceiling = budget >= 32000 ? 18000 : budget >= 16000 ? 12000 : 8000;
+	return Math.min(ceiling, Math.max(3500, soft));
 }
 
 function compactTokenThreshold(budget: number): number {
-	return Math.floor(budget * 0.68);
+	// Hard-compact when the usable prompt window is nearly full.
+	return Math.floor(promptTokenBudget(budget) * 0.9);
+}
+
+function softCompactTokenThreshold(budget: number): number {
+	return Math.floor(promptTokenBudget(budget) * 0.72);
+}
+
+function midCompactTokenThreshold(budget: number): number {
+	return Math.floor(promptTokenBudget(budget) * 0.82);
 }
 
 function compactEveryNSteps(budget: number): number {
-	if (budget >= 32000) return 12;
-	if (budget >= 16000) return 8;
-	return 4;
+	// Soft hygiene only; never force a hard LLM compact on a timer.
+	if (budget >= 32000) return 24;
+	if (budget >= 16000) return 16;
+	return 8;
+}
+
+/** Chars for prior-turn continuity — keep light (Cursor-style), not a second repo dump. */
+function priorTranscriptCharBudget(budget: number): number {
+	// ~10–12% of the token window in characters; hard caps so 110 old tools cannot dominate.
+	const target = Math.floor(budget * 0.45);
+	const ceiling = budget >= 32000 ? 10000 : budget >= 16000 ? 6000 : 3500;
+	return Math.min(ceiling, Math.max(2500, target));
 }
 
 /** Extra fields for Ollama-compatible gateways (ignored if unsupported). */
@@ -144,10 +258,29 @@ export const AGENT_TOOLS = [
 		type: 'function' as const,
 		function: {
 			name: 'read',
-			description: 'Read a file from the workspace',
+			description:
+				'Read a slice of a workspace file with line numbers. Default 120 lines from startLine; use startLine+limit for another slice.',
 			parameters: {
 				type: 'object',
-				properties: { path: { type: 'string' } },
+				properties: {
+					path: { type: 'string' },
+					startLine: {
+						type: 'number',
+						description: '1-based start line (default 1)',
+					},
+					limit: {
+						type: 'number',
+						description: 'Max lines to return (default 120, max 400)',
+					},
+					offset: {
+						type: 'number',
+						description: 'Alias for startLine',
+					},
+					endLine: {
+						type: 'number',
+						description: 'Optional inclusive end line (alternative to limit)',
+					},
+				},
 				required: ['path'],
 			},
 		},
@@ -157,14 +290,14 @@ export const AGENT_TOOLS = [
 		function: {
 			name: 'write',
 			description:
-				'Create or overwrite a file. Keep content COMPLETE and valid JSON. Prefer small files (<120 lines). For large files, write a minimal stub first then patch with another write — never emit truncated content.',
+				'Create a new file, or replace a whole file when most of it changes. To change part of an existing file use edit. content is the complete file body.',
 			parameters: {
 				type: 'object',
 				properties: {
 					path: { type: 'string' },
 					content: {
 						type: 'string',
-						description: 'Full file body. Must be complete; do not cut mid-string.',
+						description: 'Complete file body.',
 					},
 				},
 				required: ['path', 'content'],
@@ -174,16 +307,38 @@ export const AGENT_TOOLS = [
 	{
 		type: 'function' as const,
 		function: {
+			name: 'edit',
+			description:
+				'Replace an exact text span in an existing file. old_string must match the file exactly (including indentation) and be unique unless replace_all is true. Include 2-3 surrounding lines to make it unique.',
+			parameters: {
+				type: 'object',
+				properties: {
+					path: { type: 'string' },
+					old_string: { type: 'string', description: 'Exact existing text to replace' },
+					new_string: { type: 'string', description: 'Replacement text' },
+					replace_all: {
+						type: 'boolean',
+						description: 'Replace every occurrence (default false)',
+					},
+				},
+				required: ['path', 'old_string', 'new_string'],
+			},
+		},
+	},
+	DOTNET_TOOL,
+	{
+		type: 'function' as const,
+		function: {
 			name: 'list',
 			description:
-				'List files in ONE known subdirectory (non-recursive). Prefer retrieve over listing. Never recursive on repo root. Max ~2 lists per task.',
+				'List the files of one folder (non-recursive by default).',
 			parameters: {
 				type: 'object',
 				properties: {
 					path: { type: 'string' },
 					recursive: {
 						type: 'boolean',
-						description: 'Optional. Shallow recurse only; hard-capped. Prefer false.',
+						description: 'Optional shallow recursion (capped).',
 					},
 				},
 				required: ['path'],
@@ -552,6 +707,8 @@ export const AGENT_TOOLS = [
 	},
 ];
 
+const AGENT_TOOL_NAMES = new Set(AGENT_TOOLS.map(t => t.function.name));
+
 type ContentPart =
 	| { type: 'text'; text: string }
 	| { type: 'image_url'; image_url: { url: string } };
@@ -626,7 +783,7 @@ export interface AgentLoopOptions {
 	 * must emit tool_calls as JSON in content (parsed by parseProseToolCalls).
 	 */
 	proseToolsOnly?: boolean;
-	/** Initial checkpoint size (default 20). Extended on positive reviews. */
+	/** Initial checkpoint size (default 30). Extended on positive reviews. */
 	maxSteps?: number;
 	/** Absolute hard cap (default 100). */
 	hardCap?: number;
@@ -637,6 +794,13 @@ export interface AgentLoopOptions {
 	 * Plan mode: allow explore + wiki tools only (no production writes/shell mutators).
 	 */
 	planMode?: boolean;
+	/**
+	 * Clean context (orchestrator items): no chat history, no prior-session transcript or read memory.
+	 * Stable facts and tool traces are still shared through the session.
+	 */
+	isolated?: boolean;
+	/** Phase decided by the caller (orchestrator items) instead of inferred from the task text. */
+	basePhase?: AgentPhase;
 }
 
 const PLAN_MODE_TOOLS = new Set([
@@ -661,7 +825,7 @@ const PLAN_MODE_TOOLS = new Set([
 ]);
 
 export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string> {
-	const checkpointSize = opts.maxSteps ?? 20;
+	const checkpointSize = opts.maxSteps ?? 30;
 	const hardCap = opts.hardCap ?? 100;
 	const depth = opts.depth ?? 0;
 	const adaptive = depth === 0; // subagents keep fixed short budget
@@ -674,66 +838,57 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 	const mcpTools = mcp?.listTools() ?? [];
 	const governance = getGovernanceStore();
 	const weakProfile = opts.weakProfile === true;
-	const gates = new GuardrailSession(
-		governance.runtimeConfig({
-			weakProfile,
-			requireFailingTestBeforeImpl: weakProfile,
-		})
-	);
+	const gates = new GuardrailSession(governance.runtimeConfig({ weakProfile }));
 
-	const forceSkills = weakProfile ? ['skill.harness-weak-models'] : undefined;
+	const openPaths = collectOpenFilePaths(opts.workspaceRoot);
+	const forceSkills = [
+		...(weakProfile ? ['skill.harness-weak-models'] : []),
+		...(openPaths.some(p => /\.cshtml$|\.razor$|\/(Pages|Views)\//i.test(p)) ? ['skill.dotnet-razor'] : []),
+	];
 	const skillSection = [
 		governance.buildPromptSection(opts.task, { forceSkillIds: forceSkills }),
 		getSkillsRules().buildPromptSection(
 			opts.task,
-			collectOpenFilePaths(opts.workspaceRoot)
+			openPaths,
+			Math.min(5000, Math.max(2000, Math.floor(getContextBudget(opts.numCtx) * 0.08)))
 		),
 	]
 		.filter(Boolean)
 		.join('\n\n');
-	const mcpHint = mcpTools.length
+	const mcpHint = mcpTools.length && (!weakProfile || /\bmcp\b/i.test(opts.task))
 		? `MCP tools available via mcp_call: ${mcpTools.map(t => t.fullName).join(', ')}`
 		: '';
 	const agentsMdSection = await loadAgentsMdForPrompt();
 
-	const planModeHint = opts.planMode
+	const planModeHint = opts.planMode && opts.isolated
+		? 'Only exploration tools are available in this run.'
+		: opts.planMode
 		? [
 				'### PLAN MODE (active)',
-				'You may explore the repo and write a plan to the wiki (wiki_write id=task-plan with checklist + Definition of Done).',
-				'Do NOT implement: no write/delete/rename of source files, no mutating shell. When the plan is saved, stop and summarize the plan.',
+				'Explore the repo and write a plan to the wiki (wiki_write id=task-plan with checklist + Definition of Done).',
+				'Only explore and wiki tools are available in this mode. When the plan is saved, reply with a summary of it.',
 			].join('\n')
 		: '';
-	const weakHint = weakProfile
-		? '### WEAK MODEL HARNESS: keep steps tiny; plan first; TDD; verify APIs; build after each write.'
-		: '';
-
 	const systemBase = [
 		'You are CodeForge Agent, a coding agent inside a VS Code-based IDE on Windows.',
 		`Workspace root: ${opts.workspaceRoot ?? '(none — ask user to open a folder)'}`,
-		'You CAN and MUST use tools to read/write files and run commands.',
-		'Prefer relative paths from the workspace root.',
-		'On Windows shell: commands run via cmd.exe in the workspace. Prefer `dotnet …` without `cd`. `&&` works. Do not use PowerShell-only syntax.',
-		'Shell output (exit code + stdout/stderr) is returned to you — read it and adapt. Do not repeat a failing command unchanged.',
-		'.NET / Blazor: use Microsoft.AspNetCore.Components.WebAssembly (NOT Microsoft.AspNetCore.Blazor.WebAssembly). Match EF Core package versions to the project TFM. Prefer `dotnet list package` then `dotnet add package <Name>` one at a time on failure.',
-		'findstr on Windows: use simple substrings (e.g. findstr /i EntityFramework), not regex with \\|.',
-		'Use list (not shell ls). Use write for file content. Use shell for build/test/run.',
-		'Long-running servers (dotnet run, npm start, …) keep streaming in the Agent Terminal; after startup you get a handoff — do NOT re-run the same server; finish the task or keep editing.',
-		'Act from CONTEXT PACKET first (IDE STATE, RETRIEVE, STABLE FACTS). Do NOT start with a tour of the repo.',
-		'Default: retrieve or open/dirty files → targeted read → write/shell. Skip list unless a specific folder path is unknown.',
-		'Hard limit: at most 2 list calls and 3 explore reads per task before you must write, shell, or answer. Never list "." recursively. Never list every folder "just in case".',
-		'When you already know enough to answer or edit, STOP exploring. When the user goal is met, stop tools and give a short summary (what changed + how to run).',
-		'Respect STABLE FACTS and IDE STATE — never invent alternate project roots.',
-		'Use diagnostics after edits. Use git_* tools for VCS. Use wiki_* for durable memory. Use browser_* for visual checks when Playwright is available.',
-		'Use delegate_task only for focused parallel research (depth-1), not for routine listing.',
-		'CRITICAL for write tool: emit COMPLETE JSON arguments. Prefer files under ~120 lines per write. Never cut content mid-string — the gateway rejects truncated tool JSON.',
+		'Use the tools to read and change files and to run commands. Paths are relative to the workspace root.',
+		'For .NET use the `dotnet` tool (new, sln_add, add_reference, add_package, build, test); it runs from the workspace root with explicit paths.',
+		'Shell runs cmd.exe in the workspace root: `&&` works; PowerShell syntax and Unix pipes (tail/grep/head) do not.',
+		'Shell results include the exit code and output. When a command fails, change the command or the files before running it again.',
+		'Long-running servers (dotnet run, npm start) hand off after startup and keep streaming in the Agent Terminal; one start is enough.',
+		'The CONTEXT PACKET (IDE STATE, RETRIEVE, STABLE FACTS) is your starting point. STABLE FACTS hold the canonical project roots and open build errors.',
+		'Typical flow: retrieve/search → read the slice you will change → edit (existing file) or write (new file) → build/test.',
+		'Tool results stay in this chat. A repeated read of a range you already have returns the remembered text, marked as already in context.',
+		'The IDE runs the project build/test (oracle) after a few writes and when you finish; the task is done when it is green. If you cannot finish, reply with `blocked: <reason>`.',
+		'Final reply: a short summary of what changed and how to run it.',
 		opts.forceJson
 			? 'This server expects JSON responses. Prefer native tool_calls when available; otherwise reply with ONLY JSON like {"tool_calls":[{"id":"call_1","type":"function","function":{"name":"write","arguments":{"path":"...","content":"..."}}}]} — no markdown fences.'
 			: '',
 		opts.proseToolsOnly
-			? 'This model does NOT support native tools. You MUST reply with ONLY JSON tool_calls in content (no markdown). Example: {"tool_calls":[{"id":"call_1","type":"function","function":{"name":"retrieve","arguments":{"query":"..."}}}]}'
+			? 'This model has no native tools: reply with only JSON tool_calls in content (no markdown). Example: {"tool_calls":[{"id":"call_1","type":"function","function":{"name":"retrieve","arguments":{"query":"..."}}}]}'
 			: '',
 		planModeHint,
-		weakHint,
 		agentsMdSection,
 		skillSection,
 		mcpHint,
@@ -746,7 +901,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 		.slice(-16)
 		.map(m => ({
 			role: m.role as 'user' | 'assistant',
-			content: truncateHistory(m.content, 6000),
+			content: clipData(m.content.trim(), 6000),
 		}));
 
 	let facts: StableFacts = emptyStableFacts();
@@ -802,41 +957,209 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 	const recentFingerprints: string[] = [];
 	const resultCache = new Map<string, string>();
 	const readPathsSeen = new Set<string>();
+	/** Highest end line already returned per path (1-based inclusive). */
+	const readMaxEnd = new Map<string, number>();
+	const listPathsSeen = new Set<string>();
+	const retrieveQueriesSeen = new Set<string>();
 	const warnedFingerprints = new Set<string>();
 	/** Shell (and other) fingerprints that already failed once this run — block identical retry. */
 	const failedFingerprints = new Map<string, number>();
+	/** successfulWriteCount at the time a fingerprint last failed (a later write allows a retry). */
+	const failedAtWriteCount = new Map<string, number>();
+	let successfulWriteCount = 0;
 	let consecutiveToolFails = 0;
 	const touchedPaths = new Set<string>();
 	let emptyFinishNudges = 0;
+	/** Extra retries when completion hits max_tokens (~8192) without a tool call. */
+	let lengthTruncationNudges = 0;
 	/** Retries when gateway rejects truncated tool-call JSON (common with large writes). */
 	let truncatedToolRetries = 0;
 	/** Retries when model dumps tool JSON in content but parse fails. */
 	let proseToolParseRetries = 0;
-	/** Soft retries when model returns empty / `{}` under forceJson instead of tools. */
-	let trivialFinishNudges = 0;
 	/** One-shot repair when Anthropic rejects orphan tool_use without tool_result. */
 	let toolHistoryRepairedOnce = false;
-	/** After negative checkpoint: block explore tools for N LLM steps so the model must write/build. */
-	let exploreBanSteps = 0;
-	let exploreOnlyStreak = 0;
-	/** Soft explore nudge fires once per streak window (avoid spam). */
-	let exploreSoftNudged = false;
-	/** Total list calls this run — hard-capped to stop repo tours. */
-	let listCallCount = 0;
-	/** Total explore-tool successes this run before a write/shell. */
-	let exploreBudgetUsed = 0;
-	let systemBaseWithPacket = system;
+	/** Soft-memory hits per path this run (UI only). */
+	const softReadHits = new Map<string, number>();
+	let phase: AgentPhase = 'implement';
+	let lastPhase: AgentPhase | undefined;
+	let activeToolNames = new Set(AGENT_TOOL_NAMES);
+	/** Consecutive explore calls while the build is red (weak-profile gate). */
+	let readsWhileRed = 0;
+	/** Successful write/edit calls since the oracle last ran. */
+	let writesSinceOracle = 0;
+	/** Finish attempts refused because the oracle was red. */
+	let oracleRejections = 0;
+	const MAX_ORACLE_REJECTIONS = 6;
+	const oracleCfg = opts.planMode ? undefined : detectOracle(opts.workspaceRoot, nodeOracleFs);
+	let lastProgressMarker = '';
+	const progressMarker = () =>
+		`${successfulWriteCount}|${readPathsSeen.size}|${gates.buildRed ? 'red' : 'ok'}|${gates.lastBuildErrors.length}`;
+	const runOracleNow = async (reason: string) => {
+		opts.onStatus?.(`Oracle: ${reason}…`);
+		const result = await runOracle(oracleCfg!, async command => {
+			const r = await opts.bridge.execute({
+				id: `oracle-${Date.now()}`,
+				name: 'shell',
+				arguments: { command },
+				abortSignal: opts.abortSignal,
+			});
+			const out = r.success ? r.output : `exit 1\n${r.error ?? 'oracle command failed'}`;
+			gates.onShellResult(command, exitCodeOf(out) === 0, out);
+			return out;
+		});
+		if (!result.ok) {
+			facts = mergeStableFacts(facts, {
+				openErrors: result.errors.length
+					? result.errors.slice(0, 15).map(e => `${e.file}${e.line ? `:${e.line}` : ''} ${e.code} ${e.msg}`)
+					: result.failedTests.slice(0, 15).map(t => `test failed: ${t}`),
+			});
+		} else {
+			facts = mergeStableFacts(facts, { openErrors: [] });
+		}
+		writesSinceOracle = 0;
+		trace?.info('oracle', `${result.ok ? 'green' : 'red'} ${reason} ${result.commands.join(' → ')}`);
+		opts.onActivity?.({
+			kind: 'checkpoint',
+			label: `Oracle ${result.ok ? 'verde' : 'vermelho'}`,
+			detail: result.ok
+				? result.commands.join(' → ')
+				: [...result.errors.slice(0, 3).map(e => `${e.code} ${e.file}:${e.line}`), ...result.failedTests.slice(0, 3)].join(' | '),
+		});
+		return result;
+	};
+
+	// Remember what this session already explored (survives "continua") — soft memory, not bans.
+	if (opts.sessionId && opts.sessionStore && !opts.isolated) {
+		const prior = opts.sessionStore.get(opts.sessionId)?.toolTraces ?? [];
+		const cap = toolResultCharCap(getContextBudget(opts.numCtx));
+		for (const t of prior) {
+			if (!t.success) continue;
+			const p =
+				typeof t.arguments?.path === 'string'
+					? String(t.arguments.path)
+							.replace(/\\/g, '/')
+							.replace(/\/+/g, '/')
+							.toLowerCase()
+					: '';
+			if (MUTATING.has(t.name)) {
+				// Later writes make earlier reads/lists stale.
+				const changed = [p, String(t.arguments?.oldPath ?? ''), String(t.arguments?.newPath ?? '')]
+					.map(x => canonicalizePathKey(x))
+					.filter(Boolean);
+				invalidatePaths(resultCache, readPathsSeen, readMaxEnd, changed.flatMap(readAliasesFor));
+				for (const k of [...resultCache.keys()]) if (k.startsWith('list:')) resultCache.delete(k);
+				listPathsSeen.clear();
+				continue;
+			}
+			if (t.name === 'list' && p) {
+				listPathsSeen.add(p);
+				if (t.output) {
+					resultCache.set(`list:${p}`, t.output.slice(0, cap));
+				}
+			}
+			if (t.name === 'read' && p) {
+				readPathsSeen.add(p);
+				const start = Math.max(1, Number(t.arguments.startLine ?? t.arguments.offset ?? 1) || 1);
+				const limit = Math.max(1, Number(t.arguments.limit ?? 120) || 120);
+				const parsed = parseReadCoverage(t.output ?? '');
+				const end = parsed?.end ?? start + limit - 1;
+				readMaxEnd.set(p, Math.max(readMaxEnd.get(p) ?? 0, end));
+				if (parsed?.total) {
+					// Whole file already seen — treat as fully covered so re-reads soft-hit.
+					if (parsed.end >= parsed.total) {
+						readMaxEnd.set(p, Math.max(readMaxEnd.get(p) ?? 0, parsed.total));
+					}
+				}
+				resultCache.set(`readwin:${p}@${start}@${limit}`, (t.output ?? '').slice(0, cap));
+			}
+			if (t.name === 'retrieve' || t.name === 'search') {
+				const q = String(t.arguments.query ?? t.arguments.pattern ?? '')
+					.trim()
+					.toLowerCase();
+				if (q) {
+					retrieveQueriesSeen.add(`${t.name}:${q}`);
+				}
+			}
+		}
+	}
+
+	if (readPathsSeen.size || listPathsSeen.size) {
+		const mem = [
+			'Paths opened earlier in this chat:',
+			listPathsSeen.size ? `Folders: ${[...listPathsSeen].join(', ')}` : '',
+			readPathsSeen.size
+				? `Files: ${[...readPathsSeen]
+						.map(p => {
+							const end = readMaxEnd.get(p);
+							return end ? `${p} (L1-${end})` : p;
+						})
+						.join(', ')}`
+				: '',
+		]
+			.filter(Boolean)
+			.join('\n');
+		messages[0] = {
+			role: 'system',
+			content: `${system}\n\n${mem}`,
+		};
+	}
+
+	// Cursor-style: light continuity — path index + few recent tool bodies (not the whole tour).
+	const priorSession =
+		opts.sessionId && opts.sessionStore && !opts.isolated ? opts.sessionStore.get(opts.sessionId) : undefined;
+	const priorTraces = priorSession?.toolTraces ?? [];
+	const priorTranscript = buildPriorAgentTranscript(
+		priorTraces,
+		priorTranscriptCharBudget(getContextBudget(opts.numCtx)),
+		getContextBudget(opts.numCtx),
+		priorSession?.rollingSummary
+	);
+	if (priorTranscript) {
+		const sys = messages[0];
+		const rest = messages.slice(1);
+		const head = rest.slice(0, -1);
+		const latestUser = rest[rest.length - 1];
+		messages = [
+			sys,
+			...head,
+			{
+				role: 'user',
+				content: priorTranscript,
+			},
+			{
+				role: 'assistant',
+				content:
+					'Understood — I have the earlier paths and recent tool results.',
+			},
+			latestUser,
+		];
+		opts.onActivity?.({
+			kind: 'context',
+			label: 'Prior context (Cursor-style)',
+			detail: `${priorTraces.length} traces → light index + recent bodies`,
+		});
+	}
+
+	/** Git availability for this run (IDE probe). */
+	let gitAvailable = true;
+	try {
+		await git.gitStatus();
+	} catch {
+		gitAvailable = false;
+	}
+	let systemBaseWithPacket =
+		typeof messages[0]?.content === 'string' ? messages[0].content : system;
 	const contextBudget = getContextBudget(opts.numCtx);
 	const toolCap = toolResultCharCap(contextBudget);
 	const compactEvery = compactEveryNSteps(contextBudget);
-	const softCompactAt = Math.floor(contextBudget * 0.45);
-	const midCompactAt = Math.floor(contextBudget * 0.58);
+	const softCompactAt = softCompactTokenThreshold(contextBudget);
+	const midCompactAt = midCompactTokenThreshold(contextBudget);
 	const compactAt = compactTokenThreshold(contextBudget);
-	const packetEvery = Math.max(3, Math.floor(compactEvery / 2));
+	const packetEvery = Math.max(4, Math.floor(compactEvery / 2));
 	opts.onActivity?.({
 		kind: 'context',
 		label: `contextBudget ${contextBudget}`,
-		detail: `num_ctx=${contextBudget}; soft@${softCompactAt} mid@${midCompactAt} hard@${compactAt}; packet every ${packetEvery}; tool cap ${toolCap}`,
+		detail: `num_ctx=${contextBudget}; soft@${softCompactAt} mid@${midCompactAt} hard@${compactAt}; packet every ${packetEvery}; tool cap ${toolCap}; priorTx ${priorTranscriptCharBudget(contextBudget)}`,
 	});
 
 	// Ensure Agent Terminal is visible even before the first shell call
@@ -847,8 +1170,13 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 	}
 	const reviewLog: string[] = [];
 	let compactedOnce = false;
+	let historyNukeOnce = false;
+	let tokenCalibration = 1;
+	let lastRealPromptTokens = 0;
+	let contextOverflowRetries = 0;
 	const taskId = opts.sessionId ?? `task-${Date.now()}`;
 	const started = Date.now();
+	const completionCap = completionMaxTokens(contextBudget);
 	opts.onTaskUpdate?.({
 		id: taskId,
 		name: truncateHistory(opts.task, 60),
@@ -870,8 +1198,10 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 				return 'Cancelled.';
 			}
 
-			const exploreBanned = exploreBanSteps > 0;
-			const tokEst = estimateTokens(messages);
+			const tokEst = Math.max(
+				calibratedTokens(estimateTokens(messages), tokenCalibration),
+				lastRealPromptTokens
+			);
 
 			// Refresh context packet periodically so IDE/retrieve stay current.
 			if (step > 0 && step % packetEvery === 0 && depth === 0) {
@@ -890,11 +1220,12 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 								wiki_session: 0.08,
 								wiki_project: 0.08,
 								facts: 0.06,
+								lessons: 0.07,
 								ide: 0.12,
 								retrieve: 0.14,
 								git: 0.04,
 								mcp: 0.03,
-								history: 0.25,
+								history: 0.22,
 							},
 						},
 						boostPaths: [...touchedPaths],
@@ -932,7 +1263,9 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 				}
 			}
 
-			if (tokEst > compactAt || (step > 0 && step % compactEvery === 0)) {
+			// Compact only when the window is actually filling up.
+			// Do NOT hard-compact on a step timer — that wastes a 32k context (Cursor fills the window).
+			if (tokEst > compactAt) {
 				sm.transition('compacting');
 				opts.onActivity?.({
 					kind: 'compact',
@@ -956,12 +1289,21 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 			} else if (tokEst > midCompactAt) {
 				sm.transition('compacting');
 				opts.onActivity?.({ kind: 'compact', label: 'Mid compact (summarize old turns)…' });
-				messages = midCompactMessages(messages, systemBaseWithPacket);
+				messages = midCompactMessages(
+					messages as Parameters<typeof midCompactMessages>[0],
+					systemBaseWithPacket
+				) as ChatMessage[];
 				sm.transition('executing');
-			} else if (tokEst > softCompactAt) {
+			} else if (
+				tokEst > softCompactAt ||
+				(step > 0 && step % compactEvery === 0 && tokEst > Math.floor(softCompactAt * 0.85))
+			) {
 				sm.transition('compacting');
-				opts.onActivity?.({ kind: 'compact', label: 'Soft compact (trim tool results)…' });
-				messages = softCompactToolResults(messages, Math.floor(toolCap * 0.35));
+				opts.onActivity?.({ kind: 'compact', label: 'Soft compact (trim old tool results)…' });
+				messages = softCompactToolResults(
+					messages as Parameters<typeof softCompactToolResults>[0],
+					Math.floor(toolCap * 0.55)
+				) as ChatMessage[];
 				sm.transition('executing');
 			}
 
@@ -997,8 +1339,28 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 			}
 
 			const llmStart = Date.now();
-			normalizeToolProtocolHistory(messages);
-			const round = await postAgentRound(opts, url, sanitizeMessages(messages));
+			normalizeToolProtocolHistory(messages as Parameters<typeof normalizeToolProtocolHistory>[0]);
+			const sentTokenEstimate = estimateTokens(messages);
+			phase = opts.basePhase
+				? opts.basePhase === 'implement' && gates.buildRed
+					? 'fix'
+					: opts.basePhase
+				: currentPhase(opts.task, { buildRed: gates.buildRed });
+			activeToolNames = toolNamesFor(phase, opts.task, {
+				weakProfile,
+				allNames: [...AGENT_TOOL_NAMES].filter(n => !opts.planMode || PLAN_MODE_TOOLS.has(n)),
+			});
+			if (phase !== lastPhase) {
+				opts.onActivity?.({ kind: 'context', label: `Phase: ${phase}`, detail: [...activeToolNames].join(', ') });
+				lastPhase = phase;
+			}
+			const round = await postAgentRound(
+				opts,
+				url,
+				sanitizeMessages(messages),
+				completionCap,
+				AGENT_TOOLS.filter(t => activeToolNames.has(t.function.name))
+			);
 			if (!round.ok) {
 				const errText = round.errorText;
 				trace?.error('LLM error', `${round.status}: ${errText.slice(0, 300)}`);
@@ -1007,6 +1369,39 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					label: `LLM error ${round.status || ''}`.trim(),
 					detail: errText.slice(0, 400),
 				});
+				// Window overflow: shrink locally (a summarizing LLM call could overflow too) and retry.
+				if (isContextOverflowError(round.status, errText) && contextOverflowRetries < 2) {
+					contextOverflowRetries += 1;
+					const over = parseOverflowTokens(errText);
+					tokenCalibration = updateTokenCalibration(
+						tokenCalibration,
+						sentTokenEstimate,
+						over.prompt
+					);
+					const aggressive = contextOverflowRetries > 1;
+					messages = midCompactMessages(
+						softCompactToolResults(
+							messages as Parameters<typeof softCompactToolResults>[0],
+							aggressive ? 700 : Math.floor(toolCap * 0.35),
+							aggressive ? 0 : 3,
+							aggressive ? 900 : 1800
+						),
+						systemBaseWithPacket
+					) as ChatMessage[];
+					normalizeToolProtocolHistory(
+						messages as Parameters<typeof normalizeToolProtocolHistory>[0]
+					);
+					opts.onStatus?.(
+						`Context full${over.prompt && over.ctx ? ` (${over.prompt}/${over.ctx})` : ''} — compacting and retrying…`
+					);
+					opts.onActivity?.({
+						kind: 'compact',
+						label: `Context overflow — compact + retry ${contextOverflowRetries}/2`,
+						detail: errText.slice(0, 200),
+					});
+					step -= 1;
+					continue;
+				}
 				if (round.status === 408 || /timeout|timed out|cancelled/i.test(errText)) {
 					opts.onActivity?.({
 						kind: 'checkpoint',
@@ -1017,11 +1412,13 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 				// All providers: orphan tool_calls / broken tool turns → normalize and retry once.
 				if (isBrokenToolHistoryError(round.status, errText) && !toolHistoryRepairedOnce) {
 					toolHistoryRepairedOnce = true;
-					const n = normalizeToolProtocolHistory(messages);
+					const n = normalizeToolProtocolHistory(
+						messages as Parameters<typeof normalizeToolProtocolHistory>[0]
+					);
 					opts.onStatus?.(
 						n
-							? `Histórico de tools reparado (${n}) — a repetir…`
-							: 'Histórico de tools inválido — a repetir…'
+							? `Tool history repaired (${n}) — retrying…`
+							: 'Invalid tool history — retrying…'
 					);
 					opts.onActivity?.({
 						kind: 'checkpoint',
@@ -1044,15 +1441,12 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					messages.push({
 						role: 'user',
 						content: [
-							'### MODEL HAS NO NATIVE TOOL SUPPORT',
-							'The API rejected `tools` for this model.',
-							'From now on reply with ONLY valid JSON tool_calls in your message content (no markdown fences):',
+							'The API rejected native tools for this model. From now on, call tools with JSON in the message content (no markdown fences):',
 							'{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"retrieve","arguments":{"query":"relevant files"}}}]}',
-							'Prefer retrieve/write/shell. Do not list the whole workspace. Stop when the user task is done.',
 						].join('\n'),
 					});
 					opts.onStatus?.(
-						`Modelo sem tools nativas (${opts.model}) — a continuar em modo JSON…`
+						`Model has no native tools (${opts.model}) — continuing in JSON mode…`
 					);
 					opts.onActivity?.({
 						kind: 'checkpoint',
@@ -1067,14 +1461,11 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					messages.push({
 						role: 'user',
 						content: [
-							'### TOOL CALL JSON WAS TRUNCATED (gateway rejected it)',
-							'Your last tool call had incomplete JSON arguments (often a cut-off `write.content`).',
-							'Retry with SMALLER writes: one short file at a time (<120 lines), complete valid JSON, no mid-string cuts.',
-							'Prefer fixing existing files with small patches over rewriting large Razor/HTML in one call.',
-							`Attempt ${truncatedToolRetries}/3.`,
+							'The gateway rejected your last tool call: its JSON arguments were incomplete (usually a long write.content cut off).',
+							'Repeat it smaller: change an existing file with edit, or write a new file in parts.',
 						].join('\n'),
 					});
-					opts.onStatus?.('Tool JSON truncado — a pedir write mais pequeno…');
+					opts.onStatus?.('Truncated tool JSON — asking for a smaller write…');
 					opts.onActivity?.({
 						kind: 'checkpoint',
 						label: 'Retry: truncated tool JSON',
@@ -1094,8 +1485,33 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 						facts,
 						gates.compactStickyExtra()
 					);
-					normalizeToolProtocolHistory(messages);
+					normalizeToolProtocolHistory(
+						messages as Parameters<typeof normalizeToolProtocolHistory>[0]
+					);
 					opts.onStatus?.('Gateway lost context — retrying with compacted history…');
+					step -= 1;
+					continue;
+				}
+				if (isBrokenToolHistoryError(round.status, errText) && !historyNukeOnce) {
+					historyNukeOnce = true;
+					const digest = [
+						`Task: ${opts.task}`,
+						summarizeActionsForLlm(actions),
+						reviewLog.length ? `Last checkpoint: ${reviewLog[reviewLog.length - 1]}` : '',
+						'The earlier tool transcript was invalid and was reset; the progress above is what happened so far. Files may be read again as needed.',
+					]
+						.filter(Boolean)
+						.join('\n');
+					messages = [
+						{ role: 'system', content: systemBaseWithPacket },
+						{ role: 'user', content: digest },
+					];
+					opts.onStatus?.('Invalid history — minimal reset, retrying…');
+					opts.onActivity?.({
+						kind: 'checkpoint',
+						label: 'Nuked broken tool history',
+						detail: errText.slice(0, 200),
+					});
 					step -= 1;
 					continue;
 				}
@@ -1109,8 +1525,18 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 			}
 			truncatedToolRetries = 0;
 			toolHistoryRepairedOnce = false;
+			contextOverflowRetries = 0;
 
 			const data = round.data;
+			tokenCalibration = updateTokenCalibration(
+				tokenCalibration,
+				sentTokenEstimate,
+				data.usage?.prompt_tokens ?? data.usage?.input_tokens
+			);
+			const realIn = Number(data.usage?.prompt_tokens ?? data.usage?.input_tokens ?? 0) || 0;
+			if (realIn > 0) {
+				lastRealPromptTokens = realIn;
+			}
 
 			trace?.llm({
 				label: `step ${step + 1}`,
@@ -1123,6 +1549,11 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 			if (!msg) {
 				throw new Error('Empty LLM response');
 			}
+			const finishReason = String(
+				data.choices?.[0]?.finish_reason ?? data.choices?.[0]?.stop_reason ?? ''
+			).toLowerCase();
+			const tokensOut =
+				Number(data.usage?.completion_tokens ?? data.usage?.output_tokens ?? 0) || 0;
 
 			let toolCalls = normalizeToolCalls(msg.tool_calls ?? []);
 			// Some local models put text in alternate fields or return huge empty generations
@@ -1178,12 +1609,9 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					messages.push({
 						role: 'user',
 						content: [
-							'Your previous message looked like a tool call but was NOT valid JSON (often Windows paths need \\\\).',
-							'Call tools using the native tool/function protocol if available.',
-							'Otherwise reply with ONLY valid JSON (no markdown fences, no trailing ```):',
+							'Your previous message looked like a tool call but was not valid JSON (Windows backslashes need escaping as \\\\; relative paths avoid this).',
+							'Use the native tool protocol, or reply with only valid JSON (no markdown fences):',
 							'{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"write","arguments":{"path":"hello.txt","content":"Hello, World!"}}}]}',
-							'Use relative paths when possible (avoid c:\\\\...).',
-							'Do NOT reply with {} or prose — emit a real tool call and continue the mission.',
 						].join('\n'),
 					});
 					step -= 1;
@@ -1195,98 +1623,88 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 			const assistantContent = toolCalls.length && looksLikeToolJson(content) ? '' : content;
 
 			if (!toolCalls.length) {
-				const writes = actions.filter(a => a.startsWith('write ')).length;
-				const shells = actions.filter(a => a.startsWith('shell')).length;
 				const trivial = isTrivialAssistantContent(content);
-				const substantive =
-					!!content &&
-					!trivial &&
-					!looksLikeToolJson(content) &&
-					content.trim().length >= 40;
-				const codingTask =
-					/\b(create|implement|add|fix|write|build|gerar|criar|implementar|corrigir|adicionar|refactor|migrate)\b/i.test(
-						opts.task
-					);
-				const needsBuild =
-					/\b(build|run|dotnet|test|compilar|executar)\b/i.test(opts.task) &&
-					writes > 0 &&
-					shells === 0;
+				const hitLengthCap =
+					finishReason === 'length' ||
+					tokensOut >= 7500 ||
+					(content.length >= 12000 && !looksLikeToolJson(content));
 
-				// Only force more tools for empty/broken turns — never for a real answer after listing.
-				const stillNeedsTools =
-					looksLikeToolJson(content) ||
-					((!content || trivial) && emptyFinishNudges < 2) ||
-					(codingTask && writes === 0 && !substantive && emptyFinishNudges < 2) ||
-					(needsBuild && !substantive && emptyFinishNudges < 2);
-
-				if (stillNeedsTools && step + 1 < stepBudget) {
-					emptyFinishNudges += 1;
-					if (trivial || !content) {
-						trivialFinishNudges += 1;
-					}
-					const nudge = [
-						'### CONTINUE — do not stop yet',
-						'Your last turn had no usable tool call (empty, `{}`, or invalid tool JSON).',
-						content && !trivial
-							? `Last text:\n${content.slice(0, 1200)}`
-							: 'Last model turn was empty/trivial.',
-						codingTask && writes === 0
-							? 'REQUIRED: write the change (retrieve one target file first if needed). Do NOT list the whole repo.'
-							: needsBuild
-								? 'REQUIRED: run shell build/test now, then summarize.'
-								: 'Emit a real tool call, or if the task is already done reply with a short final summary and STOP.',
-						actions.length ? `Actions so far: ${actions.slice(-8).join(' | ')}` : '',
-					]
-						.filter(Boolean)
-						.join('\n');
-					messages.push({ role: 'assistant', content: content || '(empty)' });
-					messages.push({ role: 'user', content: nudge });
-					opts.onStatus?.(
-						`Sem progresso útil — a forçar continuação (${emptyFinishNudges}/2)…`
-					);
+				// Completion budget ran out mid-answer: a technical event, so say so and continue.
+				if (hitLengthCap && lengthTruncationNudges < 5 && step + 1 <= stepBudget) {
+					lengthTruncationNudges += 1;
+					messages.push({ role: 'assistant', content: clipData(content || '(truncated)', 1500) });
+					const note = LENGTH_CAP_NOTE;
+					trace?.info('harness', String(note.length));
+					messages.push({ role: 'user', content: note });
+					opts.onStatus?.(`Truncated reply (max_tokens) — continuing (${lengthTruncationNudges}/5)…`);
 					opts.onActivity?.({
 						kind: 'checkpoint',
-						label: 'Forced continue',
-						detail: trivial ? 'trivial/empty model output' : content.slice(0, 160),
+						label: 'Truncated completion — retry tools',
+						detail: `finish_reason=${finishReason || '?'} tokensOut=${tokensOut}`,
 					});
+					step -= 1;
+					continue;
+				}
+
+				// Empty turn before any work: one neutral reminder, then accept.
+				if ((!content || trivial) && successfulWriteCount === 0 && emptyFinishNudges < 2 && step + 1 < stepBudget) {
+					emptyFinishNudges += 1;
+					const note = EMPTY_TURN_NOTE;
+					trace?.info('harness', String(note.length));
+					messages.push({ role: 'assistant', content: content || '(empty)' });
+					messages.push({ role: 'user', content: note });
 					continue;
 				}
 
 				const summary =
-					content ||
-					(actions.length
-						? 'Parado sem texto final do modelo. Peça “continua” se a missão não estiver completa.'
-						: '(no response)');
-				// Never surface raw tool JSON as the final chat answer
+					content && !trivial
+						? content
+						: actions.length
+							? `Stopped without a final reply from the model.\n${summarizeActionsForLlm(actions)}`
+							: '(no response)';
 				if (looksLikeToolJson(summary)) {
 					return [
-						'O modelo ficou a devolver JSON de ferramentas inválido e esgotou as tentativas.',
-						'Desative "Require JSON responses" neste servidor ou peça de novo com um ficheiro relativo (ex.: hello.txt).',
-						`Pré-visualização: ${summary.slice(0, 240)}`,
+						'The model kept returning invalid tool JSON and ran out of retries.',
+						'Disable "Require JSON responses" on this server, or ask again with a relative file path (e.g. hello.txt).',
+						`Preview: ${summary.slice(0, 240)}`,
 					].join('\n');
 				}
-				if (isTrivialAssistantContent(summary) && actions.length) {
-					return [
-						'O modelo parou com resposta vazia após algumas ações.',
-						'Peça “continua” no chat para retomar.',
-						summarizeActionsForLlm(actions),
-					].join('\n');
+
+				// Done is decided by the oracle: after changes, build/test must be green (or the model says blocked).
+				const blocked = parseBlockedClaim(summary);
+				const changedFiles = successfulWriteCount > 0;
+				let doneNote = '';
+				if (!blocked && changedFiles && !opts.planMode && oracleCfg && !gates.hasVerifiedGreen()) {
+					const result = await runOracleNow('finish check');
+					if (!result.ok && oracleRejections < MAX_ORACLE_REJECTIONS && step + 1 < stepBudget) {
+						oracleRejections += 1;
+						const note = oracleRejectNote(oracleNote(result, 'finish check'));
+						trace?.info('harness', String(note.length));
+						messages.push({ role: 'assistant', content: summary });
+						messages.push({ role: 'user', content: note });
+						opts.onStatus?.(`Oracle vermelho — a continuar (${oracleRejections}/${MAX_ORACLE_REJECTIONS})…`);
+						continue;
+					}
+					if (!result.ok) {
+						doneNote = finalReplyNote('still-red', result.commands[result.commands.length - 1]);
+					}
+				} else if (!blocked && changedFiles && !oracleCfg && claimsBuildOrTestGreen(summary) && !gates.hasVerifiedGreen()) {
+					doneNote = finalReplyNote('unverified');
 				}
+
 				opts.onTaskUpdate?.({
 					id: taskId,
 					name: truncateHistory(opts.task, 60),
-					status: 'completed',
+					status: blocked ? 'failed' : 'completed',
 					result: summary.slice(0, 200),
 					elapsed: Date.now() - started,
 				});
 				opts.onActivity?.({
 					kind: 'checkpoint',
-					label: 'Turn summary',
-					detail: summarizeActionsForLlm(actions).slice(0, 400),
+					label: blocked ? 'Blocked' : 'Turn summary',
+					detail: blocked ?? summarizeActionsForLlm(actions).slice(0, 400),
 				});
-				// Keep conversational reply clean — do not append Actions/Checkpoints dumps
-				// (they pollute session history sent back to the LLM).
-				return summary;
+				return summary + doneNote;
 			}
 
 			messages.push({
@@ -1294,6 +1712,8 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 				content: assistantContent || '',
 				tool_calls: toolCalls,
 			});
+			lengthTruncationNudges = 0;
+			emptyFinishNudges = 0;
 
 			const exploreTools = new Set([
 				'read',
@@ -1334,89 +1754,70 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 				}
 
 				const name = call.function.name;
+				const toolAdvice: string[] = [];
+				const refuse = (content: string, label: string) => {
+					trace?.info('harness', String(content.length));
+					messages.push({ role: 'tool', tool_call_id: call.id, name, content });
+					actions.push(`${name} blocked (${label})`);
+				};
+
 				if (name === 'write' && typeof args.content === 'string' && args.content.length > 14000) {
-					messages.push({
-						role: 'tool',
-						tool_call_id: call.id,
-						name,
-						content:
-							'Write rejected: content too large for a single tool call. ' +
-							'Split into a smaller stub write, then follow-up writes. Keep each write under ~120 lines.',
-					});
-					actions.push('write blocked (too large)');
-					continue;
-				}
-				if (exploreBanned && exploreTools.has(name)) {
-					messages.push({
-						role: 'tool',
-						tool_call_id: call.id,
-						name,
-						content: [
-							`BLOCKED: ${name} is temporarily banned after REPLAN (${exploreBanSteps} steps left).`,
-							'You already explored enough. Next tools MUST be write and/or shell (dotnet build / dotnet run).',
-							'Fix compile errors from the last build: in Razor use double quotes for strings (not single quotes); use ValidationMessageFor (not ValidationFor); replace invented PagePath(...) with href="/path".',
-						].join('\n'),
-					});
-					actions.push(`${name} blocked (replan)`);
+					refuse(
+						'Not written: content is larger than one tool call can carry reliably (14k chars). Write the file in parts (write the first part, then add the rest with edit).',
+						'too large'
+					);
 					continue;
 				}
 
-				// Hard caps: stop repo-wide listing tours before they eat the turn.
+				if (weakProfile && !activeToolNames.has(name) && AGENT_TOOL_NAMES.has(name)) {
+					refuse(
+						`Tool "${name}" is not available in the ${phase} phase. Available now: ${[...activeToolNames].join(', ')}.`,
+						'phase'
+					);
+					continue;
+				}
+
+				// Weak profile: a full rewrite of a large existing file loses code; edit is the tool for that.
+				if (weakProfile && name === 'write' && gates.cfg.blockMassRewrite && typeof args.path === 'string') {
+					const existing = await opts.bridge.readRaw(String(args.path));
+					const existingLines = existing?.split(/\r?\n/).length ?? 0;
+					if (existing !== undefined && existingLines > LARGE_FILE_LINES && isPartialRewrite(existing, String(args.content ?? ''))) {
+						refuse(
+							`Not written: ${args.path} already has ${existingLines} lines and most of them would stay the same. Change the parts that differ with edit (old_string → new_string).`,
+							'large rewrite'
+						);
+						continue;
+					}
+				}
+
+				// Weak profile: with the build red, three reads are enough to locate the error; broad exploration waits.
+				if (
+					weakProfile &&
+					gates.buildRed &&
+					readsWhileRed >= 3 &&
+					(name === 'list' || name === 'retrieve' || name === 'search' || (name === 'read' && !mentionsErrorFile(String(args.path ?? ''), gates.lastBuildErrors)))
+				) {
+					refuse(
+						[
+							'Not run: the build is red and three reads have happened since. Edit the files named in the errors, or run the build again.',
+							'Open errors:',
+							...gates.lastBuildErrors.slice(0, 8).map(e => `- ${e}`),
+						].join('\n'),
+						'red build'
+					);
+					continue;
+				}
+
 				if (name === 'list') {
 					const listPath = String(args.path ?? '.')
 						.replace(/\\/g, '/')
 						.replace(/^\.\//, '')
 						.trim();
 					const isRoot = !listPath || listPath === '.' || listPath === '/';
-					const recursive = Boolean(args.recursive);
-					if (recursive && isRoot) {
-						messages.push({
-							role: 'tool',
-							tool_call_id: call.id,
-							name,
-							content: [
-								'BLOCKED: recursive list of the workspace root is not allowed.',
-								'Use retrieve with a specific query, or list ONE subfolder (e.g. src/, Pages/).',
-								'Then write/shell or answer — do not tour the tree.',
-							].join('\n'),
-						});
-						actions.push('list blocked (root-recursive)');
-						exploreOnlyStreak += 1;
-						continue;
+					if (Boolean(args.recursive) && isRoot) {
+						args.recursive = false;
+						toolAdvice.push('(recursive listing of the workspace root is shallow — list a subfolder for more)');
 					}
-					if (listCallCount >= 2) {
-						messages.push({
-							role: 'tool',
-							tool_call_id: call.id,
-							name,
-							content: [
-								'BLOCKED: list budget exhausted (max 2 per task).',
-								'Use retrieve, read a known path, write, shell, or answer the user now.',
-							].join('\n'),
-						});
-						actions.push('list blocked (budget)');
-						exploreBanSteps = Math.max(exploreBanSteps, 3);
-						continue;
-					}
-				}
-
-				if (
-					exploreTools.has(name) &&
-					exploreBudgetUsed >= 3 &&
-					!exploreBanned
-				) {
-					messages.push({
-						role: 'tool',
-						tool_call_id: call.id,
-						name,
-						content: [
-							`BLOCKED: explore budget exhausted (${exploreBudgetUsed} explore tools).`,
-							'CONTEXT PACKET + prior tool results are enough. Next: write, shell, or final answer.',
-						].join('\n'),
-					});
-					actions.push(`${name} blocked (explore-budget)`);
-					exploreBanSteps = Math.max(exploreBanSteps, 3);
-					continue;
 				}
 
 				const fingerprint = toolFingerprint(name, args);
@@ -1428,51 +1829,90 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 
 				const pathKey =
 					typeof args.path === 'string'
-						? args.path.replace(/\\/g, '/').replace(/\/+/g, '/').toLowerCase()
-						: '';
+						? canonicalizePathKey(args.path)
+						: typeof args.oldPath === 'string'
+							? canonicalizePathKey(String(args.oldPath))
+							: '';
 				const cached = resultCache.get(fingerprint);
 				const isReadonly = READONLY_TOOLS.has(name);
 				const priorFails = failedFingerprints.get(fingerprint) ?? 0;
 
-				// Block identical shell (or other mutating) retry after a prior failure.
-				if (priorFails >= 1 && (name === 'shell' || !isReadonly)) {
+				if (name === 'list' && pathKey && listPathsSeen.has(pathKey) && resultCache.has(`list:${pathKey}`)) {
+					const prior = resultCache.get(`list:${pathKey}`) ?? '';
+					const content = `(already in context — earlier listing of ${args.path})\n${clipData(prior, toolCap)}`;
 					messages.push({
 						role: 'tool',
 						tool_call_id: call.id,
 						name,
-						content: [
-							`BLOCKED: identical "${name}" already failed earlier in this run.`,
-							'Do not repeat the same command/args. Change the approach (different command, fix the file, or ask the user).',
-							name === 'shell'
-								? 'Tip: read the previous exit/stderr, then write a fix or run a different build target.'
-								: '',
-						]
-							.filter(Boolean)
-							.join('\n'),
+						content,
 					});
-					actions.push(`${name} blocked (failed-repeat)`);
-					pendingNudges.push(
-						`Circuit: "${name}" failed before with the same arguments. Try a different action.`
-					);
-					consecutiveToolFails += 1;
+					actions.push(`list ${args.path} cached`.trim());
+					opts.onActivity?.({
+						kind: 'tool',
+						label: `list cached ${args.path}`,
+						tool: name,
+						toolCallId: call.id,
+						toolStatus: 'ok',
+						success: true,
+						detail: content.slice(0, 200),
+					});
 					continue;
 				}
 
-				// Cursor-like anti-re-read: same path already seen this run → refuse full dump.
-				if (name === 'read' && pathKey && readPathsSeen.has(pathKey)) {
+				// Same path + covered window: return remembered content; new startLine past coverage still runs.
+				const readStart = Math.max(
+					1,
+					Number(args.startLine ?? args.offset ?? 1) || 1
+				);
+				const readLimit = Math.max(1, Math.min(400, Number(args.limit ?? 120) || 120));
+				const readAliases = readAliasesFor(pathKey);
+				const coveredEnd = Math.max(
+					0,
+					...readAliases.map(k => readMaxEnd.get(k) ?? 0)
+				);
+				const alreadyRead = readAliases.some(k => readPathsSeen.has(k));
+				const readWindowKey =
+					name === 'read' && pathKey ? `${pathKey}@${readStart}@${readLimit}` : '';
+				const cachedWindow =
+					name === 'read' && pathKey && alreadyRead
+						? rememberedReadWindow(resultCache, readAliases, readStart, readLimit)
+						: undefined;
+				if (name === 'read' && cachedWindow !== undefined && readStart <= coveredEnd) {
+					const hits = (softReadHits.get(pathKey) ?? 0) + 1;
+					softReadHits.set(pathKey, hits);
+					const content = `(already in context up to L${coveredEnd})\n${clipData(cachedWindow, toolCap)}`;
 					messages.push({
 						role: 'tool',
 						tool_call_id: call.id,
 						name,
-						content: [
-							`ALREADY_READ: ${args.path}`,
-							'You already read this file in this run. Do NOT read it again.',
-							`Known paths: ${[...readPathsSeen].slice(0, 20).join(', ')}`,
-							'Next: write the needed changes, then shell (dotnet build).',
-						].join('\n'),
+						content,
 					});
-					actions.push(`read skipped (already seen)`);
-					exploreOnlyStreak += 1;
+					actions.push(`read ${args.path} cached`.trim());
+					opts.onActivity?.({
+						kind: 'tool',
+						label: `read cached ${args.path}`,
+						tool: name,
+						toolCallId: call.id,
+						toolStatus: 'ok',
+						success: true,
+						detail: content.slice(0, 200),
+					});
+					continue;
+				}
+
+				// Identical failed command: not re-run (same input, same failure) unless files changed since.
+				if (
+					priorFails >= 1 &&
+					(name === 'shell' || name === 'dotnet') &&
+					failedAtWriteCount.get(fingerprint) === successfulWriteCount
+				) {
+					const refusal = [
+						'Not run: this exact command already failed in this run and no file changed since.',
+						'Change the command, or fix the files named in its output first.',
+					].join('\n');
+					messages.push({ role: 'tool', tool_call_id: call.id, name, content: refusal });
+					actions.push(`${name} advised (failed-repeat)`);
+					consecutiveToolFails += 1;
 					continue;
 				}
 
@@ -1481,36 +1921,12 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 						role: 'tool',
 						tool_call_id: call.id,
 						name,
-						content:
-							`[already fetched — do not re-read; use this and move on]\n${cached.slice(0, Math.min(2000, toolCap))}`,
+						content: `(already in context — same ${name} result for the same arguments)\n${clipToolOutput(name, cached, toolCap)}`,
 					});
 					if (!warnedFingerprints.has(fingerprint)) {
 						warnedFingerprints.add(fingerprint);
 						actions.push(`${name} cached`);
-						pendingNudges.push(
-							`You already have the result of ${name}. Do NOT call it again with the same arguments. ` +
-								`Continue with writes, diagnostics, build, or a final summary.`
-						);
 					}
-					exploreOnlyStreak += 1;
-					continue;
-				}
-
-				if (priorCount >= 2 && !isReadonly) {
-					messages.push({
-						role: 'tool',
-						tool_call_id: call.id,
-						name,
-						content: `Stopped: tool "${name}" repeated with the same arguments without progress. Change approach.`,
-					});
-					if (!warnedFingerprints.has(fingerprint)) {
-						warnedFingerprints.add(fingerprint);
-						actions.push(`${name} blocked (repeat)`);
-						pendingNudges.push(
-							'You repeated the same mutating tool call. Stop looping. Summarize progress and the next concrete step.'
-						);
-					}
-					consecutiveToolFails += 1;
 					continue;
 				}
 
@@ -1560,35 +1976,21 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					return 'Cancelled.';
 				}
 
-				const blocked = gates.blockReason(name, args);
-				if (blocked) {
-					messages.push({
-						role: 'tool',
-						tool_call_id: call.id,
-						name,
-						content: blocked,
-					});
-					pendingNudges.push(blocked);
-					actions.push(`${name} blocked (guardrail)`);
-					opts.onActivity?.({
-						kind: 'checkpoint',
-						label: `Guardrail blocked ${name}`,
-						detail: blocked.slice(0, 240),
-					});
-					continue;
+				const guardAdvice = gates.adviceFor(name, args);
+				if (guardAdvice) {
+					toolAdvice.push(guardAdvice);
 				}
 
 				if (opts.planMode && !PLAN_MODE_TOOLS.has(name)) {
-					const planBlock =
-						`Blocked by Plan mode: tool "${name}" is not allowed. ` +
-						`Use explore/wiki tools only, save task-plan via wiki_write, then switch to Agent to implement.`;
+					const planBlock = opts.isolated
+						? `Not run: "${name}" is not available in this run (exploration tools only).`
+						: `Not run: "${name}" is not available in Plan mode (explore and wiki tools only; the plan goes to wiki_write id=task-plan).`;
 					messages.push({
 						role: 'tool',
 						tool_call_id: call.id,
 						name,
 						content: planBlock,
 					});
-					pendingNudges.push(planBlock);
 					actions.push(`${name} blocked (plan mode)`);
 					continue;
 				}
@@ -1639,15 +2041,24 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					}
 				}
 
-				if (name === 'write') {
+				if (name === 'write' || name === 'edit') {
 					const policy = getApprovalPolicy();
 					const previewEdits =
 						vscode.workspace.getConfiguration('codeforge.ai').get<boolean>('previewEdits') ===
 						true;
 					// Cursor-like: if edits are auto-approved (or user already accepted), skip DiffPreview
 					// unless previewEdits is explicitly enabled.
-					if (previewEdits && !policy.isAutoApproved('write')) {
-						const ok = await maybeShowWriteDiff(opts.bridge, args);
+					let previewArgs: Record<string, unknown> | undefined = args;
+					if (name === 'edit') {
+						const current = await opts.bridge.readRaw(String(args.path ?? ''));
+						const applied =
+							current === undefined
+								? undefined
+								: applyEdit(current, String(args.old_string ?? ''), String(args.new_string ?? ''), args.replace_all === true);
+						previewArgs = applied?.ok ? { path: args.path, content: applied.text } : undefined;
+					}
+					if (previewArgs && previewEdits && !policy.isAutoApproved('write')) {
+						const ok = await maybeShowWriteDiff(opts.bridge, previewArgs);
 						if (!ok) {
 							messages.push({
 								role: 'tool',
@@ -1666,7 +2077,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 				let durationMs: number;
 				let success: boolean;
 				try {
-					output = await executeTool(opts, name, args, call.id, depth);
+					output = await executeTool(opts, name, args, call.id, depth, { gitAvailable });
 					durationMs = Date.now() - toolStart;
 					success = isToolSuccess(name, output);
 				} catch (toolErr) {
@@ -1704,27 +2115,50 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					}
 				} else {
 					failedFingerprints.set(fingerprint, priorFails + 1);
+					failedAtWriteCount.set(fingerprint, successfulWriteCount);
 					consecutiveToolFails += 1;
 				}
 
-				if (name === 'shell') {
-					const nudge = gates.onShellResult(args.command, success, output);
-					if (nudge) {
-						pendingNudges.push(nudge);
-						if (gates.lastBuildErrors.length) {
-							facts = mergeStableFacts(facts, { openErrors: gates.lastBuildErrors });
+				const shellLike = name === 'shell' || name === 'dotnet';
+				if (shellLike) {
+					const cmdStr = name === 'dotnet' ? dotnetCommandLine(args) : String(args.command ?? '');
+					const buildAdvice = gates.onShellResult(cmdStr, success, output);
+					if (gates.buildRed && gates.lastBuildErrors.length) {
+						facts = mergeStableFacts(facts, { openErrors: gates.lastBuildErrors });
+						if (buildAdvice) {
+							opts.onActivity?.({
+								kind: 'checkpoint',
+								label: 'Build-fix mode',
+								detail: gates.lastBuildErrors.slice(0, 3).join(' | '),
+							});
 						}
-						opts.onActivity?.({
-							kind: 'checkpoint',
-							label: 'Build-fix mode',
-							detail: gates.lastBuildErrors.slice(0, 3).join(' | '),
-						});
-					} else if (success && gates.lastBuildErrors.length === 0 && !gates.buildRed) {
+					} else if (success && !gates.buildRed) {
 						facts = mergeStableFacts(facts, { openErrors: [] });
 					}
+					if (!success && name === 'shell') {
+						output = enrichShellFailure(cmdStr, output, opts.workspaceRoot);
+						try {
+							const learned = await learnFromShellFailure(opts.workspaceRoot, cmdStr, output);
+							if (learned) {
+								output = `${output}\n\n${learned.adviceBlock}`;
+								opts.onActivity?.({
+									kind: 'checkpoint',
+									label: 'Lesson learned',
+									detail: learned.lesson.id,
+								});
+							}
+						} catch {
+							/* best-effort */
+						}
+					}
 				}
-				if (name === 'write' && success) {
+				if ((name === 'write' || name === 'edit') && success) {
 					gates.onSuccessfulWrite(args.path);
+					successfulWriteCount += 1;
+					writesSinceOracle += 1;
+				}
+				if (name === 'delete' || name === 'rename') {
+					if (success) successfulWriteCount += 1;
 				}
 
 				facts = extractFactsFromTool(
@@ -1735,6 +2169,12 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					success,
 					opts.workspaceRoot
 				);
+
+				if (toolAdvice.length) {
+					const advice = toolAdvice.join('\n\n');
+					trace?.info('harness', String(advice.length));
+					output = `${output}\n\n${advice}`;
+				}
 				if (opts.sessionId && opts.sessionStore) {
 					await opts.sessionStore.setStableFacts(opts.sessionId, facts);
 					await getSessionWikiStore().pushTool(opts.sessionId, name);
@@ -1778,235 +2218,101 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 						? `${name} missing ${args.path ?? ''}`.trim()
 						: success
 							? `${name} ${args.path ?? args.oldPath ?? args.command ?? args.tool ?? args.task ?? args.query ?? ''}`.trim()
-							: `${name} failed`
+							: name === 'shell' &&
+								  isShellNoiseFailure(String(args.command ?? ''), output)
+								? 'shell failed (cmd-noise)'
+								: `${name} failed`
 				);
 
 				if (name === 'read' && pathKey && success) {
 					readPathsSeen.add(pathKey);
+					readsWhileRed = gates.buildRed ? readsWhileRed + 1 : 0;
+					const parsed = parseReadCoverage(output);
+					const endLine = parsed?.end ?? readStart + readLimit - 1;
+					readMaxEnd.set(pathKey, Math.max(readMaxEnd.get(pathKey) ?? 0, endLine));
+					if (parsed?.total && parsed.end >= parsed.total) {
+						readMaxEnd.set(pathKey, Math.max(readMaxEnd.get(pathKey) ?? 0, parsed.total));
+					}
+					if (readWindowKey) {
+						resultCache.set(`readwin:${readWindowKey}`, output);
+					}
+				}
+				if (name === 'list' && pathKey && success) {
+					listPathsSeen.add(pathKey);
+					resultCache.set(`list:${pathKey}`, output);
+				}
+				if (name !== 'read' && !exploreTools.has(name)) {
+					readsWhileRed = 0;
 				}
 
-				if (exploreTools.has(name)) {
-					exploreOnlyStreak += 1;
-					exploreBudgetUsed += 1;
-					if (name === 'list') {
-						listCallCount += 1;
+				if (
+					success &&
+					(name === 'write' || name === 'edit' || name === 'delete' || name === 'rename') &&
+					pathKey
+				) {
+					const keys = new Set(readAliases.length ? readAliases : [pathKey]);
+					if (name === 'rename' && typeof args.newPath === 'string') {
+						keys.add(canonicalizePathKey(String(args.newPath)));
 					}
-				} else if (name === 'write' || name === 'shell') {
-					exploreOnlyStreak = 0;
-					exploreSoftNudged = false;
-					exploreBudgetUsed = 0;
+					invalidatePaths(resultCache, readPathsSeen, readMaxEnd, keys);
+					for (const k of keys) softReadHits.delete(k);
+					// Directory listings may now be stale too.
+					for (const cacheKey of [...resultCache.keys()]) {
+						if (cacheKey.startsWith('list:')) resultCache.delete(cacheKey);
+					}
+					listPathsSeen.clear();
+				}
+
+				if (name === 'retrieve' && success) {
+					output = annotateRetrieveWithReadMemory(output, readPathsSeen, readMaxEnd);
 				}
 
 				messages.push({
 					role: 'tool',
 					tool_call_id: call.id,
 					name,
-					content: output.slice(0, toolCap),
+					content: clipToolOutput(name, output, toolCap + 400),
 				});
 			}
 
 			// Flush deferred nudges only after every tool_result for this assistant turn exists.
 			for (const nudge of pendingNudges) {
+				trace?.info('harness', String(nudge.length));
 				messages.push({ role: 'user', content: nudge });
 			}
 
-			// Circuit breaker: too many consecutive tool failures → force rethink.
-			if (consecutiveToolFails >= 5) {
-				consecutiveToolFails = 0;
-				exploreBanSteps = Math.max(exploreBanSteps, 4);
-				messages.push({
-					role: 'user',
-					content: [
-						'### CIRCUIT BREAKER',
-						'Too many consecutive tool failures without progress.',
-						summarizeActionsForLlm(actions),
-						'Stop repeating failed tools. Change strategy: write a fix, run a different command, or summarize blockers for the user.',
-					].join('\n'),
-				});
-				opts.onActivity?.({
-					kind: 'checkpoint',
-					label: 'Circuit breaker',
-					detail: '5 consecutive tool failures',
-				});
-			}
-
-			// Soft steer early, then hard explore ban without waiting for checkpoint.
+			// Oracle after a batch of writes: the project's build/test speaks instead of advice text.
 			if (
-				gates.antiExploreEnabled() &&
-				exploreOnlyStreak >= 2 &&
-				exploreOnlyStreak < 3 &&
-				!exploreBanned &&
-				!exploreSoftNudged
+				oracleCfg &&
+				!opts.planMode &&
+				writesSinceOracle >= gates.cfg.maxWritesWithoutBuild &&
+				gates.writesSinceBuild > 0
 			) {
-				exploreSoftNudged = true;
-				messages.push({
-					role: 'user',
-					content: [
-						'### STOP TOURING — act now',
-						'You already explored. Prefer write/shell or a final answer. Do not list more folders.',
-						`Files already read: ${[...readPathsSeen].slice(0, 24).join(', ') || '(none)'}`,
-					].join('\n'),
-				});
-			}
-			if (gates.antiExploreEnabled() && exploreOnlyStreak >= 3 && !exploreBanned) {
-				exploreOnlyStreak = 0;
-				exploreSoftNudged = false;
-				exploreBanSteps = Math.max(exploreBanSteps, 4);
-				const seen = [...readPathsSeen].slice(0, 24).join(', ') || '(none yet)';
-				messages.push({
-					role: 'user',
-					content: [
-						'### IMPLEMENTATION PHASE',
-						'Explore tools are now temporarily banned. Stop listing/reading.',
-						`Files already read: ${seen}`,
-						formatStableFactsBlock(facts),
-						'REQUIRED next: write and/or shell, or a short final answer if the question is answered.',
-					]
-						.filter(Boolean)
-						.join('\n'),
-				});
-				opts.onActivity?.({
-					kind: 'checkpoint',
-					label: 'Explore ban (early)',
-					detail: `after ${actions.length} actions`,
-				});
+				const result = await runOracleNow(`automatic after ${writesSinceOracle} writes`);
+				const note = oracleNote(result, `automatic after ${writesSinceOracle} writes`);
+				trace?.info('harness', String(note.length));
+				messages.push({ role: 'user', content: note });
+				writesSinceOracle = 0;
 			}
 
-			// Consume one explore-ban step after the full tool round (not before).
-			if (exploreBanned) {
-				exploreBanSteps = Math.max(0, exploreBanSteps - 1);
-			}
-
-			// Checkpoint review every N steps (adaptive budget extension)
+			// Step budget: extend silently while there is measurable progress (no LLM judge).
 			const completedSteps = step + 1;
-			if (
-				adaptive &&
-				completedSteps === nextCheckpoint &&
-				completedSteps < hardCap
-			) {
-				opts.onStatus?.(
-					`Checkpoint ${completedSteps}/${hardCap}: a avaliar progresso…`
-				);
-				opts.onActivity?.({
-					kind: 'checkpoint',
-					label: `Checkpoint @ step ${completedSteps}`,
-				});
-				const evaluation = await evaluateProgress(opts, actions, reviewLog);
-				const line = `[step ${completedSteps}] ${evaluation.verdict.toUpperCase()} — ${evaluation.cause}`;
-				reviewLog.push(line);
-				trace?.info('checkpoint', line);
-
-				const statusBlock = [
-					`### Checkpoint @ step ${completedSteps}`,
-					`**Veredicto:** ${evaluation.verdict}`,
-					`**Causa:** ${evaluation.cause}`,
-					`**Caminho:** ${evaluation.path}`,
-					evaluation.summary ? `**Resumo:** ${evaluation.summary}` : '',
-				]
-					.filter(Boolean)
-					.join('\n');
-				opts.onStatus?.(statusBlock);
-
-				if (evaluation.verdict === 'done') {
-					opts.onTaskUpdate?.({
-						id: taskId,
-						name: truncateHistory(opts.task, 60),
-						status: 'completed',
-						result: evaluation.summary.slice(0, 200),
-						elapsed: Date.now() - started,
-					});
-					return evaluation.summary || 'Task appears complete.';
-				}
-
-				if (evaluation.verdict === 'positive') {
+			if (adaptive && completedSteps === nextCheckpoint && completedSteps < hardCap) {
+				const progress = progressMarker();
+				if (progress !== lastProgressMarker) {
+					lastProgressMarker = progress;
 					const extended = Math.min(hardCap, nextCheckpoint + checkpointSize);
 					stepBudget = extended;
 					nextCheckpoint = extended;
-					opts.onStatus?.(
-						`Progresso positivo → a continuar até step ${extended} (cap ${hardCap}).\nCausa: ${evaluation.cause}`
-					);
-					messages.push({
-						role: 'user',
-						content: [
-							`CHECKPOINT REVIEW (positive): extend budget to ${extended} steps.`,
-							`Cause: ${evaluation.cause}`,
-							`Progress: ${summarizeActionsForLlm(actions)}`,
-							`Continue only what remains. Do not re-list folders or redo completed work.`,
-							`If the user goal is already met, reply with a short final summary and stop tools.`,
-						].join('\n'),
+					reviewLog.push(`[step ${completedSteps}] progress → budget ${extended}`);
+					opts.onActivity?.({
+						kind: 'checkpoint',
+						label: `Checkpoint @ step ${completedSteps}`,
+						detail: `progress → budget ${extended}/${hardCap}`,
 					});
-					continue;
+				} else {
+					reviewLog.push(`[step ${completedSteps}] no progress since last checkpoint`);
 				}
-
-				if (evaluation.verdict === 'blocked') {
-					const choice = await ProgressReviewDialog.chooseProposal(evaluation);
-					if (choice.action === 'stop') {
-						opts.onTaskUpdate?.({
-							id: taskId,
-							name: truncateHistory(opts.task, 60),
-							status: 'failed',
-							result: 'Blocked — stopped by user',
-							elapsed: Date.now() - started,
-						});
-						return [
-							'## Bloqueio — parado pelo utilizador',
-							`**Causa:** ${evaluation.cause}`,
-							evaluation.summary,
-						]
-							.filter(Boolean)
-							.join('\n');
-					}
-
-					const extended = Math.min(hardCap, nextCheckpoint + checkpointSize);
-					stepBudget = extended;
-					nextCheckpoint = extended;
-
-					if (choice.action === 'replan') {
-						exploreBanSteps = Math.max(exploreBanSteps, 8);
-						opts.onStatus?.(
-							`Reanálise pedida pelo utilizador → budget ${extended}.\nCausa: ${evaluation.cause}`
-						);
-						messages.push({
-							role: 'user',
-							content: await buildReplanPrompt(opts, evaluation, actions, 'user asked to replan'),
-						});
-					} else {
-						exploreBanSteps = Math.max(exploreBanSteps, 6);
-						opts.onStatus?.(
-							`Opção escolhida: ${choice.proposal.title}\nCausa: ${evaluation.cause}\nNovo caminho: ${choice.proposal.detail}\nA continuar até ${extended}.`
-						);
-						messages.push({
-							role: 'user',
-							content: [
-								'USER RESOLUTION for blocker:',
-								`Chosen option: ${choice.proposal.title}`,
-								`Details: ${choice.proposal.detail}`,
-								`Prior cause: ${evaluation.cause}`,
-								`Progress: ${summarizeActionsForLlm(actions)}`,
-								'Follow this resolution. Do not repeat the failed approach. Budget extended.',
-							].join('\n'),
-						});
-					}
-					continue;
-				}
-
-				// negative → reanalyze and get back on track, then allow one more checkpoint
-				const extended = Math.min(hardCap, nextCheckpoint + checkpointSize);
-				stepBudget = extended;
-				nextCheckpoint = extended;
-				exploreBanSteps = Math.max(exploreBanSteps, 8);
-				opts.onStatus?.(
-					`Progresso insuficiente → reanálise.\nCausa: ${evaluation.cause}\nA corrigir rumo e continuar até ${extended}.\n(Exploração read/list bloqueada por ${exploreBanSteps} steps.)`
-				);
-				messages.push({
-					role: 'user',
-					content: await buildReplanPrompt(
-						opts,
-						evaluation,
-						actions,
-						'automatic replan after negative checkpoint'
-					),
-				});
 			}
 		}
 
@@ -2018,8 +2324,56 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 			elapsed: Date.now() - started,
 		});
 
+		let finalSummary = '';
+		try {
+			opts.onStatus?.('Hard cap — asking for a final summary…');
+			const base = (opts.baseUrl || defaultBase(opts.provider)).replace(/\/$/, '');
+			const res = await fetch(`${base}/chat/completions`, {
+				method: 'POST',
+				headers: {
+					'Content-Type': 'application/json',
+					...(opts.apiKey ? { Authorization: `Bearer ${opts.apiKey}` } : {}),
+				},
+				signal: opts.abortSignal,
+				body: JSON.stringify({
+					model: opts.model,
+					temperature: 0.2,
+					stream: false,
+					max_tokens: 700,
+					...llmContextOptions(getContextBudget(opts.numCtx)),
+					...llmJsonOptions(opts.forceJson),
+					messages: [
+						{
+							role: 'system',
+							content:
+								'Summarize agent progress in under 200 words. Cover what was done, what remains, and how to continue. Do not invent paths.',
+						},
+						{
+							role: 'user',
+							content: [
+								`Task: ${opts.task}`,
+								summarizeActionsForLlm(actions),
+								reviewLog.length
+									? `Last checkpoint: ${reviewLog[reviewLog.length - 1]}`
+									: '',
+							]
+								.filter(Boolean)
+								.join('\n'),
+						},
+					],
+				}),
+			});
+			if (res.ok) {
+				const data = await readChatCompletionResponse(res);
+				finalSummary = data.choices?.[0]?.message?.content?.trim() ?? '';
+			}
+		} catch {
+			finalSummary = '';
+		}
+
 		return (
-			`Reached max tool steps (${stepBudget}/${hardCap}) without a final summary.\n\n` +
+			`Reached max tool steps (${stepBudget}/${hardCap}) without finishing tools.\n\n` +
+			(finalSummary ? `${finalSummary}\n\n` : '') +
 			`${summarizeActionsForLlm(actions)}\n` +
 			(reviewLog.length ? `Last checkpoint: ${reviewLog[reviewLog.length - 1]}\n\n` : '') +
 			`Tip: ask to continue, or break the task into smaller steps.`
@@ -2042,10 +2396,25 @@ async function executeTool(
 	name: string,
 	args: Record<string, unknown>,
 	callId: string,
-	depth: number
+	depth: number,
+	caps?: { gitAvailable?: boolean }
 ): Promise<string> {
 	try {
+		if (name.startsWith('git_') && caps?.gitAvailable === false) {
+			return 'Error: git is unavailable in this workspace (no repository, or git is not on PATH).';
+		}
 		switch (name) {
+			case 'dotnet': {
+				const built = buildDotnetCommand(args);
+				if ('error' in built) return `Error: ${built.error}`;
+				const result = await opts.bridge.execute({
+					id: callId,
+					name: 'shell',
+					arguments: { command: built.command },
+					abortSignal: opts.abortSignal,
+				});
+				return result.success ? `$ ${built.command}\n${result.output}` : `Error: ${result.error ?? 'failed'}`;
+			}
 			case 'diagnostics':
 				return (
 					await opts.bridge.execute({
@@ -2075,21 +2444,30 @@ async function executeTool(
 					Number(args.character ?? 0)
 				);
 			case 'git_status':
-				return await git.gitStatus();
 			case 'git_diff':
-				return await git.gitDiff(args.path ? String(args.path) : undefined);
 			case 'git_log':
-				return await git.gitLog(Number(args.count ?? 10));
 			case 'git_commit_msg':
-				return await git.suggestCommitMessage();
 			case 'git_blame':
-				return await git.gitBlame(
-					String(args.path),
-					args.startLine !== undefined ? Number(args.startLine) : undefined,
-					args.endLine !== undefined ? Number(args.endLine) : undefined
-				);
-			case 'git_conflicts':
-				return await git.gitConflicts(args.path ? String(args.path) : undefined);
+			case 'git_conflicts': {
+				try {
+					if (name === 'git_status') return await git.gitStatus();
+					if (name === 'git_diff') {
+						return await git.gitDiff(args.path ? String(args.path) : undefined);
+					}
+					if (name === 'git_log') return await git.gitLog(Number(args.count ?? 10));
+					if (name === 'git_commit_msg') return await git.suggestCommitMessage();
+					if (name === 'git_blame') {
+						return await git.gitBlame(
+							String(args.path),
+							args.startLine !== undefined ? Number(args.startLine) : undefined,
+							args.endLine !== undefined ? Number(args.endLine) : undefined
+						);
+					}
+					return await git.gitConflicts(args.path ? String(args.path) : undefined);
+				} catch (err) {
+					return `Error: git tool failed: ${err instanceof Error ? err.message : String(err)}`;
+				}
+			}
 			case 'wiki_read': {
 				const wiki = getProjectWikiStore();
 				const id = args.id ? String(args.id) : '';
@@ -2100,9 +2478,30 @@ async function executeTool(
 						: 'No project wiki documents yet. Use wiki_write to create one.';
 				}
 				const doc = wiki.getDocument(id);
-				return doc
-					? `# ${doc.title}\n\n${doc.content}`
-					: `Wiki document not found: ${id}`;
+				if (doc) {
+					return `# ${doc.title}\n\n${doc.content}`;
+				}
+				// Models often confuse wiki ids with docs/*.md filenames.
+				if (/\.md$/i.test(id) || /^C\d+/i.test(id) || /CONVENCOES|convencoes/i.test(id)) {
+					const candidates = [id, id.replace(/^docs\//i, ''), `docs/${id.replace(/^docs\//i, '')}`];
+					for (const cand of candidates) {
+						const result = await opts.bridge.execute({
+							id: `${callId}-wiki-fallback`,
+							name: 'read',
+							arguments: { path: cand },
+						});
+						if (result.success && !String(result.output).startsWith('FILE_NOT_FOUND:')) {
+							return [`("${id}" is a workspace file, not a wiki id — showing ${cand})`, result.output].join('\n');
+						}
+					}
+				}
+				const list = wiki.listDocuments().slice(0, 12);
+				return [
+					`Wiki document not found: ${id}`,
+					list.length
+						? `Known wiki ids: ${list.map(d => d.id).join(', ')}`
+						: 'No wiki documents yet. For cards use read on docs/*.md.',
+				].join('\n');
 			}
 		case 'wiki_write': {
 				const { ensureProjectWiki } = await import('../memory/projectWiki');
@@ -2221,19 +2620,7 @@ async function maybeShowWriteDiff(
 	const newContent = String(args.content ?? '');
 	if (!filePath) return true;
 
-	let oldContent: string | undefined;
-	try {
-		const result = await bridge.execute({
-			id: 'diff-read',
-			name: 'read',
-			arguments: { path: filePath },
-		});
-		if (result.success) {
-			oldContent = result.output.replace(/\n\n\.\.\. \[truncated\]$/, '');
-		}
-	} catch {
-		oldContent = undefined;
-	}
+	const oldContent = await bridge.readRaw(filePath);
 
 	if (oldContent === undefined) {
 		return true; // create — no preview required
@@ -2253,67 +2640,7 @@ async function maybeShowWriteDiff(
 	return preview.accepted.includes(filePath);
 }
 
-/** Soft: shrink older tool results in-place without wiping the turn structure. */
-function softCompactToolResults(messages: ChatMessage[], maxChars: number): ChatMessage[] {
-	const toolIdxs: number[] = [];
-	for (let i = 0; i < messages.length; i++) {
-		if (messages[i].role === 'tool') toolIdxs.push(i);
-	}
-	const keepFull = new Set(toolIdxs.slice(-4));
-	return messages.map((m, i) => {
-		if (m.role !== 'tool' || keepFull.has(i)) return m;
-		const text = typeof m.content === 'string' ? m.content : '';
-		if (text.length <= maxChars) return m;
-		return {
-			...m,
-			content:
-				text.slice(0, maxChars) +
-				`\n…[soft-compacted ${text.length - maxChars} chars]`,
-		};
-	});
-}
-
-/** Mid: collapse older assistant/tool turns into one summary user message. */
-function midCompactMessages(messages: ChatMessage[], systemContent: string): ChatMessage[] {
-	const system = messages.find(m => m.role === 'system') ?? {
-		role: 'system' as const,
-		content: systemContent,
-	};
-	const tailStart = Math.max(1, messages.length - 10);
-	const head = messages.slice(1, tailStart);
-	const tail = messages.slice(tailStart);
-	if (head.length < 4) {
-		return softCompactToolResults(messages, 1200);
-	}
-	const digest = head
-		.map(m => {
-			const role = m.role;
-			const text =
-				typeof m.content === 'string'
-					? m.content
-					: Array.isArray(m.content)
-						? m.content.map(p => ('text' in p ? p.text : '')).join(' ')
-						: '';
-			if (role === 'tool') {
-				return `tool:${m.name || '?'}: ${text.slice(0, 180)}`;
-			}
-			if (role === 'assistant' && m.tool_calls?.length) {
-				return `assistant tools: ${m.tool_calls.map(t => t.function.name).join(', ')}`;
-			}
-			return `${role}: ${text.slice(0, 240)}`;
-		})
-		.join('\n')
-		.slice(0, 3500);
-
-	return [
-		{ role: 'system', content: typeof system.content === 'string' ? system.content : systemContent },
-		{
-			role: 'user',
-			content: `### MID-COMPACT DIGEST (older turns)\n${digest}\n\nContinue from the recent messages below.`,
-		},
-		...tail,
-	];
-}
+/** Soft/mid compact helpers live in ./toolHistory (pure, unit-tested). */
 
 async function compactWithLlm(
 	opts: AgentLoopOptions,
@@ -2331,7 +2658,7 @@ async function compactWithLlm(
 	const recentTools = previous
 		.filter(m => m.role === 'tool')
 		.slice(-6)
-		.map(m => `- ${(m.name ?? 'tool')}: ${contentToPlainText(m.content).slice(0, 600)}`)
+		.map(m => `- ${(m.name ?? 'tool')}: ${clipToolOutput(m.name ?? '', contentToPlainText(m.content), 900)}`)
 		.join('\n');
 
 	let rolling = '';
@@ -2357,7 +2684,7 @@ async function compactWithLlm(
 						content:
 							'Summarize the agent progress in under 300 words as narrative only. ' +
 							'Preserve objective, decisions, changed files, errors, blockers. ' +
-							'Do NOT invent project paths. Canonical paths are provided separately.',
+							'Mention only paths that appear in the input; canonical paths are provided separately.',
 					},
 					{
 						role: 'user',
@@ -2407,7 +2734,7 @@ async function compactWithLlm(
 		history.length > 0
 			? `Earlier conversation:\n${history
 					.slice(-6)
-					.map(m => `${m.role}: ${truncateHistory(m.content, 800)}`)
+					.map(m => `${m.role}: ${clipData(m.content.trim(), 1200)}`)
 					.join('\n')}`
 			: '';
 
@@ -2419,13 +2746,10 @@ async function compactWithLlm(
 				prior,
 				`Current task:\n${opts.task}`,
 				``,
-				`Rolling summary (narrative):\n${rolling}`,
-				recentTools ? `\nRecent tools:\n${recentTools}` : '',
-				``,
-				'### AFTER COMPACT — Cursor-style',
-				'STABLE FACTS above are canonical. Do NOT invent sibling folders at workspace root.',
-				'Do NOT re-read files you already have. Prefer write + shell (build) now.',
-				'Continue from here. Obey STABLE FACTS paths.',
+				'### Rolling summary + facts',
+				'The conversation was compacted. STABLE FACTS (system message) hold the canonical paths and open errors.',
+				rolling,
+				recentTools ? `\nRecent tool results:\n${recentTools}` : '',
 				stickyExtra,
 			]
 				.filter(Boolean)
@@ -2447,23 +2771,17 @@ function isNativeAnthropic(opts: AgentLoopOptions): boolean {
 async function postAgentRound(
 	opts: AgentLoopOptions,
 	openaiUrl: string,
-	messages: ChatMessage[]
+	messages: ChatMessage[],
+	maxTokens = 8192,
+	tools: typeof AGENT_TOOLS = AGENT_TOOLS
 ): Promise<{
 	ok: boolean;
 	status: number;
 	errorText: string;
-	data: {
-		choices?: Array<{ message?: { content?: string | null; tool_calls?: ToolCall[] } }>;
-		usage?: {
-			prompt_tokens?: number;
-			completion_tokens?: number;
-			input_tokens?: number;
-			output_tokens?: number;
-		};
-	};
+	data: ChatCompletionData;
 }> {
 	if (isNativeAnthropic(opts)) {
-		return postAnthropicRound(opts, messages);
+		return postAnthropicRound(opts, messages, maxTokens, tools);
 	}
 
 	const response = await fetch(openaiUrl, {
@@ -2478,11 +2796,11 @@ async function postAgentRound(
 			model: opts.model,
 			messages,
 			temperature: 0.2,
-			max_tokens: 8192,
+			max_tokens: maxTokens,
 			stream: false,
 			...(opts.proseToolsOnly
 				? {}
-				: { tools: AGENT_TOOLS, tool_choice: 'auto' as const }),
+				: { tools, tool_choice: 'auto' as const }),
 			...llmContextOptions(getContextBudget(opts.numCtx)),
 			...llmJsonOptions(opts.forceJson),
 		}),
@@ -2500,8 +2818,17 @@ async function postAgentRound(
 }
 
 type ChatCompletionData = {
-	choices?: Array<{ message?: { content?: string | null; tool_calls?: ToolCall[] } }>;
-	usage?: { prompt_tokens?: number; completion_tokens?: number };
+	choices?: Array<{
+		message?: { content?: string | null; tool_calls?: ToolCall[] };
+		finish_reason?: string | null;
+		stop_reason?: string | null;
+	}>;
+	usage?: {
+		prompt_tokens?: number;
+		completion_tokens?: number;
+		input_tokens?: number;
+		output_tokens?: number;
+	};
 };
 
 /**
@@ -2583,6 +2910,8 @@ function aggregateSseChatCompletion(raw: string): ChatCompletionData {
 		{ id: string; type: 'function'; function: { name: string; arguments: string } }
 	>();
 	let usage: ChatCompletionData['usage'];
+	let finishReason: string | null | undefined;
+	let stopReason: string | null | undefined;
 
 	for (const line of raw.split(/\r?\n/)) {
 		const trimmed = line.trim();
@@ -2590,8 +2919,10 @@ function aggregateSseChatCompletion(raw: string): ChatCompletionData {
 		const payload = trimmed.slice(5).trim();
 		if (!payload || payload === '[DONE]') continue;
 		let chunk: {
-			usage?: { prompt_tokens?: number; completion_tokens?: number };
+			usage?: ChatCompletionData['usage'];
 			choices?: Array<{
+				finish_reason?: string | null;
+				stop_reason?: string | null;
 				delta?: {
 					content?: string | null;
 					tool_calls?: Array<{
@@ -2614,6 +2945,8 @@ function aggregateSseChatCompletion(raw: string): ChatCompletionData {
 		}
 		const choice = chunk.choices?.[0];
 		if (!choice) continue;
+		if (choice.finish_reason) finishReason = choice.finish_reason;
+		if (choice.stop_reason) stopReason = choice.stop_reason;
 		// Rare non-streaming chunk shaped as full message inside SSE
 		if (choice.message) {
 			if (choice.message.content) content += choice.message.content;
@@ -2661,7 +2994,13 @@ function aggregateSseChatCompletion(raw: string): ChatCompletionData {
 		const lifted = parseProseToolCalls(content);
 		if (lifted.length) {
 			return {
-				choices: [{ message: { content: null, tool_calls: lifted } }],
+				choices: [
+					{
+						message: { content: null, tool_calls: lifted },
+						finish_reason: finishReason,
+						stop_reason: stopReason,
+					},
+				],
 				usage,
 			};
 		}
@@ -2674,6 +3013,8 @@ function aggregateSseChatCompletion(raw: string): ChatCompletionData {
 					content: content || null,
 					tool_calls: tool_calls.length ? tool_calls : undefined,
 				},
+				finish_reason: finishReason,
+				stop_reason: stopReason,
 			},
 		],
 		usage,
@@ -2682,7 +3023,9 @@ function aggregateSseChatCompletion(raw: string): ChatCompletionData {
 
 async function postAnthropicRound(
 	opts: AgentLoopOptions,
-	messages: ChatMessage[]
+	messages: ChatMessage[],
+	maxTokens = 8192,
+	activeTools: typeof AGENT_TOOLS = AGENT_TOOLS
 ): Promise<{
 	ok: boolean;
 	status: number;
@@ -2752,7 +3095,9 @@ async function postAnthropicRound(
 		}
 	}
 
-	const tools = AGENT_TOOLS.map(t => ({
+	const safeConverted = filterAnthropicToolResults(converted);
+
+	const tools = activeTools.map(t => ({
 		name: t.function.name,
 		description: t.function.description,
 		input_schema: t.function.parameters,
@@ -2768,9 +3113,9 @@ async function postAnthropicRound(
 		signal: opts.abortSignal,
 		body: JSON.stringify({
 			model: opts.model,
-			max_tokens: 8192,
+			max_tokens: maxTokens,
 			system: system || undefined,
-			messages: converted,
+			messages: safeConverted,
 			tools,
 		}),
 	});
@@ -2813,180 +3158,6 @@ async function postAnthropicRound(
 	};
 }
 
-async function evaluateProgress(
-	opts: AgentLoopOptions,
-	actions: string[],
-	priorReviews: string[]
-): Promise<ProgressEval> {
-	const writes = actions.filter(a => a.startsWith('write ')).length;
-	const fails = actions.filter(a => a.includes('failed') || a.includes('blocked')).length;
-	const cached = actions.filter(a => a.includes('cached')).length;
-	const reads = actions.filter(a => a.startsWith('read ') || a.startsWith('list ')).length;
-	const shellFails = actions.filter(a => a === 'shell failed').length;
-	const exploreSpin = writes === 0 && reads >= 3;
-	const heuristicBlocked = (fails > writes + 3 && writes < 2) || (shellFails >= 1 && writes === 0 && reads >= 8);
-	const heuristicPositive = writes >= 2 && fails <= writes;
-	const heuristicNegative = exploreSpin || (writes === 0 && shellFails >= 1);
-
-	const fallback: ProgressEval = heuristicBlocked
-		? {
-				verdict: 'blocked',
-				cause: `Muitas falhas (${fails}) com pouco progresso de write (${writes}).`,
-				path: compactActionPath(actions),
-				summary: 'O agent parece preso sem conseguir avançar na implementação.',
-				proposals: [
-					{
-						id: 'simplify',
-						title: 'Simplificar: completar só o mínimo (1 página + build)',
-						detail: 'Parar de explorar; escrever o essencial e correr dotnet build.',
-					},
-					{
-						id: 'inspect',
-						title: 'Inspecionar erros de build/diagnostics primeiro',
-						detail: 'Correr diagnostics e shell build; corrigir erros antes de novos writes.',
-					},
-					{
-						id: 'resume-writes',
-						title: 'Continuar writes com paths relativos ao workspace',
-						detail: 'Evitar paths absolutos e re-reads; focar em ficheiros em falta.',
-					},
-				],
-			}
-		: heuristicPositive
-			? {
-					verdict: 'positive',
-					cause: `${writes} writes com falhas controladas (${fails}).`,
-					path: compactActionPath(actions),
-					summary: 'Há progresso concreto em ficheiros; continuar.',
-				}
-			: heuristicNegative
-				? {
-						verdict: 'negative',
-						cause:
-							shellFails > 0
-								? `Build/shell falhou e ainda não houve writes para corrigir (reads=${reads}).`
-								: `Só exploração (reads/lists=${reads}) sem writes — missão de implementação não avançou.`,
-						path: compactActionPath(actions),
-						summary:
-							'Parar reads. Corrigir *.cshtml (aspas, ValidationMessageFor, href) com write, depois dotnet build e dotnet run.',
-					}
-				: {
-						verdict: 'negative',
-						cause: `Progresso fraco: writes=${writes}, fails=${fails}, cached=${cached}.`,
-						path: compactActionPath(actions),
-						summary: 'Reanalisar objetivo e mudar de estratégia.',
-					};
-
-	try {
-		const base = (opts.baseUrl || defaultBase(opts.provider)).replace(/\/$/, '');
-		const res = await fetch(`${base}/chat/completions`, {
-			method: 'POST',
-			headers: {
-				'Content-Type': 'application/json',
-				...(opts.apiKey ? { Authorization: `Bearer ${opts.apiKey}` } : {}),
-			},
-			signal: opts.abortSignal,
-			body: JSON.stringify({
-				model: opts.model,
-				temperature: 0.1,
-				stream: false,
-				max_tokens: 512,
-				messages: [
-					{
-						role: 'system',
-						content:
-							'You evaluate coding-agent progress. Reply ONLY valid JSON with keys: ' +
-							'verdict ("positive"|"negative"|"blocked"|"done"), cause, path, summary, ' +
-							'proposals (optional array of {id,title,detail}). No markdown. ' +
-							'Keep cause/path/summary short (one line each). Do not list every tool call.',
-					},
-					{
-						role: 'user',
-						content: [
-							`Task: ${opts.task}`,
-							summarizeActionsForLlm(actions),
-							`Recent path: ${compactActionPath(actions)}`,
-							priorReviews.length
-								? `Prior reviews: ${priorReviews.slice(-3).join(' | ')}`
-								: '',
-							'Rules:',
-							'- positive = clear forward progress (useful writes/builds), continue',
-							'- negative = spinning/re-reading/little value, needs replan',
-							'- blocked = cannot proceed without user decision',
-							'- done = task objective already satisfied',
-						]
-							.filter(Boolean)
-							.join('\n'),
-					},
-				],
-			}),
-		});
-		if (!res.ok) {
-			return fallback;
-		}
-		const data = await readChatCompletionResponse(res);
-		const text = data.choices?.[0]?.message?.content ?? '';
-		const jsonMatch = text.match(/\{[\s\S]*\}/);
-		if (!jsonMatch) {
-			return fallback;
-		}
-		const parsed = JSON.parse(jsonMatch[0]) as ProgressEval;
-		if (!parsed.verdict || !parsed.cause || !parsed.path) {
-			return fallback;
-		}
-		if (!['positive', 'negative', 'blocked', 'done'].includes(parsed.verdict)) {
-			return fallback;
-		}
-		return {
-			verdict: parsed.verdict,
-			cause: String(parsed.cause),
-			path: String(parsed.path),
-			summary: String(parsed.summary ?? ''),
-			proposals: Array.isArray(parsed.proposals)
-				? parsed.proposals.map((p, i) => ({
-						id: String(p.id ?? `opt${i}`),
-						title: String(p.title ?? `Option ${i + 1}`),
-						detail: String(p.detail ?? ''),
-					}))
-				: fallback.proposals,
-		};
-	} catch {
-		return fallback;
-	}
-}
-
-async function buildReplanPrompt(
-	opts: AgentLoopOptions,
-	evaluation: ProgressEval,
-	actions: string[],
-	reason: string
-): Promise<string> {
-	return [
-		'REPLAN REQUIRED — STOP EXPLORING. EXECUTE NOW.',
-		`Reason: ${reason}`,
-		`Cause of deviation: ${evaluation.cause}`,
-		`Evaluation summary: ${evaluation.summary}`,
-		`Original task: ${opts.task}`,
-		summarizeActionsForLlm(actions),
-		`Recent path: ${compactActionPath(actions)}`,
-		'',
-		'MANDATORY next tool calls (no prose-only turns):',
-		'1) write — fix broken files (especially *.cshtml compile errors).',
-		'2) shell — `dotnet build` in the project folder.',
-		'3) on build success — `dotnet run` (long-running handoff is OK).',
-		'',
-		'Razor/.NET fixes that usually unblock this project:',
-		'- Strings in Razor C# must use double quotes: href="/funcionarios" NOT \'/funcionarios\' (CS1012).',
-		'- Use Html.ValidationMessageFor(...) — ValidationFor does not exist (CS1061).',
-		'- Do not invent PagePath(...); use plain href="/..." or asp-page.',
-		'- FuncionarioViewModel already exists at ViewModels/FuncionarioViewModel.cs — do not recreate under Models/.',
-		'- This app uses Razor Pages (Program.cs AddRazorPages), not the obsolete Microsoft.AspNetCore.Blazor.WebAssembly package.',
-		'',
-		'FORBIDDEN for the next several steps: read / list / search (they will be blocked).',
-		'If a file content is unknown, write a complete correct version anyway based on the build errors.',
-	].join('\n');
-}
-
 function isBrokenToolHistoryError(status: number, errText: string): boolean {
 	if (status < 400) return false;
 	return /no user query found|multi_step_tool_call_failed|argo exception|tool_use ids were found without|without\s+`?tool_result|each `tool_use` block must have|tool_use.*tool_result|tool_result.*tool_use|tool_call_id|messages with role ['"]tool['"]|did not find (a )?tool (response|result)|tool_calls must be followed|unclosed tool|missing tool (call )?result|invalid.*tool.*message|tool call result/i.test(
@@ -3013,80 +3184,6 @@ function ensureToolResultsForCalls(
 		});
 		have.add(call.id);
 	}
-}
-
-/**
- * Universal tool-protocol hygiene for all providers (OpenAI-compat + Anthropic):
- * 1) Fill missing tool results for any assistant tool_calls.
- * 2) Reorder so tool results sit contiguously right after their assistant turn
- *    (no user nudges interleaved between tool messages).
- */
-function normalizeToolProtocolHistory(messages: ChatMessage[]): number {
-	let changes = repairMissingToolResults(messages);
-	for (let i = 0; i < messages.length; i++) {
-		const m = messages[i];
-		if (m.role !== 'assistant' || !m.tool_calls?.length) continue;
-		const ids = new Set(m.tool_calls.map(tc => tc.id));
-		const tools: ChatMessage[] = [];
-		const others: ChatMessage[] = [];
-		let j = i + 1;
-		while (j < messages.length && messages[j].role !== 'assistant') {
-			const n = messages[j];
-			if (n.role === 'tool' && n.tool_call_id && ids.has(n.tool_call_id)) {
-				tools.push(n);
-			} else {
-				others.push(n);
-			}
-			j++;
-		}
-		const byId = new Map(tools.map(t => [t.tool_call_id as string, t]));
-		const orderedTools: ChatMessage[] = [];
-		for (const tc of m.tool_calls) {
-			const hit = byId.get(tc.id);
-			if (hit) orderedTools.push(hit);
-		}
-		for (const t of tools) {
-			if (!orderedTools.includes(t)) orderedTools.push(t);
-		}
-		const slice = [...orderedTools, ...others];
-		const current = messages.slice(i + 1, j);
-		const same =
-			current.length === slice.length && current.every((c, idx) => c === slice[idx]);
-		if (!same) {
-			messages.splice(i + 1, j - (i + 1), ...slice);
-			changes += 1;
-		}
-	}
-	return changes;
-}
-
-/** Repair orphaned tool_use / tool_call ids across the full history. */
-function repairMissingToolResults(messages: ChatMessage[]): number {
-	let repaired = 0;
-	for (let i = 0; i < messages.length; i++) {
-		const m = messages[i];
-		if (m.role !== 'assistant' || !m.tool_calls?.length) continue;
-		const have = new Set<string>();
-		for (let j = i + 1; j < messages.length; j++) {
-			const next = messages[j];
-			if (next.role === 'assistant') break;
-			if (next.role === 'tool' && next.tool_call_id) {
-				have.add(next.tool_call_id);
-			}
-		}
-		const missing = m.tool_calls.filter(tc => !have.has(tc.id));
-		if (!missing.length) continue;
-		const stubs: ChatMessage[] = missing.map(tc => ({
-			role: 'tool' as const,
-			tool_call_id: tc.id,
-			name: tc.function.name,
-			content: 'Skipped: tool result was missing from history (repaired).',
-		}));
-		messages.splice(i + 1, 0, ...stubs);
-		repaired += stubs.length;
-		i += stubs.length;
-	}
-	return repaired;
 }
 
 /** Gateway (llama-server) rejected tool call because arguments JSON was cut mid-stream. */
@@ -3260,12 +3357,16 @@ function summarizeActionsForLlm(actions: string[]): string {
 	if (!actions.length) {
 		return 'Progress: (no tools yet)';
 	}
-	const writes = actions.filter(a => a.startsWith('write '));
+	const writes = actions.filter(a => a.startsWith('write ') || a.startsWith('edit '));
 	const deletes = actions.filter(a => a.startsWith('delete '));
 	const shellsOk = actions.filter(
 		a => a.startsWith('shell ') && a !== 'shell failed' && !/blocked|denied|threw/.test(a)
 	);
-	const fails = actions.filter(a => /failed|blocked|denied|threw/.test(a));
+	const fails = actions.filter(
+		a =>
+			/\b(failed|denied|threw|bad-args)\b/.test(a) ||
+			/blocked \(plan mode\)|blocked \(hook\)|blocked \(too large\)|rejected \(diff\)/.test(a)
+	);
 	const patterns = new Map<string, number>();
 	for (const f of fails) {
 		const key = shortenActionLabel(f);
@@ -3286,36 +3387,16 @@ function summarizeActionsForLlm(actions: string[]): string {
 		.join('\n');
 }
 
-/** Collapse consecutive duplicate actions into a short path for checkpoints. */
-function compactActionPath(actions: string[], max = 8): string {
-	if (!actions.length) {
-		return '(sem actions)';
-	}
-	const parts: Array<{ text: string; n: number }> = [];
-	for (const a of actions) {
-		const text = shortenActionLabel(a);
-		const last = parts[parts.length - 1];
-		if (last && last.text === text) {
-			last.n += 1;
-		} else {
-			parts.push({ text, n: 1 });
-		}
-	}
-	return parts
-		.slice(-max)
-		.map(p => (p.n > 1 ? `${p.text}×${p.n}` : p.text))
-		.join(' → ');
-}
-
 function shortenActionLabel(a: string): string {
 	if (a === 'shell failed') return 'shell failed';
 	if (/blocked/.test(a)) {
 		return a.replace(/\s*\([^)]*\)/g, '').slice(0, 40);
 	}
-	if (a.startsWith('write ')) {
-		const p = a.slice(6).replace(/\\/g, '/');
+	if (a.startsWith('write ') || a.startsWith('edit ')) {
+		const verb = a.startsWith('edit ') ? 'edit' : 'write';
+		const p = a.slice(verb.length + 1).replace(/\\/g, '/');
 		const bits = p.split('/').filter(Boolean);
-		return `write ${bits.slice(-2).join('/')}`;
+		return `${verb} ${bits.slice(-2).join('/')}`;
 	}
 	if (a.startsWith('delete ')) {
 		const p = a.slice(7).replace(/\\/g, '/');
@@ -3702,6 +3783,10 @@ function describeMutation(name: string, args: Record<string, unknown>): string {
 	switch (name) {
 		case 'write':
 			return `Write file ${args.path}`;
+		case 'edit':
+			return `Edit ${args.path}`;
+		case 'dotnet':
+			return `Run: ${dotnetCommandLine(args) || `dotnet ${String(args.action ?? '')}`}`;
 		case 'delete':
 			return `Delete ${args.path}`;
 		case 'rename':
@@ -3722,6 +3807,18 @@ function summarizeArgs(name: string, args: Record<string, unknown>): Record<stri
 			bytes: content.length,
 		};
 	}
+	if (name === 'edit') {
+		const clip = (s: unknown) => {
+			const t = String(s ?? '');
+			return t.length > 300 ? `${t.slice(0, 300)}…[+${t.length - 300} chars]` : t;
+		};
+		return {
+			path: args.path,
+			old_string: clip(args.old_string),
+			new_string: clip(args.new_string),
+			...(args.replace_all ? { replace_all: true } : {}),
+		};
+	}
 	return args;
 }
 
@@ -3730,13 +3827,37 @@ function isToolSuccess(name: string, output: string): boolean {
 	if (output.startsWith('Error:')) {
 		return false;
 	}
-	if (name === 'shell') {
+	if (name.startsWith('git_') && /Git is unavailable|Git tool failed/i.test(output)) {
+		return false;
+	}
+	if (name === 'shell' || name === 'dotnet') {
 		const m = /^exit\s+(\d+)/m.exec(output);
 		if (m && Number(m[1]) !== 0) {
 			return false;
 		}
+		if (/Shell failed with empty stdout/i.test(output)) {
+			return false;
+		}
 	}
 	return true;
+}
+
+/** Enrich failed shell results so the model can decide without guessing. */
+function enrichShellFailure(command: string, output: string, workspaceRoot?: string): string {
+	const trimmed = (output || '').trim();
+	const cwd = workspaceRoot || '(workspace root unknown)';
+	if (trimmed.length > 0 && !/exit\s*code/i.test(trimmed) && !/^exit\s+\d+/m.test(trimmed)) {
+		return [trimmed, '', `(failed — cwd: ${cwd}; command: ${command})`].join('\n');
+	}
+	if (trimmed.length > 0) {
+		return trimmed;
+	}
+	return [
+		`Shell failed with empty stdout/stderr.`,
+		`cwd: ${cwd}`,
+		`command: ${command}`,
+		'(empty output usually means the program was not found or was killed)',
+	].join('\n');
 }
 
 function defaultBase(provider: string): string {

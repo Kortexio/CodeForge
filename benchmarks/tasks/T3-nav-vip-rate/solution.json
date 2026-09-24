@@ -1,0 +1,4 @@
+[
+  { "file": "src/pricing/rules.js", "replace": "const VIP_RATE = 0.1;", "with": "const VIP_RATE = 0.15;" },
+  { "file": "docs/pricing.md", "replace": "| vip      | 10%      |", "with": "| vip      | 15%      |" }
+]

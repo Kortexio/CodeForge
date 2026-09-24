@@ -1,0 +1,11 @@
+{
+  "id": "CS1-bugfix-subtotal",
+  "category": "bugfix",
+  "fixture": "billing",
+  "runtime": "dotnet",
+  "title": "Fix failing tests (Subtotal skips the last item)",
+  "prompt": "The project tests fail (run `dotnet test`). Find the cause and fix the code in `src/` — do not change the tests.",
+  "protected": ["tests/"],
+  "checks": [],
+  "bonus": []
+}

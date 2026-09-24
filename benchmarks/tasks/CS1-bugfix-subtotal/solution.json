@@ -1,0 +1,3 @@
+[
+  { "file": "src/Acme.Billing/Totals.cs", "replace": "i < cart.Items.Count - 1;", "with": "i < cart.Items.Count;" }
+]

@@ -16,6 +16,9 @@ export const SLASH_COMMANDS: SlashCommand[] = [
 	{ name: 'auto', description: 'Switch to Auto mode (allow all this session)' },
 	{ name: 'permissions', description: 'Cycle Default → Assisted → Allow all' },
 	{ name: 'instructions', description: 'Generate AGENTS.md for this workspace' },
+	{ name: 'cards', description: 'Implement docs/C*.md cards one by one (optional: C01-C05)' },
+	{ name: 'plan-run', description: 'Plan the request in steps and run each step with a clean context' },
+	{ name: 'review', description: 'Find bugs: build/test signals, per-file review, BUGS.md' },
 ];
 
 export function filterSlashCommands(prefix: string): SlashCommand[] {

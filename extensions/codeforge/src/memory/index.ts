@@ -19,3 +19,12 @@ export {
 	type WikiDocument,
 	type TemporalFact,
 } from './projectWiki';
+
+export {
+	getExtendedLessons,
+	learnFromShellFailure,
+	formatLessonsForPrompt,
+	isShellNoiseFailure,
+	recordLesson,
+	type MemoryLesson,
+} from './extendedMemory';

@@ -1,0 +1,9 @@
+{
+  "id": "T1-bugfix-subtotal",
+  "category": "bugfix",
+  "title": "Fix failing tests (subtotal skips the last item)",
+  "prompt": "The project tests fail (run `npm test`). Find the cause and fix the code in `src/` — do not change the tests.",
+  "protected": ["test/"],
+  "checks": [],
+  "bonus": []
+}

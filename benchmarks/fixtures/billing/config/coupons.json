@@ -1,0 +1,5 @@
+[
+  { "code": "WELCOME10", "type": "percent", "value": 10, "expires": "2099-12-31" },
+  { "code": "FIVEOFF", "type": "fixed", "value": 5, "expires": "2099-12-31" },
+  { "code": "OLD20", "type": "percent", "value": 20, "expires": "2020-01-01" }
+]

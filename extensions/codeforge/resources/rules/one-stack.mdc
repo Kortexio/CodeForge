@@ -1,10 +1,10 @@
 ---
-description: Prefer one ASP.NET stack; apply when editing .NET web files
-globs: ["**/*.{cs,cshtml,razor}", "**/Pages/**", "**/Views/**", "**/Controllers/**"]
+description: Keep one ASP.NET UI stack (Razor Pages or MVC)
+globs: ["**/*.{cshtml,razor}", "**/Pages/**", "**/Views/**", "**/Controllers/**"]
 alwaysApply: false
 ---
 
-# One stack (.NET)
+# One stack (ASP.NET UI)
 
-- Pick ONE stack: Razor Pages (`Pages/` + `@page` first) OR MVC (`Views/` + Controllers). Never mix mid-task.
-- Do not introduce a second UI framework in the same feature.
+- Keep the stack the repo already uses: Razor Pages (`Pages/` with `@page` on line 1) or MVC (`Views/` + Controllers).
+- A feature uses one UI framework; a second one needs the user's request.

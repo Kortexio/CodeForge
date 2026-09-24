@@ -1,0 +1,8 @@
+[
+  { "id": "vat-es", "file": "src/Acme.Billing/Tax.cs", "line": 8, "desc": "ES VAT is 12% instead of 21% (docs/pricing.md)" },
+  { "id": "bulk-order", "file": "src/Acme.Billing/PricingRules.cs", "line": 15, "desc": "Bulk tiers checked ascending: 25+/50+ units get the 10+ rate" },
+  { "id": "gold-rate", "file": "src/Acme.Billing/PricingRules.cs", "line": 160, "desc": "Gold tier discount is 50% instead of 5%" },
+  { "id": "tax-base", "file": "src/Acme.Billing/Totals.cs", "line": 27, "desc": "Tax computed on the subtotal instead of the net amount" },
+  { "id": "rounding", "file": "src/Acme.Billing/Money.cs", "line": 6, "desc": "Rounding uses ToEven instead of AwayFromZero" },
+  { "id": "coupon-json", "file": "src/Acme.Billing/Coupons.cs", "line": 14, "desc": "Case-sensitive JSON binding: lowercase keys in coupons.json never bind" }
+]

@@ -10,8 +10,12 @@ import {
 	retrieveSnippets,
 	contextBadge,
 	ensureWorkspaceIndex,
+	getIndexedCount,
+	hasSemanticEmbeddings,
 	RetrieveHit,
 } from '../intelligence/workspaceIndex';
+import * as fs from 'fs/promises';
+import * as path from 'path';
 import { StableFacts, normalizeFacts } from './stableFacts';
 import {
 	assembleContext,
@@ -22,6 +26,7 @@ import {
 } from '../context/engine';
 import { getSessionWikiStore } from '../memory/sessionWiki';
 import { getProjectWikiStore } from '../memory/projectWiki';
+import { clipData } from './clip';
 
 export interface ContextPacketResult {
 	markdown: string;
@@ -47,6 +52,8 @@ export async function buildContextPacket(opts: {
 
 	const facts = normalizeFacts(opts.facts);
 	const ide = await gatherIdeState();
+	const capabilities = await gatherToolCapabilities(opts.workspaceRoot, ide.gitAvailable);
+	const prefetch = await gatherWorkspacePrefetch(opts.workspaceRoot);
 	const lspOutline = await gatherActiveLspOutline();
 	let retrieved: RetrieveHit[] = [];
 	let retrieveNote = '';
@@ -69,7 +76,7 @@ export async function buildContextPacket(opts: {
 	sources.push({
 		kind: 'ide',
 		priority: idePriority,
-		content: [ide.block, lspOutline].filter(Boolean).join('\n\n'),
+		content: [capabilities, ide.block, prefetch, lspOutline].filter(Boolean).join('\n\n'),
 	});
 
 	const f = factsSource(facts);
@@ -95,6 +102,9 @@ export async function buildContextPacket(opts: {
 		/* ignore */
 	}
 
+	// Extended-memory lessons are attached to the failing shell output that triggers them,
+	// not repeated in every packet.
+
 	if (retrieved.length || retrieveNote) {
 		const boosted = retrieved.filter(r =>
 			boost.has(r.path.replace(/\\/g, '/').toLowerCase())
@@ -116,7 +126,7 @@ export async function buildContextPacket(opts: {
 		sources.push({
 			kind: 'history',
 			priority: 40,
-			content: `### RECENT CHAT\n${opts.historyText.trim().slice(0, 6000)}`,
+			content: `### RECENT CHAT\n${clipData(opts.historyText.trim(), 6000)}`,
 		});
 	}
 
@@ -152,6 +162,7 @@ async function gatherIdeState(): Promise<{
 	openRelative?: string;
 	/** Open / dirty editors — used to boost retrieve ranking. */
 	editorPaths: string[];
+	gitAvailable: boolean;
 }> {
 	const editor = vscode.window.activeTextEditor;
 	const lines: string[] = ['### IDE STATE'];
@@ -201,6 +212,7 @@ async function gatherIdeState(): Promise<{
 		lines.push('- Diagnostics: none');
 	}
 
+	let gitAvailable = true;
 	try {
 		const status = await git.gitStatus();
 		const short = status.split('\n').slice(0, 12).join(' | ');
@@ -211,10 +223,84 @@ async function gatherIdeState(): Promise<{
 			lines.push(`- Git diff (truncated):\n\`\`\`\n${snippet.slice(0, 1200)}\n\`\`\``);
 		}
 	} catch {
+		gitAvailable = false;
 		lines.push('- Git: (unavailable)');
 	}
 
-	return { block: lines.join('\n'), openRelative, editorPaths: editorPaths.slice(0, 24) };
+	return {
+		block: lines.join('\n'),
+		openRelative,
+		editorPaths: editorPaths.slice(0, 24),
+		gitAvailable,
+	};
+}
+
+async function gatherToolCapabilities(
+	workspaceRoot: string | undefined,
+	gitAvailable: boolean
+): Promise<string> {
+	const indexed = getIndexedCount();
+	const semantic = hasSemanticEmbeddings();
+	return [
+		'### TOOL CAPABILITIES',
+		`- Workspace root: ${workspaceRoot || '(none — ask user to open a folder)'}`,
+		`- Git: ${gitAvailable ? 'available' : 'unavailable (git_* tools will fail)'}`,
+		`- Index: ${indexed} paths cached; retrieve is ${semantic ? 'hybrid lexical+semantic' : 'lexical-only (embeddings not ready)'}`,
+	].join('\n');
+}
+
+async function gatherWorkspacePrefetch(workspaceRoot?: string): Promise<string> {
+	const folder =
+		workspaceRoot || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+	if (!folder) return '';
+	const lines: string[] = ['### WORKSPACE PREFETCH'];
+	try {
+		const entries = await fs.readdir(folder, { withFileTypes: true });
+		const all = entries
+			.filter(e => !e.name.startsWith('.') && e.name !== 'node_modules')
+			.map(e => (e.isDirectory() ? `${e.name}/` : e.name));
+		const names = all.slice(0, 24);
+		if (names.length) {
+			const more = all.length > names.length ? ` …[+${all.length - names.length} entries]` : '';
+			lines.push(`- Top-level: ${names.join(', ')}${more}`);
+		}
+	} catch {
+		return '';
+	}
+	const markers = [
+		'package.json',
+		'README.md',
+		'README',
+		'*.csproj',
+		'*.sln',
+		'Cargo.toml',
+		'pyproject.toml',
+		'go.mod',
+	];
+	const found: string[] = [];
+	for (const m of markers) {
+		if (m.includes('*')) {
+			try {
+				const hits = await vscode.workspace.findFiles(m, '**/node_modules/**', 4);
+				for (const u of hits) {
+					found.push(vscode.workspace.asRelativePath(u));
+				}
+			} catch {
+				/* ignore */
+			}
+		} else {
+			try {
+				await fs.access(path.join(folder, m));
+				found.push(m);
+			} catch {
+				/* missing */
+			}
+		}
+	}
+	if (found.length) {
+		lines.push(`- Markers: ${[...new Set(found)].slice(0, 12).join(', ')}`);
+	}
+	return lines.length > 1 ? lines.join('\n') : '';
 }
 
 async function gatherActiveLspOutline(): Promise<string> {
@@ -224,9 +310,11 @@ async function gatherActiveLspOutline(): Promise<string> {
 		const rel = vscode.workspace.asRelativePath(editor.document.uri);
 		const symbols = await lsp.documentSymbols(editor.document.uri.fsPath);
 		if (!symbols || symbols.startsWith('No symbols')) return '';
-		const outline = symbols.split('\n').slice(0, 40).join('\n');
+		const all = symbols.split('\n');
+		const outline =
+			all.slice(0, 40).join('\n') + (all.length > 40 ? `\n…[+${all.length - 40} symbols; use symbols tool]` : '');
 		return [
-			'### LSP OUTLINE (active file — prefer symbols/definition/references before full read)',
+			'### LSP OUTLINE (active file)',
 			`File: ${rel}`,
 			outline,
 		].join('\n');

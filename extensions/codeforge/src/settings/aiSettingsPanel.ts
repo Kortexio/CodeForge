@@ -51,7 +51,7 @@ function readAgentPrefs(): AgentPrefs {
 		previewEdits: cfg.get<boolean>('previewEdits', false),
 		traceLevel: cfg.get<string>('traceLevel', 'basic'),
 		tabCompletion: cfg.get<boolean>('tabCompletion', true),
-		agentCheckpointSteps: cfg.get<number>('agentCheckpointSteps', 20),
+		agentCheckpointSteps: cfg.get<number>('agentCheckpointSteps', 30),
 		agentHardCap: cfg.get<number>('agentHardCap', 100),
 		contextBudget: cfg.get<number>('contextBudget', 32768),
 	};
@@ -643,7 +643,7 @@ export class AiSettingsPanel {
     document.getElementById('agentWeakMode').value = agent.weakModelMode || 'auto';
     document.getElementById('agentCollapse').checked = !!agent.collapseToolCards;
     document.getElementById('agentTrace').value = agent.traceLevel || 'basic';
-    document.getElementById('agentCheckpoint').value = agent.agentCheckpointSteps ?? 20;
+    document.getElementById('agentCheckpoint').value = agent.agentCheckpointSteps ?? 30;
     document.getElementById('agentHardCap').value = agent.agentHardCap ?? 100;
     document.getElementById('agentAutoApprove').value = (agent.autoApprove || []).join(', ');
     document.getElementById('agentAutoApproveEdits').checked = !!agent.autoApproveEdits;

@@ -1,0 +1,3 @@
+[
+  { "file": "src/cart/totals.js", "replace": "i < cart.items.length - 1;", "with": "i < cart.items.length;" }
+]

@@ -1,0 +1,6 @@
+[
+  { "file": "src/pricing/tax.js", "replace": "calcTax", "with": "computeTax", "all": true },
+  { "file": "src/cart/totals.js", "replace": "calcTax", "with": "computeTax", "all": true },
+  { "file": "src/checkout/invoice.js", "replace": "calcTax", "with": "computeTax", "all": true },
+  { "file": "src/index.js", "replace": "calcTax", "with": "computeTax", "all": true }
+]

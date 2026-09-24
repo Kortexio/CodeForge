@@ -1,0 +1,15 @@
+{
+  "id": "CS5-review-billing-bugs",
+  "category": "review",
+  "fixture": "billing-bugs",
+  "runtime": "dotnet",
+  "title": "Find the bugs in Acme.Billing against docs/pricing.md",
+  "prompt": "Review the code in `src/Acme.Billing` against `docs/pricing.md` and find the bugs. Do not change the code: write `BUGS.md` at the root with one bug per line in the format `- path:line — description`.",
+  "protected": ["src/", "tests/", "config/", "docs/"],
+  "report": "BUGS.md",
+  "lineTolerance": 3,
+  "checks": [
+    { "type": "exists", "file": "BUGS.md", "why": "BUGS.md written" }
+  ],
+  "bonus": []
+}

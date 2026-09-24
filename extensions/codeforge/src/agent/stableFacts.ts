@@ -27,12 +27,23 @@ export function normalizeFacts(input?: Partial<StableFacts> | null): StableFacts
 	if (!input) return base;
 	return {
 		projectRoots: uniq(input.projectRoots ?? []),
-		keyPaths: uniq(input.keyPaths ?? []),
+		keyPaths: uniq((input.keyPaths ?? []).filter(isPlausiblePath)),
 		stackHints: uniq(input.stackHints ?? []),
 		decisions: uniq(input.decisions ?? []).slice(-20),
 		openErrors: uniq(input.openErrors ?? []).slice(-30),
 		updatedAt: input.updatedAt ?? Date.now(),
 	};
+}
+
+/** Rejects prose that leaked into keyPaths (e.g. ADVICE sentences parsed as list entries). */
+export function isPlausiblePath(p: string): boolean {
+	const s = String(p ?? '').trim();
+	if (!s || s.length > 260 || s.includes('###')) return false;
+	if (/\b(ADVICE|Prefer|explore tools|CONTEXT PACKET)\b/.test(s)) return false;
+	const last = s.split(/[\\/]/).pop() ?? s;
+	if (last.split(/\s+/).length > 4) return false;
+	if (/\s/.test(last) && /[.!?:,]$/.test(last)) return false;
+	return true;
 }
 
 export function mergeStableFacts(prev: StableFacts | undefined, next: Partial<StableFacts>): StableFacts {
@@ -44,7 +55,7 @@ export function mergeStableFacts(prev: StableFacts | undefined, next: Partial<St
 			: a.openErrors;
 	return {
 		projectRoots: uniq([...a.projectRoots, ...(next.projectRoots ?? [])]).slice(0, 12),
-		keyPaths: uniq([...a.keyPaths, ...(next.keyPaths ?? [])]).slice(0, 80),
+		keyPaths: uniq([...a.keyPaths, ...(next.keyPaths ?? []).filter(isPlausiblePath)]).slice(0, 80),
 		stackHints: uniq([...a.stackHints, ...(next.stackHints ?? [])]).slice(0, 20),
 		decisions: uniq([...a.decisions, ...(next.decisions ?? [])]).slice(-20),
 		openErrors,
@@ -78,11 +89,15 @@ export function extractFactsFromTool(
 	}
 
 	if (tool === 'list' && success) {
-		const children = output
-			.split('\n')
-			.map(l => l.trim())
-			.filter(l => l && !l.startsWith('('))
-			.slice(0, 40);
+		const children: string[] = [];
+		for (const raw of output.split('\n')) {
+			const l = raw.trim();
+			// Advice / memory blocks appended to tool output start with markdown headings.
+			if (l.startsWith('#')) break;
+			if (!l || l.startsWith('(')) continue;
+			children.push(l);
+			if (children.length >= 40) break;
+		}
 		const base = pathArg ? toRel(String(pathArg), root) : '.';
 		const childPaths = children.map(c => {
 			const name = c.replace(/^[\[\]\w\s]+\s+/, '').trim() || c;
@@ -106,7 +121,7 @@ export function extractFactsFromTool(
 		}
 	}
 
-	if (tool === 'write' && success && pathArg) {
+	if ((tool === 'write' || tool === 'edit') && success && pathArg) {
 		facts = mergeStableFacts(facts, {
 			keyPaths: [toRel(pathArg, root)],
 			decisions: [`wrote ${toRel(pathArg, root)}`],
@@ -114,8 +129,8 @@ export function extractFactsFromTool(
 		});
 	}
 
-	if (tool === 'shell') {
-		const cmd = String(args.command ?? '');
+	if (tool === 'shell' || tool === 'dotnet') {
+		const cmd = tool === 'dotnet' ? `dotnet ${String(args.action ?? '').replace('_', ' ')}` : String(args.command ?? '');
 		if (/dotnet/i.test(cmd)) {
 			facts = mergeStableFacts(facts, { stackHints: ['.NET / dotnet CLI'] });
 		}
@@ -131,7 +146,10 @@ export function extractFactsFromTool(
 			if (errs.length) {
 				facts = mergeStableFacts(facts, { openErrors: errs });
 			}
-		} else if (/Build succeeded|exit\s*[:=]?\s*0/i.test(output)) {
+		} else if (
+			/\b(dotnet\s+(build|test)|npm\s+(test|run\s+build)|pytest|cargo\s+(build|test)|go\s+test)\b/i.test(cmd) &&
+			/Build succeeded|exit\s*[:=]?\s*0/i.test(output)
+		) {
 			facts = mergeStableFacts(facts, { openErrors: [], decisions: [`shell ok: ${cmd.slice(0, 80)}`] });
 		}
 	}
@@ -166,13 +184,16 @@ export function formatStableFactsBlock(facts: StableFacts): string {
 		return '';
 	}
 	return [
-		'### STABLE FACTS (canonical — do not invent alternate roots/paths)',
+		'### STABLE FACTS (paths and state observed in this workspace)',
 		f.projectRoots.length ? `- projectRoots: ${f.projectRoots.join(' | ')}` : '',
-		f.keyPaths.length ? `- keyPaths: ${f.keyPaths.slice(0, 40).join(', ')}` : '',
+		f.keyPaths.length
+			? `- keyPaths: ${f.keyPaths.slice(0, 40).join(', ')}${f.keyPaths.length > 40 ? ` …[+${f.keyPaths.length - 40}]` : ''}`
+			: '',
 		f.stackHints.length ? `- stackHints: ${f.stackHints.join('; ')}` : '',
 		f.decisions.length ? `- decisions: ${f.decisions.slice(-10).join('; ')}` : '',
-		f.openErrors.length ? `- openErrors:\n${f.openErrors.slice(0, 12).map(e => `  · ${e}`).join('\n')}` : '',
-		'Prefer paths under projectRoots. Never invent sibling folders at workspace root unless listed in keyPaths.',
+		f.openErrors.length
+			? `- openErrors:\n${f.openErrors.slice(0, 12).map(e => `  · ${e}`).join('\n')}${f.openErrors.length > 12 ? `\n  …[+${f.openErrors.length - 12} errors]` : ''}`
+			: '',
 	]
 		.filter(Boolean)
 		.join('\n');

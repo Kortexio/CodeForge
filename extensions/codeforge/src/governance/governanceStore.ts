@@ -17,6 +17,22 @@ import {
 } from './types';
 
 const STATE_KEY = 'codeforge.ai.governance.v1';
+const BUILTIN_GOVERNANCE_VERSION = 5;
+
+/** v5: replaced by resources/skills/dotnet-error-cookbook.md (hints attached per error code). */
+const REMOVED_SKILL_IDS = new Set(['skill.dotnet-build-fix']);
+
+/** Rules removed from the builtins — drop from saved state so they stop polluting prompts. */
+const REMOVED_RULE_IDS = new Set([
+	'rule.plan-before-code',
+	'rule.one-file-turn',
+	'rule.verify-apis',
+	// v4: moved to resources/rules/one-stack.mdc (path-activated on Razor/MVC files only).
+	'rule.one-stack',
+]);
+
+/** Guardrails whose default flipped to off in v4 (plan-first conflicts with card-driven work). */
+const DISABLED_IN_V4 = new Set(['guard.require-plan-before-writes', 'guard.anti-explore-loop']);
 
 function mergeById<T extends { id: string; builtin?: boolean }>(
 	builtins: T[],
@@ -38,26 +54,129 @@ function mergeById<T extends { id: string; builtin?: boolean }>(
 	return [...builtins.map(b => map.get(b.id)!), ...customs];
 }
 
+function applyBuiltinDefaultsV2(state: GovernanceState): GovernanceState {
+	const builtins = builtinGovernanceState();
+	const byId = <T extends { id: string }>(list: T[]) => new Map(list.map(x => [x.id, x]));
+
+	const gBuilt = byId(builtins.guardrails);
+	const pBuilt = byId(builtins.policies);
+
+	state.rules = state.rules.filter(r => !REMOVED_RULE_IDS.has(r.id));
+
+	for (const g of state.guardrails) {
+		const b = gBuilt.get(g.id);
+		if (!b) continue;
+		if (
+			g.id === 'guard.anti-explore-loop' ||
+			g.id === 'guard.require-failing-test-before-impl'
+		) {
+			g.enabled = false;
+		}
+		if (g.id === 'guard.require-build-after-writes') {
+			g.params = { ...g.params, maxWritesWithoutBuild: 3 };
+		}
+		if (g.id === 'guard.block-mass-rewrite') {
+			g.params = { ...g.params, maxConsecutiveFileWrites: 8 };
+		}
+		g.description = b.description;
+		g.content = b.content;
+		g.title = b.title;
+	}
+
+	for (const p of state.policies) {
+		const b = pBuilt.get(p.id);
+		if (!b) continue;
+		if (p.id === 'policy.write-budget') {
+			p.params = { ...p.params, maxWritesWithoutBuild: 3 };
+			p.content = b.content;
+		}
+		if (p.id === 'policy.failed-build-discipline') {
+			p.content = b.content;
+		}
+	}
+
+	state.version = BUILTIN_GOVERNANCE_VERSION;
+	return state;
+}
+
+/** v4: refresh builtin texts (saved copies override builtins in mergeById) and new defaults. */
+function applyBuiltinDefaultsV4(state: GovernanceState): GovernanceState {
+	const builtins = builtinGovernanceState();
+	const refresh = <T extends { id: string; builtin?: boolean }>(list: T[], fresh: T[], keys: (keyof T)[]) => {
+		const byId = new Map(fresh.map(x => [x.id, x]));
+		for (const item of list) {
+			const b = byId.get(item.id);
+			if (!b) continue;
+			for (const k of keys) {
+				item[k] = b[k];
+			}
+		}
+	};
+	refresh(state.skills, builtins.skills, ['title', 'description', 'content', 'triggers']);
+	refresh(state.rules, builtins.rules, ['title', 'description', 'content']);
+	refresh(state.policies, builtins.policies, ['title', 'description', 'content']);
+	refresh(state.guardrails, builtins.guardrails, ['title', 'description', 'content', 'params']);
+	state.rules = state.rules.filter(r => !REMOVED_RULE_IDS.has(r.id));
+	for (const g of state.guardrails) {
+		if (DISABLED_IN_V4.has(g.id)) g.enabled = false;
+	}
+	state.version = BUILTIN_GOVERNANCE_VERSION;
+	return state;
+}
+
+/** Instruction blocks are never cut: whole text when it fits, otherwise the one-line description. */
+export function fitInstruction(
+	title: string,
+	content: string,
+	description: string | undefined,
+	remaining: number
+): { text: string; full: boolean } | undefined {
+	const full = `### ${title}\n${content.trim()}`;
+	if (full.length <= remaining) return { text: full, full: true };
+	const short = description?.trim() ? `### ${title}\n${description.trim()}` : '';
+	if (short && short.length <= remaining) return { text: short, full: false };
+	return undefined;
+}
+
 export class GovernanceStore {
 	private readonly _onDidChange = new vscode.EventEmitter<GovernanceState>();
 	readonly onDidChange = this._onDidChange.event;
+	private migrating = false;
 
 	constructor(private readonly context: vscode.ExtensionContext) {}
 
 	getState(): GovernanceState {
 		const builtins = builtinGovernanceState();
 		const raw = this.context.globalState.get<Partial<GovernanceState>>(STATE_KEY);
-		return {
-			version: 1,
-			skills: mergeById(builtins.skills, raw?.skills),
-			rules: mergeById(builtins.rules, raw?.rules),
+		let state: GovernanceState = {
+			version: typeof raw?.version === 'number' ? raw.version : 1,
+			skills: mergeById(builtins.skills, raw?.skills).filter(s => !REMOVED_SKILL_IDS.has(s.id)),
+			rules: mergeById(builtins.rules, raw?.rules).filter(r => !REMOVED_RULE_IDS.has(r.id)),
 			policies: mergeById(builtins.policies, raw?.policies),
 			guardrails: mergeById(builtins.guardrails, raw?.guardrails),
 		};
+
+		if ((state.version ?? 1) < BUILTIN_GOVERNANCE_VERSION) {
+			if ((state.version ?? 1) < 3) {
+				state = applyBuiltinDefaultsV2(state);
+			}
+			state = applyBuiltinDefaultsV4(state);
+			if (!this.migrating) {
+				this.migrating = true;
+				void this.save(state).finally(() => {
+					this.migrating = false;
+				});
+			}
+		}
+
+		return state;
 	}
 
 	async save(state: GovernanceState): Promise<void> {
-		await this.context.globalState.update(STATE_KEY, state);
+		await this.context.globalState.update(STATE_KEY, {
+			...state,
+			version: BUILTIN_GOVERNANCE_VERSION,
+		});
 		this._onDidChange.fire(this.getState());
 	}
 
@@ -134,59 +253,11 @@ export class GovernanceStore {
 		} satisfies GuardrailItem;
 	}
 
-	buildPromptSection(task: string, opts?: { forceSkillIds?: string[] }): string {
-		const state = this.getState();
-		const q = task.toLowerCase();
-		const rules = state.rules.filter(r => r.enabled).slice(0, 12);
-		const skills = state.skills
-			.filter(s => s.enabled)
-			.filter(
-				s =>
-					opts?.forceSkillIds?.includes(s.id) ||
-					s.triggers.some(t => q.includes(t.toLowerCase())) ||
-					s.title.toLowerCase().split(/\s+/).some(w => w.length > 3 && q.includes(w))
-			)
-			.slice(0, 6);
-		const workflow = state.skills.find(s => s.id === 'skill.agent-workflow' && s.enabled);
-		if (workflow && !skills.some(s => s.id === workflow.id)) {
-			skills.unshift(workflow);
-		}
-		const weakSkill = state.skills.find(s => s.id === 'skill.harness-weak-models' && s.enabled);
-		if (
-			weakSkill &&
-			opts?.forceSkillIds?.includes('skill.harness-weak-models') &&
-			!skills.some(s => s.id === weakSkill.id)
-		) {
-			skills.unshift(weakSkill);
-		}
-		const parts: string[] = [];
-		if (rules.length) {
-			parts.push(
-				'## Active Rules',
-				...rules.map(r => `- ${r.title}: ${r.content.slice(0, 500)}`)
-			);
-		}
-		if (skills.length) {
-			parts.push(
-				'## Relevant Skills',
-				...skills.map(s => `### ${s.title}\n${s.content.slice(0, 2500)}`)
-			);
-		}
-		const policies = state.policies.filter(p => p.enabled).slice(0, 6);
-		if (policies.length) {
-			parts.push(
-				'## Active Policies',
-				...policies.map(p => `- ${p.title}: ${p.content.slice(0, 400)}`)
-			);
-		}
-		const gates = state.guardrails.filter(g => g.enabled);
-		if (gates.length) {
-			parts.push(
-				'## Active Guardrails (enforced by IDE)',
-				...gates.map(g => `- ${g.title}: ${g.description || g.content.slice(0, 200)}`)
-			);
-		}
-		return parts.join('\n');
+	buildPromptSection(
+		task: string,
+		opts?: { forceSkillIds?: string[]; charBudget?: number }
+	): string {
+		return buildGovernancePrompt(this.getState(), task, opts);
 	}
 
 	runtimeConfig(overrides?: Partial<GuardrailRuntimeConfig>): GuardrailRuntimeConfig {
@@ -203,9 +274,9 @@ export class GovernanceStore {
 		const maxWrites =
 			numParam(guard('require_build_after_writes')?.params, 'maxWritesWithoutBuild') ??
 			numParam(policyWrite?.params, 'maxWritesWithoutBuild') ??
-			1;
+			3;
 		const maxConsecutive =
-			numParam(guard('block_mass_rewrite')?.params, 'maxConsecutiveFileWrites') ?? 5;
+			numParam(guard('block_mass_rewrite')?.params, 'maxConsecutiveFileWrites') ?? 8;
 		const blockExplore =
 			boolParam(guard('build_fix_gate')?.params, 'blockExploreWhileBuildRed') ??
 			boolParam(policyFail?.params, 'blockExploreWhileBuildRed') ??
@@ -217,7 +288,7 @@ export class GovernanceStore {
 		const base: GuardrailRuntimeConfig = {
 			buildFixGate: on('build_fix_gate'),
 			requireBuildAfterWrites: on('require_build_after_writes'),
-			maxWritesWithoutBuild: weak ? Math.min(maxWrites, 1) : maxWrites,
+			maxWritesWithoutBuild: weak ? Math.min(maxWrites, 2) : maxWrites,
 			preserveBuildErrorsOnCompact: on('preserve_build_errors_on_compact'),
 			blockMassRewrite: on('block_mass_rewrite'),
 			maxConsecutiveFileWrites: maxConsecutive,
@@ -225,14 +296,71 @@ export class GovernanceStore {
 			antiExploreLoop: on('anti_explore_loop'),
 			blockExploreWhileBuildRed: blockExplore,
 			requirePlanBeforeWrites: on('require_plan_before_writes') && weak,
-			requireFailingTestBeforeImpl:
-				(on('require_failing_test_before_impl') && weak) ||
-				overrides?.requireFailingTestBeforeImpl === true,
+			requireFailingTestBeforeImpl: on('require_failing_test_before_impl') && weak,
 			maxImplWritesAfterRed,
 			weakProfile: weak,
 		};
-		return { ...base, ...overrides, weakProfile: weak || overrides?.weakProfile === true };
+		// Ignore requireFailingTestBeforeImpl overrides that would force TDD on when the gate is off.
+		const { requireFailingTestBeforeImpl: _ignoredTdd, ...rest } = overrides ?? {};
+		void _ignoredTdd;
+		return {
+			...base,
+			...rest,
+			requireFailingTestBeforeImpl: base.requireFailingTestBeforeImpl,
+			weakProfile: weak || overrides?.weakProfile === true,
+		};
 	}
+}
+
+/**
+ * Rules + relevant skills for the system prompt. Items are selected (never truncated):
+ * each block goes in whole, or as its description, or not at all.
+ * Guardrails are not listed — they act at tool time and speak through tool results.
+ */
+export function buildGovernancePrompt(
+	state: GovernanceState,
+	task: string,
+	opts?: { forceSkillIds?: string[]; charBudget?: number }
+): string {
+	const q = task.toLowerCase();
+	const budget = opts?.charBudget ?? 6000;
+	const rules = state.rules.filter(r => r.enabled);
+	const forced = new Set(opts?.forceSkillIds ?? []);
+	const enabledSkills = state.skills.filter(s => s.enabled);
+	const matched = enabledSkills.filter(
+		s =>
+			!forced.has(s.id) &&
+			s.id !== 'skill.agent-workflow' &&
+			(s.triggers.some(t => q.includes(t.toLowerCase())) ||
+				s.title.toLowerCase().split(/\s+/).some(w => w.length > 3 && q.includes(w)))
+	);
+	const ordered = [
+		...enabledSkills.filter(s => s.id === 'skill.agent-workflow'),
+		...enabledSkills.filter(s => forced.has(s.id) && s.id !== 'skill.agent-workflow'),
+		...matched.slice(0, 3),
+	];
+
+	let remaining = budget;
+	const ruleLines: string[] = [];
+	for (const r of rules) {
+		const line = `- ${r.title}: ${r.content.trim()}`;
+		const alt = r.description ? `- ${r.title}: ${r.description.trim()}` : '';
+		const pick = line.length <= remaining ? line : alt && alt.length <= remaining ? alt : '';
+		if (!pick) continue;
+		ruleLines.push(pick);
+		remaining -= pick.length + 1;
+	}
+	const skillBlocks: string[] = [];
+	for (const s of ordered) {
+		const fit = fitInstruction(s.title, s.content, s.description, remaining);
+		if (!fit) continue;
+		skillBlocks.push(fit.text);
+		remaining -= fit.text.length + 1;
+	}
+	const parts: string[] = [];
+	if (ruleLines.length) parts.push('## Active Rules', ...ruleLines);
+	if (skillBlocks.length) parts.push('## Relevant Skills', ...skillBlocks);
+	return parts.join('\n');
 }
 
 function listFor(state: GovernanceState, kind: GovernanceKind): GovernanceItem[] {

@@ -1,0 +1,6 @@
+[
+  {
+    "file": "BUGS.md",
+    "write": "# Bugs\n\n- src/Acme.Billing/Tax.cs:8 — ES VAT is 12%, docs say 21%\n- src/Acme.Billing/PricingRules.cs:15 — bulk tiers are ascending, 50 units get 5%\n- src/Acme.Billing/PricingRules.cs:160 — gold discount 50% instead of 5%\n- src/Acme.Billing/Totals.cs:27 — VAT charged on the subtotal, not on net\n- src/Acme.Billing/Money.cs:6 — MidpointRounding.ToEven, docs say AwayFromZero\n- src/Acme.Billing/Coupons.cs:14 — case-sensitive JSON, lowercase keys in coupons.json do not bind\n"
+  }
+]

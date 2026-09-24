@@ -13,7 +13,8 @@ export type ContextSourceKind =
 	| 'git'
 	| 'mcp'
 	| 'history'
-	| 'facts';
+	| 'facts'
+	| 'lessons';
 
 export interface ContextSource {
 	kind: ContextSourceKind;
@@ -35,11 +36,12 @@ export const DEFAULT_BUDGET: ContextBudget = {
 		wiki_session: 0.1,
 		wiki_project: 0.1,
 		facts: 0.06,
+		lessons: 0.06,
 		ide: 0.08,
 		retrieve: 0.12,
 		git: 0.05,
 		mcp: 0.04,
-		history: 0.33,
+		history: 0.27,
 	},
 };
 
@@ -47,6 +49,7 @@ const RANK: Record<ContextSourceKind, number> = {
 	system: 100,
 	wiki_session: 90,
 	facts: 88,
+	lessons: 92,
 	wiki_project: 85,
 	ide: 80,
 	retrieve: 70,

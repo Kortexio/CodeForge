@@ -7,7 +7,10 @@
 
 import * as vscode from 'vscode';
 import * as path from 'path';
+import * as fs from 'fs';
 import { pickSandboxLevel, runSandboxed, type SandboxLevel } from '../sandbox/runtime';
+import { clipBuildOutput, clipData } from '../agent/clip';
+import { applyEdit, excerptAround } from '../agent/editTool';
 
 export interface BridgeToolCall {
     id: string;
@@ -73,9 +76,29 @@ export class VSCodeAIBridge {
 
         switch (toolCall.name) {
             case 'read':
-                return this.readFile(String(args.path));
+                return this.readFile(String(args.path), {
+					startLine:
+						args.startLine !== undefined
+							? Number(args.startLine)
+							: args.offset !== undefined
+								? Number(args.offset)
+								: undefined,
+					limit:
+						args.limit !== undefined
+							? Number(args.limit)
+							: args.endLine !== undefined && args.startLine !== undefined
+								? Math.max(1, Number(args.endLine) - Number(args.startLine) + 1)
+								: undefined,
+				});
             case 'write':
                 return this.writeFile(String(args.path), String(args.content ?? ''));
+            case 'edit':
+                return this.editFile(
+                    String(args.path),
+                    String(args.old_string ?? ''),
+                    String(args.new_string ?? ''),
+                    args.replace_all === true || args.replace_all === 'true'
+                );
             case 'list':
                 return this.listDirectory(String(args.path ?? '.'), Boolean(args.recursive));
             case 'search':
@@ -110,26 +133,71 @@ export class VSCodeAIBridge {
         return vscode.Uri.file(path.join(root, filePath));
     }
 
-    private async readFile(filePath: string): Promise<string> {
+    private async readFile(
+		filePath: string,
+		opts?: { startLine?: number; limit?: number }
+	): Promise<string> {
         const uri = this.resolveUri(filePath);
         const budget =
             vscode.workspace.getConfiguration('codeforge.ai').get<number>('contextBudget') ?? 32768;
-        const maxChars = Math.min(12000, Math.max(4000, Math.floor(budget * 0.45)));
+		// Default window ~ Cursor-style: prefer a slice, not the whole file.
+		const defaultLineLimit = 120;
+		const maxChars = Math.min(8000, Math.max(2500, Math.floor(budget * 0.2)));
         try {
             const bytes = await vscode.workspace.fs.readFile(uri);
             const text = Buffer.from(bytes).toString('utf8');
-            if (text.length > maxChars) {
-                return text.slice(0, maxChars) + `\n\n... [truncated @ ${maxChars} chars — use symbols/retrieve for more]`;
-            }
-            return text;
+			const lines = text.split(/\r?\n/);
+			const totalLines = lines.length;
+			const start = Math.max(1, Math.floor(opts?.startLine ?? 1));
+			const limit = Math.max(1, Math.min(400, Math.floor(opts?.limit ?? defaultLineLimit)));
+			const hasWindow =
+				(opts?.startLine !== undefined && Number.isFinite(opts.startLine)) ||
+				(opts?.limit !== undefined && Number.isFinite(opts.limit));
+			const from = start - 1;
+			const slice = lines.slice(from, from + limit);
+			let shown = slice;
+			let body = shown.map((l, i) => `${String(from + i + 1).padStart(4, ' ')}|${l}`).join('\n');
+			if (body.length > maxChars) {
+				// Keep whole lines and report the real end line so a follow-up read continues exactly.
+				let used = 0;
+				let n = 0;
+				while (n < slice.length && used + slice[n].length + 6 <= maxChars) {
+					used += slice[n].length + 6;
+					n++;
+				}
+				shown = slice.slice(0, Math.max(1, n));
+				body = shown.map((l, i) => `${String(from + i + 1).padStart(4, ' ')}|${l}`).join('\n');
+			}
+			const shownEnd = from + shown.length;
+			const tail =
+				shownEnd < totalLines
+					? `\n\n(lines ${start}-${shownEnd} of ${totalLines}; more: startLine=${shownEnd + 1})`
+					: hasWindow || totalLines > defaultLineLimit
+						? `\n\n(end of file — ${totalLines} lines)`
+						: '';
+			return `FILE ${filePath} lines ${start}-${shownEnd}/${totalLines}\n${body}${tail}`;
         } catch (err) {
             const message = err instanceof Error ? err.message : String(err);
             if (/ENOENT|FileNotFound|no such file/i.test(message)) {
+                // Bare filenames often mean docs/<name> in card-driven workspaces.
+                const bare = !/[\\/]/.test(filePath) && !filePath.toLowerCase().startsWith('docs/');
+                if (bare) {
+                    try {
+                        const docsPath = `docs/${filePath}`;
+                        const docsUri = this.resolveUri(docsPath);
+                        await vscode.workspace.fs.stat(docsUri);
+                        const redirected = await this.readFile(docsPath, opts);
+                        return [
+                            `("${filePath}" is not at the workspace root — showing docs/${filePath})`,
+                            redirected,
+                        ].join('\n');
+                    } catch {
+                        /* fall through */
+                    }
+                }
                 return [
                     `FILE_NOT_FOUND: ${filePath}`,
-                    'This path does not exist. Do NOT read it again.',
-                    'If the task needs this file, create it with the write tool (include full content).',
-                    'Otherwise continue with files that already exist (use list to discover names).',
+                    'This path does not exist yet. Create it with write if the task needs it; list/retrieve show existing names.',
                 ].join('\n');
             }
             throw err;
@@ -152,6 +220,36 @@ export class VSCodeAIBridge {
             // open is best-effort
         }
         return `Wrote ${filePath} (${content.length} chars)`;
+    }
+
+    /** Current text of a workspace file, or undefined when it does not exist. */
+    async readRaw(filePath: string): Promise<string | undefined> {
+        try {
+            const bytes = await vscode.workspace.fs.readFile(this.resolveUri(filePath));
+            return Buffer.from(bytes).toString('utf8');
+        } catch {
+            return undefined;
+        }
+    }
+
+    private async editFile(
+        filePath: string,
+        oldString: string,
+        newString: string,
+        replaceAll: boolean
+    ): Promise<string> {
+        const current = await this.readRaw(filePath);
+        if (current === undefined) {
+            throw new Error(`FILE_NOT_FOUND: ${filePath} — use write to create a new file.`);
+        }
+        const result = applyEdit(current, oldString, newString, replaceAll);
+        if (!result.ok) {
+            throw new Error(`edit ${filePath}: ${result.error}`);
+        }
+        await vscode.workspace.fs.writeFile(this.resolveUri(filePath), Buffer.from(result.text, 'utf8'));
+        const excerpt = clipData(excerptAround(result.text, result.firstLine, newString), 4000);
+        const total = result.text.split(/\r?\n/).length;
+        return `Edited ${filePath} (${result.count} replacement${result.count > 1 ? 's' : ''}; file now ${total} lines)\n${excerpt}`;
     }
 
     private async listDirectory(dirPath: string, recursive: boolean): Promise<string> {
@@ -221,6 +319,40 @@ export class VSCodeAIBridge {
 
     private async search(pattern: string, searchPath?: string): Promise<string> {
         const matches: string[] = [];
+        const root = this.getWorkspaceRoot();
+        const fs = await import('fs/promises');
+        const pathMod = await import('path');
+
+        // If searchPath is a single file, grep it in-process (no ripgrep).
+        if (searchPath && root) {
+            const abs = path.isAbsolute(searchPath)
+                ? searchPath
+                : pathMod.join(root, searchPath);
+            try {
+                const st = await fs.stat(abs);
+                if (st.isFile()) {
+                    const text = await fs.readFile(abs, 'utf8');
+                    let regex: RegExp;
+                    try {
+                        regex = new RegExp(pattern, 'i');
+                    } catch {
+                        regex = new RegExp(pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+                    }
+                    const lines = text.split(/\r?\n/);
+                    for (let i = 0; i < lines.length && matches.length < 60; i++) {
+                        if (regex.test(lines[i])) {
+                            matches.push(`${abs}:${i + 1}: ${lines[i].trim().slice(0, 200)}`);
+                        }
+                    }
+                    return matches.length
+                        ? matches.join('\n')
+                        : `No matches for ${pattern} in ${searchPath}`;
+                }
+            } catch {
+                /* not a readable file — fall through */
+            }
+        }
+
         const include = searchPath
             ? new vscode.RelativePattern(this.resolveUri(searchPath), '**/*')
             : '**/*';
@@ -263,35 +395,44 @@ export class VSCodeAIBridge {
                     return matches.join('\n');
                 }
             }
-        } catch {
-            // fall through to full scan
-        }
-
-        const results = await vscode.workspace.findFiles(include, exclude, 800);
-        let regex: RegExp;
-        try {
-            regex = new RegExp(pattern, 'i');
-        } catch {
-            regex = new RegExp(pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
-        }
-        for (const uri of results) {
-            try {
-                const bytes = await vscode.workspace.fs.readFile(uri);
-                if (bytes.byteLength > 400_000) continue;
-                const text = Buffer.from(bytes).toString('utf8');
-                const lines = text.split('\n');
-                for (let index = 0; index < lines.length; index++) {
-                    if (regex.test(lines[index]) && matches.length < 60) {
-                        matches.push(`${uri.fsPath}:${index + 1}: ${lines[index].trim()}`);
-                    }
-                }
-            } catch {
-                // skip
+        } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            if (!/ENOENT|ripgrep|spawn/i.test(msg)) {
+                // unexpected — still try node scan
             }
-            if (matches.length >= 60) break;
         }
 
-        return matches.length ? matches.join('\n') : 'No matches found';
+        // Node fallback (no ripgrep): limited workspace scan.
+        try {
+            const results = await vscode.workspace.findFiles(include, exclude, 400);
+            let regex: RegExp;
+            try {
+                regex = new RegExp(pattern, 'i');
+            } catch {
+                regex = new RegExp(pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+            }
+            for (const uri of results) {
+                if (matches.length >= 60) break;
+                try {
+                    const bytes = await vscode.workspace.fs.readFile(uri);
+                    const text = Buffer.from(bytes).toString('utf8');
+                    if (text.includes('\u0000')) continue;
+                    const lines = text.split(/\r?\n/);
+                    for (let i = 0; i < lines.length && matches.length < 60; i++) {
+                        if (regex.test(lines[i])) {
+                            matches.push(`${uri.fsPath}:${i + 1}: ${lines[i].trim().slice(0, 200)}`);
+                        }
+                    }
+                } catch {
+                    /* skip unreadable */
+                }
+            }
+        } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            return `Error: search failed (${msg}). Prefer retrieve or read a known path.`;
+        }
+
+        return matches.length ? matches.join('\n') : `No matches for ${pattern}`;
     }
 
     private async deleteFile(filePath: string): Promise<string> {
@@ -544,7 +685,7 @@ export class VSCodeAIBridge {
                 } else if (opts?.background) {
                     result +=
                         `\n\n[Process still running in Agent Terminal (pid ${opts.pid ?? '?'}). ` +
-                        `Do NOT re-run the same server command. Continue with code edits; tell the user the app is up.]`;
+                        `It keeps running; starting it again would conflict with this instance.]`;
                 }
                 this.output.appendLine(result.slice(0, 2500));
                 resolve(result);
@@ -627,37 +768,7 @@ function isLongRunningCommand(command: string): boolean {
  */
 export function summarizeShellOutput(raw: string, maxChars = 8000): string {
     const text = raw.replace(/\r\n/g, '\n').trim();
-    if (!text) {
-        return '';
-    }
-    if (text.length <= maxChars) {
-        return text;
-    }
-
-    const lines = text.split('\n');
-    const important = lines.filter(l =>
-        /error|fail|success|warn|exception|notfound|unable|cannot|listening|now listening|application started|built successfully|packagereference|added package/i.test(
-            l
-        )
-    );
-    const headN = 40;
-    const tailN = 40;
-    const head = lines.slice(0, headN).join('\n');
-    const tail = lines.slice(-tailN).join('\n');
-    const signal =
-        important.length > 0
-            ? important.slice(0, 60).join('\n')
-            : '(no strong error/success lines detected)';
-
-    return [
-        `[output summarized: ${text.length} chars → keep signal for the model]`,
-        '--- important ---',
-        signal,
-        '--- head ---',
-        head,
-        '--- tail ---',
-        tail,
-    ].join('\n');
+    return text ? clipBuildOutput(text, maxChars) : '';
 }
 
 /**
@@ -668,7 +779,15 @@ function prepareWindowsCommand(
     command: string,
     workspaceRoot: string
 ): { command: string; cwd: string; display: string; note?: string } {
-    const trimmed = command.trim();
+    // Strip Unix pipes that fail on cmd.exe before any normalization.
+    const pipeStripped = command
+        .replace(/\s*\|\s*(tail|head|grep)\b[^|&;]*/gi, '')
+        .trim();
+    const pipeNote =
+        pipeStripped !== command.trim()
+            ? 'Removed Unix pipe (tail/head/grep) — shell is cmd.exe.'
+            : undefined;
+    const trimmed = pipeStripped;
     // cd X && rest  |  cd /d X && rest  |  cd X; rest
     const cdMatch = /^(?:cd(?:\s+\/d)?)\s+("([^"]+)"|([^\s&;]+))\s*(?:&&|;)\s*([\s\S]+)$/i.exec(
         trimmed
@@ -677,19 +796,35 @@ function prepareWindowsCommand(
         const target = (cdMatch[2] || cdMatch[3] || '').trim();
         const rest = (cdMatch[4] || '').trim();
         if (target && rest) {
+            const abs = path.isAbsolute(target)
+                ? target
+                : path.resolve(workspaceRoot, target);
+            if (fs.existsSync(abs)) {
+                return {
+                    command: rest,
+                    cwd: abs,
+                    display: rest,
+                    note: [pipeNote, `normalized: cwd → ${abs}`].filter(Boolean).join(' | '),
+                };
+            }
             return {
                 command: rest,
-                cwd: target,
+                cwd: workspaceRoot,
                 display: rest,
-                note: `normalized: cwd → ${target}`,
+                note: [
+                    pipeNote,
+                    `cwd "${target}" does not exist — using workspace root`,
+                ]
+                    .filter(Boolean)
+                    .join(' | '),
             };
         }
     }
 
-    // If model still uses absolute path under workspace, leave command as-is for cmd.exe
     return {
         command: trimmed,
         cwd: workspaceRoot,
         display: trimmed,
+        note: pipeNote,
     };
 }

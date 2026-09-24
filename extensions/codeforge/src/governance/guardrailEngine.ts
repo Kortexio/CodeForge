@@ -1,12 +1,12 @@
 /**
- * Hard guardrail enforcement helpers for the agent loop.
+ * Guardrail guidance helpers for the agent loop (advice-only — does not ban tools).
  */
 
 import { GuardrailRuntimeConfig } from './types';
 import { getGovernanceStore } from './governanceStore';
 import { getProjectWikiStore } from '../memory/projectWiki';
 
-const EXPLORE = new Set(['list', 'read', 'retrieve', 'search', 'grep', 'glob']);
+const BROAD_EXPLORE = new Set(['list', 'glob']);
 const MUTATING_FILE = new Set(['write', 'delete', 'rename']);
 
 export function isBuildOrTestCommand(command: unknown): boolean {
@@ -20,7 +20,9 @@ export function isBuildOrTestCommand(command: unknown): boolean {
 		/\bmvn\s+(-B\s+)?(package|test|verify)\b/.test(c) ||
 		/\bgradlew?\s+(build|test)\b/.test(c) ||
 		/\bcargo\s+(build|test)\b/.test(c) ||
-		/\bgo\s+test\b/.test(c)
+		/\bgo\s+test\b/.test(c) ||
+		/\byarn\s+(build|test)\b/.test(c) ||
+		/\bpnpm\s+(run\s+)?(build|test)\b/.test(c)
 	);
 }
 
@@ -33,7 +35,9 @@ export function isTestCommand(command: unknown): boolean {
 		/\bmvn\s+(-B\s+)?test\b/.test(c) ||
 		/\bgradlew?\s+test\b/.test(c) ||
 		/\bcargo\s+test\b/.test(c) ||
-		/\bgo\s+test\b/.test(c)
+		/\bgo\s+test\b/.test(c) ||
+		/\byarn\s+test\b/.test(c) ||
+		/\bpnpm\s+(run\s+)?test\b/.test(c)
 	);
 }
 
@@ -48,11 +52,23 @@ export function isTestFilePath(pathArg: unknown): boolean {
 }
 
 export function extractBuildErrorLines(output: string, limit = 20): string[] {
-	return output
+	const lines = output
 		.split(/\r?\n/)
-		.map(l => l.trim())
-		.filter(l => /error\s+(CS|RZ|MSB)\d+/i.test(l) || /: error /i.test(l))
-		.slice(0, limit);
+		.map(l => l.trim().replace(/\s+\[[^\]]+\.(cs|fs|vb)proj\]$/i, ''))
+		.filter(
+			l =>
+				/error\s+(CS|RZ|MSB|NU|NETSDK)\d+/i.test(l) ||
+				/: error /i.test(l) ||
+				/^Failed\s+\S+\s*\[/.test(l) ||
+				/^not ok \d+/.test(l)
+		);
+	const generic = lines.length
+		? []
+		: output
+				.split(/\r?\n/)
+				.map(l => l.trim())
+				.filter(l => /\berror\b/i.test(l));
+	return [...new Set([...lines, ...generic])].slice(0, limit);
 }
 
 function hasTaskPlan(): boolean {
@@ -80,6 +96,8 @@ export class GuardrailSession {
 	lastWritePath: string | null = null;
 	testRedSeen = false;
 	implWritesAfterRed = 0;
+	/** Last build/test command exited 0 and no write happened since. */
+	private greenAfterWrites = false;
 	private mutatingWriteSeen = false;
 
 	constructor(public cfg: GuardrailRuntimeConfig) {}
@@ -88,6 +106,14 @@ export class GuardrailSession {
 		const weak = this.cfg.weakProfile;
 		const next = getGovernanceStore().runtimeConfig({ weakProfile: weak });
 		this.cfg = { ...next, weakProfile: weak };
+	}
+
+	/** True when write-first nudges should wait (plan / TDD still pending). */
+	shouldDeferAntiExplore(planMode = false): boolean {
+		if (planMode) return true;
+		if (this.cfg.requirePlanBeforeWrites && !hasTaskPlan()) return true;
+		if (this.cfg.requireFailingTestBeforeImpl && !this.testRedSeen) return true;
+		return false;
 	}
 
 	onShellResult(command: unknown, success: boolean, output: string): string | null {
@@ -109,29 +135,22 @@ export class GuardrailSession {
 			this.lastBuildErrors = [];
 			this.writesSinceBuild = 0;
 			this.consecutiveFileWrites = 0;
+			this.greenAfterWrites = true;
 			return null;
 		}
+		this.greenAfterWrites = false;
 		this.buildRed = true;
 		this.lastBuildErrors = extractBuildErrorLines(output);
 		if (!this.cfg.buildFixGate) {
 			return null;
 		}
-		const errs =
-			this.lastBuildErrors.length > 0
-				? this.lastBuildErrors.map(e => `· ${e}`).join('\n')
-				: '· (see shell output)';
-		return [
-			'### GUARDRAIL: BUILD-FIX MODE',
-			'The last build/test failed. Do NOT explore the whole repo or rewrite unrelated files.',
-			'Fix ONLY the reported errors, one cluster at a time, then run the same build again.',
-			'Errors:',
-			errs,
-		].join('\n');
+		return this.lastBuildErrors.length ? this.lastBuildErrors.join('\n') : 'build/test failed';
 	}
 
 	onSuccessfulWrite(path: unknown): void {
 		const p = String(path ?? '');
 		this.writesSinceBuild += 1;
+		this.greenAfterWrites = false;
 		if (this.lastWritePath && this.lastWritePath !== p) {
 			this.consecutiveFileWrites += 1;
 		} else if (!this.lastWritePath) {
@@ -143,92 +162,73 @@ export class GuardrailSession {
 		}
 	}
 
-	/** Returns a block message if the tool call must be rejected. */
-	blockReason(tool: string, args: Record<string, unknown>): string | null {
+	/**
+	 * Advice-only: never rejects a tool. Call before/after execution and append to tool output or nudges.
+	 */
+	adviceFor(tool: string, args: Record<string, unknown>): string | null {
 		this.refreshConfig();
+		const tips: string[] = [];
 
 		if (
+			!this.cfg.weakProfile &&
 			this.cfg.buildFixGate &&
 			this.cfg.blockExploreWhileBuildRed &&
 			this.buildRed &&
-			EXPLORE.has(tool)
+			BROAD_EXPLORE.has(tool)
 		) {
-			return (
-				`Blocked by guardrail build_fix_gate: build is still failing. ` +
-				`Read/fix the error files or run build — do not ${tool} for broad exploration.\n` +
-				(this.lastBuildErrors.slice(0, 8).join('\n') || '')
-			);
+			tips.push(`Build is red: ${this.lastBuildErrors.slice(0, 4).join(' | ') || 'see the last build output'}`);
 		}
 
 		if (MUTATING_FILE.has(tool)) {
 			if (this.cfg.requirePlanBeforeWrites && !this.mutatingWriteSeen && !hasTaskPlan()) {
-				return (
-					`Blocked by guardrail require_plan_before_writes: no wiki plan yet. ` +
-					`Call wiki_write with id "task-plan", a numbered checklist, and a verifiable Definition of Done — then retry the write.`
+				tips.push(
+					'No wiki task-plan yet. Consider wiki_write id=task-plan with checklist + Definition of Done (especially under weak harness).'
 				);
 			}
 
 			if (tool === 'write' || tool === 'delete' || tool === 'rename') {
-				const pathArg =
-					tool === 'rename' ? args.to ?? args.path : args.path;
-				if (
-					this.cfg.requireFailingTestBeforeImpl &&
-					!isTestFilePath(pathArg)
-				) {
+				const pathArg = tool === 'rename' ? args.to ?? args.path : args.path;
+				if (this.cfg.requireFailingTestBeforeImpl && !isTestFilePath(pathArg)) {
 					if (!this.testRedSeen) {
-						return (
-							`Blocked by guardrail require_failing_test_before_impl (TDD): ` +
-							`write a failing test first, run it (dotnet test / npm test / …), then implement. ` +
-							`Test files are always allowed.`
+						tips.push(
+							'TDD gate is on: prefer a failing test (then run tests) before more production writes. Test files are fine anytime.'
 						);
-					}
-					if (this.implWritesAfterRed >= this.cfg.maxImplWritesAfterRed) {
-						return (
-							`Blocked by guardrail require_failing_test_before_impl: ` +
-							`${this.implWritesAfterRed} production writes since the last red test. ` +
-							`Re-run tests before more implementation writes.`
+					} else if (this.implWritesAfterRed >= this.cfg.maxImplWritesAfterRed) {
+						tips.push(
+							`${this.implWritesAfterRed} production writes since the last red test — re-run tests before continuing.`
 						);
 					}
 				}
 			}
 		}
 
+		// Build-after-writes and mass-rewrite are enforced by the oracle and the large-file gate, not by text.
 		if (tool === 'write') {
-			if (
-				this.cfg.requireBuildAfterWrites &&
-				this.writesSinceBuild >= this.cfg.maxWritesWithoutBuild
-			) {
-				return (
-					`Blocked by guardrail require_build_after_writes: ` +
-					`${this.writesSinceBuild} writes without a successful build. ` +
-					`Run \`dotnet build\` (or project build) before more writes.`
-				);
-			}
-			if (
-				this.cfg.blockMassRewrite &&
-				this.consecutiveFileWrites >= this.cfg.maxConsecutiveFileWrites
-			) {
-				return (
-					`Blocked by guardrail block_mass_rewrite: too many consecutive writes to different files ` +
-					`(${this.consecutiveFileWrites}). Run build/diagnostics and fix errors before continuing.`
-				);
-			}
 			if (this.cfg.oneStackDotnet) {
 				const path = String(args.path ?? '').replace(/\\/g, '/');
 				const content = String(args.content ?? '');
 				if (/\/Views\//i.test(path) && /(^|\n)\s*@page\b/.test(content)) {
-					return (
-						`Blocked by guardrail one_stack_dotnet: refusing to write @page into Views/ (${path}). ` +
-						`Use Pages/ for Razor Pages, or remove @page for MVC Views.`
+					tips.push(
+						`Stack warning: @page inside Views/ (${path}). Prefer Pages/ for Razor Pages, or remove @page for MVC Views.`
 					);
 				}
 			}
 		}
 
+		if (!tips.length) return null;
+		return tips.map(t => `(note: ${t})`).join('\n');
+	}
+
+	/** @deprecated Always null — tools are no longer hard-blocked by guardrails. */
+	blockReason(_tool: string, _args: Record<string, unknown>): string | null {
 		return null;
 	}
 
-	/** Call after a mutating file tool was allowed (not blocked). */
+	/** A build/test command exited 0 after the last write (the only valid basis for a green claim). */
+	hasVerifiedGreen(): boolean {
+		return this.greenAfterWrites && !this.buildRed && this.writesSinceBuild === 0;
+	}
+
 	markMutatingWriteAllowed(): void {
 		this.mutatingWriteSeen = true;
 	}
@@ -238,13 +238,14 @@ export class GuardrailSession {
 			return '';
 		}
 		return [
-			'### BUILD STILL RED (preserved across compact)',
+			'### Build still red (errors kept across compact)',
 			...this.lastBuildErrors.slice(0, 15).map(e => `· ${e}`),
-			'Continue fixing these errors; do not restart exploration from scratch.',
 		].join('\n');
 	}
 
-	antiExploreEnabled(): boolean {
-		return this.cfg.antiExploreLoop;
+	antiExploreEnabled(planMode = false): boolean {
+		if (!this.cfg.antiExploreLoop) return false;
+		if (this.shouldDeferAntiExplore(planMode)) return false;
+		return true;
 	}
 }

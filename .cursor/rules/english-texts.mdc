@@ -1,0 +1,26 @@
+---
+description: All project texts (prompts, guardrails, skills, rules, markers, READMEs, fixtures) are written in English
+alwaysApply: true
+---
+
+# English-only texts
+
+Everything the model or a developer reads in this repo is English:
+
+- system prompts, nudges, guardrail/oracle notes, tool results and markers (`…[clipped: …]`, `(already in context …)`)
+- skills and rules (`extensions/codeforge/resources/**`, `governance/builtins.ts`)
+- status/activity labels, reports (`BUGS.md`, plan report), READMEs, `HEURISTICS.md`
+- benchmark prompts (`task.json`) and fixture docs/cards (`Depends on:`, `Acceptance criteria`)
+
+Portuguese is allowed only in **matchers of user input** (regexes, skill `triggers`, stopwords), because users write in Portuguese:
+
+```ts
+// ✅ matcher — keeps recognizing Portuguese requests
+/\b(review|revis\w*|encontr\w* (os )?bugs?)\b/i
+// ❌ text sent to the model
+`…[cortado: mostradas linhas 1-${n}]`
+// ✅
+`…[clipped: showing lines 1-${n} of ${total}]`
+```
+
+Chat replies to the user follow the user's language; this rule is about files in the repo.

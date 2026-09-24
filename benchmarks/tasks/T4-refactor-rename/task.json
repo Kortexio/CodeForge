@@ -1,0 +1,11 @@
+{
+  "id": "T4-refactor-rename",
+  "category": "refactor",
+  "title": "Rename calcTax to computeTax across src/",
+  "prompt": "Rename the function `calcTax` to `computeTax` throughout `src/` (definition, imports, usages and the export in `src/index.js`) without changing behavior. Confirm with `npm test`.",
+  "protected": ["test/"],
+  "checks": [
+    { "type": "absent", "dir": "src", "pattern": "calcTax", "why": "no leftover references" }
+  ],
+  "bonus": []
+}

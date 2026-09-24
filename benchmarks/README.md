@@ -1,6 +1,38 @@
 # CodeForge Benchmarks
 
-This directory contains benchmark suites for evaluating CodeForge's AI capabilities.
+## Harness benchmark (available now)
+
+Semi-automatic suite: the agent runs inside CodeForge; `check` scores with hidden tests + session metrics.
+
+### JavaScript (`fixtures/shop`) — T1–T4
+Quick harness smoke (node). Good for catching retrieve/read loops; **not** your real C# workload.
+
+### C# / .NET 10 (`fixtures/billing` + `scaffold`) — CS1–CS4
+Closer to ContextRouter: `dotnet test`, classlibs, docs-driven features, VIP navigation, and a **scaffold** task (create solution from a C01 card).
+
+```bash
+npm run bench -- list
+npm run bench -- setup CS1 --label bonsai --open   # or CS2 / CS3 / CS4
+# New Chat in that folder → bonsai → paste the printed prompt
+npm run bench -- check latest
+npm run bench -- report
+npm run bench -- selftest CS                       # validates fixtures + solutions
+```
+
+Score (0–100): hidden 60 · visible 15 · protected untouched 10 · checks 10 · no junk files 5.
+
+### Long and review (`fixtures/router-cards`, `fixtures/billing-bugs`) — CS5–CS6
+
+- **CS5 (review)**: 6 bugs planted in `billing-bugs` (visible tests still pass). The agent writes
+  `BUGS.md` with `path:line` references; the manifest lives in `tasks/CS5-review-billing-bugs/bugs.manifest.json`
+  (outside the fixture). Score: F1 × 80 · protected 10 · `BUGS.md` exists 10 (±3 line tolerance).
+- **CS6 (long)**: cards C01–C05 with "Depends on:" lines. Hidden tests run **per card** (only that
+  card's tests are compiled in); the hidden ratio is the average over cards.
+
+Every result also reports `falseDone` (the agent claimed green while tests were red) and
+`harness` (chars of harness text injected into the conversation).
+
+## Planned suites
 
 ## Categories
 

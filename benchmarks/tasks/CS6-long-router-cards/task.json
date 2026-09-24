@@ -1,0 +1,19 @@
+{
+  "id": "CS6-long-router-cards",
+  "category": "long",
+  "fixture": "router-cards",
+  "runtime": "dotnet",
+  "title": "Implement cards C01-C05 (route table) in dependency order",
+  "prompt": "Implement the cards `docs/C01.md` to `docs/C05.md` in dependency order (the \"Depends on:\" line). Each card has acceptance criteria. Confirm with `dotnet test Acme.Router.slnx`.",
+  "protected": ["docs/"],
+  "hiddenTarget": "tests/Acme.Router.Tests/BenchHidden",
+  "cards": ["C01", "C02", "C03", "C04", "C05"],
+  "checks": [
+    { "type": "exists", "file": "src/Acme.Router/RouteId.cs", "why": "C01 RouteId.cs" },
+    { "type": "exists", "file": "src/Acme.Router/Route.cs", "why": "C02 Route.cs" },
+    { "type": "exists", "file": "src/Acme.Router/RouteTable.cs", "why": "C03 RouteTable.cs" },
+    { "type": "exists", "file": "src/Acme.Router/RoutePattern.cs", "why": "C04 RoutePattern.cs" },
+    { "type": "contains", "file": "src/Acme.Router/RouteTable.cs", "pattern": "Resolve\\s*\\(", "why": "C05 Resolve" }
+  ],
+  "bonus": []
+}

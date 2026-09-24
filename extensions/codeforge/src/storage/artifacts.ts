@@ -6,6 +6,7 @@ import * as crypto from 'crypto';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { artifactsDir, ensureDir } from './paths';
+import { clipToolOutput } from '../agent/clip';
 
 export interface ArtifactMeta {
 	id: string;
@@ -87,12 +88,9 @@ export class ArtifactStore {
 			content,
 			opts.sessionId
 		);
-		const head = Math.floor(opts.maxChars * 0.7);
-		const tail = Math.floor(opts.maxChars * 0.2);
-		const excerpt =
-			content.slice(0, head) +
-			`\n\n…[full output ${content.length} chars stored as artifact ${artifact.id} at ${artifact.path}]\n\n` +
-			content.slice(-tail);
+		const pointer = `\n…[full output (${content.length} chars) saved to ${artifact.path}]`;
+		const budget = Math.max(500, opts.maxChars - pointer.length);
+		const excerpt = clipToolOutput(opts.name.split('-')[0], content, budget) + pointer;
 		return { text: excerpt, artifact };
 	}
 

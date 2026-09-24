@@ -142,7 +142,7 @@ export async function activate(context: vscode.ExtensionContext) {
             if (next) {
                 await getApprovalPolicy().allowAllEdits('always');
                 vscode.window.showInformationMessage(
-                    'CodeForge: auto-approve file edits ON (write/rename/delete sem perguntar)'
+                    'CodeForge: auto-approve file edits ON (write/rename/delete without asking)'
                 );
             } else {
                 await getApprovalPolicy().revokeAllEditsAlways();

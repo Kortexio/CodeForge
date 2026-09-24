@@ -1,0 +1,34 @@
+[
+  {
+    "shell": ["dotnet", "new", "sln", "-n", "Acme.Router", "--force"]
+  },
+  {
+    "shell": ["dotnet", "new", "classlib", "-n", "Acme.Router.Domain", "-o", "src/Acme.Router.Domain", "--force", "--framework", "net10.0"]
+  },
+  {
+    "shell": ["dotnet", "new", "classlib", "-n", "Acme.Router.Application", "-o", "src/Acme.Router.Application", "--force", "--framework", "net10.0"]
+  },
+  {
+    "shell": ["dotnet", "new", "xunit", "-n", "Acme.Router.ArchitectureTests", "-o", "tests/Acme.Router.ArchitectureTests", "--force", "--framework", "net10.0"]
+  },
+  {
+    "shell": ["dotnet", "sln", "Acme.Router.slnx", "add", "src/Acme.Router.Domain/Acme.Router.Domain.csproj", "src/Acme.Router.Application/Acme.Router.Application.csproj", "tests/Acme.Router.ArchitectureTests/Acme.Router.ArchitectureTests.csproj"]
+  },
+  {
+    "shell": ["dotnet", "add", "src/Acme.Router.Application/Acme.Router.Application.csproj", "reference", "src/Acme.Router.Domain/Acme.Router.Domain.csproj"]
+  },
+  {
+    "shell": ["dotnet", "add", "tests/Acme.Router.ArchitectureTests/Acme.Router.ArchitectureTests.csproj", "reference", "src/Acme.Router.Domain/Acme.Router.Domain.csproj", "src/Acme.Router.Application/Acme.Router.Application.csproj"]
+  },
+  {
+    "delete": "tests/Acme.Router.ArchitectureTests/UnitTest1.cs"
+  },
+  {
+    "file": "tests/Acme.Router.ArchitectureTests/ArchitectureTests.cs",
+    "write": "using System.Reflection;\nusing Xunit;\n\nnamespace Acme.Router.ArchitectureTests;\n\npublic class ArchitectureTests\n{\n\t[Fact]\n\tpublic void Domain_does_not_reference_Application()\n\t{\n\t\tvar domain = typeof(Acme.Router.Domain.Class1).Assembly;\n\t\tvar forbidden = domain.GetReferencedAssemblies()\n\t\t\t.Any(a => a.Name == \"Acme.Router.Application\");\n\t\tAssert.False(forbidden);\n\t}\n}\n"
+  },
+  {
+    "file": "Directory.Build.props",
+    "write": "<Project>\n  <PropertyGroup>\n    <Nullable>enable</Nullable>\n    <ImplicitUsings>enable</ImplicitUsings>\n  </PropertyGroup>\n</Project>\n"
+  }
+]
