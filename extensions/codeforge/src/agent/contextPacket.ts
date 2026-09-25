@@ -26,7 +26,12 @@ import {
 } from '../context/engine';
 import { getSessionWikiStore } from '../memory/sessionWiki';
 import { getProjectWikiStore } from '../memory/projectWiki';
+import { emptyStatusPrompt, formatStatusForPrompt, loadProjectStatus, parseRepoSnapshot } from './projectStatus';
 import { clipData } from './clip';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
+
+const execFileAsync = promisify(execFile);
 
 export interface ContextPacketResult {
 	markdown: string;
@@ -98,6 +103,18 @@ export async function buildContextPacket(opts: {
 			const block = project.formatForPrompt();
 			if (block) sources.push({ kind: 'wiki_project', priority: 85, content: block });
 		}
+	} catch {
+		/* ignore */
+	}
+
+	try {
+		const status = await loadProjectStatus(opts.workspaceRoot);
+		const liveRepo = await gatherRepoSnapshot(opts.workspaceRoot);
+		sources.push({
+			kind: 'status',
+			priority: 96,
+			content: status ? formatStatusForPrompt(status, { liveRepo }) : emptyStatusPrompt(),
+		});
 	} catch {
 		/* ignore */
 	}
@@ -340,4 +357,32 @@ function collectTopDiagnostics(limit: number, prefer?: vscode.Uri): string[] {
 	}
 	scored.sort((a, b) => b.score - a.score);
 	return scored.slice(0, limit).map(s => s.line);
+}
+
+async function gatherRepoSnapshot(workspaceRoot?: string) {
+	const folder =
+		workspaceRoot || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+	if (!folder) return null;
+	try {
+		const [headRes, statusRes] = await Promise.all([
+			execFileAsync('git', ['rev-parse', 'HEAD'], {
+				cwd: folder,
+				windowsHide: true,
+				maxBuffer: 64 * 1024,
+			}),
+			execFileAsync('git', ['status', '--short', '--branch'], {
+				cwd: folder,
+				windowsHide: true,
+				maxBuffer: 512 * 1024,
+			}),
+		]);
+		return (
+			parseRepoSnapshot({
+				head: (headRes.stdout || '').trim(),
+				statusShort: (statusRes.stdout || statusRes.stderr || '').trim(),
+			}) ?? null
+		);
+	} catch {
+		return null;
+	}
 }

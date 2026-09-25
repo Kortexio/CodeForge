@@ -22,12 +22,29 @@ import {
 	buildDotnetCommand,
 	currentPhase,
 	isPartialRewrite,
+	isStatusQuestion,
 	mentionsErrorFile,
 	toolNamesFor,
 } from '../../extensions/codeforge/src/agent/toolsets';
-import { claimsBuildOrTestGreen, parseBlockedClaim } from '../../extensions/codeforge/src/agent/nudges';
+import { claimsBuildOrTestGreen, parseBlockedClaim, STATUS_UPDATE_NOTE } from '../../extensions/codeforge/src/agent/nudges';
+import {
+	appendProjectStatus,
+	buildDigest,
+	buildHarnessEntry,
+	finishTurn,
+	formatStatusForPrompt,
+	formatStatusMarkdown,
+	HISTORY_MAX,
+	loadProjectStatus,
+	normalizeStatusFile,
+	parseRepoSnapshot,
+	saveProjectStatus,
+	salvageSessionProgress,
+	shouldRequireStatusUpdate,
+	stalenessLine,
+} from '../../extensions/codeforge/src/agent/projectStatus';
+import { assembleContext, DEFAULT_BUDGET } from '../../extensions/codeforge/src/context/engine';
 import { extractBuildErrorLines } from '../../extensions/codeforge/src/governance/guardrailEngine';
-import * as fs from 'fs';
 import { buildPriorAgentTranscript } from '../../extensions/codeforge/src/agent/priorContext';
 import {
 	cookbookLines,
@@ -35,6 +52,9 @@ import {
 	parseFrontmatter,
 	type SkillDoc,
 } from '../../extensions/codeforge/src/skills/skillsRulesLoader';
+import { projectMemoryDir } from '../../extensions/codeforge/src/storage/paths';
+import * as os from 'os';
+import * as fs from 'fs';
 
 const SKILLS_DIR = path.join(__dirname, '..', '..', 'extensions', 'codeforge', 'resources', 'skills');
 
@@ -317,6 +337,18 @@ describe('toolsets', () => {
 		expect(withGit.has('git_status')).toBe(true);
 		expect(withGit.has('mcp_call')).toBe(false);
 		expect(toolNamesFor('explore', 'x', { weakProfile: false, allNames: all }).size).toBe(all.length);
+		const withStatus = toolNamesFor('explore', 'onde paramos?', {
+			weakProfile: true,
+			allNames: [...all, 'update_status'],
+		});
+		expect(withStatus.has('update_status')).toBe(true);
+		const statusOnly = toolNamesFor('explore', 'onde paramos no projeto?', {
+			weakProfile: false,
+			allNames: [...all, 'update_status', 'shell', 'git_status'],
+		});
+		expect([...statusOnly]).toEqual(['update_status']);
+		expect(isStatusQuestion('onde paramos?')).toBe(true);
+		expect(isStatusQuestion('continua de onde paramos')).toBe(false);
 	});
 
 	it('detects partial rewrites', () => {
@@ -393,5 +425,233 @@ describe('guardrail error lines', () => {
 			'some error text in a log line',
 		].join('\n');
 		expect(extractBuildErrorLines(out)).toEqual(['src/A.cs(1,1): error CS1002: ; expected', 'Failed Acme.Tests.X [3 ms]']);
+	});
+});
+
+describe('project status', () => {
+	it('formats the standing note and requires one update before the final reply', () => {
+		const file = normalizeStatusFile({
+			version: 2,
+			current: {
+				updatedAt: '2026-09-25T00:00:00.000Z',
+				source: 'model',
+				objective: 'Ship the cart',
+				stoppedAt: 'Cart total is implemented; tests not run',
+				next: 'Run the cart tests',
+				blockers: '',
+				files: ['src/Cart.cs'],
+				outcome: 'done',
+			},
+			history: [],
+			digest: 'Cart work in progress',
+		});
+		expect(file).not.toBeNull();
+		const block = formatStatusForPrompt(file!);
+		expect(block).toContain('Stopped at: Cart total is implemented');
+		expect(block).toContain('src/Cart.cs');
+		expect(block).toContain('Digest');
+		expect(STATUS_UPDATE_NOTE).toContain('update_status');
+		expect(shouldRequireStatusUpdate({ alreadyUpdated: false, nudges: 0 })).toBe(true);
+		expect(shouldRequireStatusUpdate({ alreadyUpdated: true, nudges: 0 })).toBe(false);
+		expect(shouldRequireStatusUpdate({ isolated: true, alreadyUpdated: false, nudges: 0 })).toBe(false);
+		expect(shouldRequireStatusUpdate({ alreadyUpdated: false, nudges: 1 })).toBe(false);
+	});
+
+	it('promotes flat v1 on disk to v2 current and appends history', async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cf-status-'));
+		const mem = projectMemoryDir(root);
+		fs.mkdirSync(mem, { recursive: true });
+		fs.writeFileSync(
+			path.join(mem, 'status.json'),
+			JSON.stringify({
+				updatedAt: '2026-01-01T00:00:00.000Z',
+				objective: 'v1',
+				stoppedAt: 'legacy stop',
+				next: '',
+				blockers: '',
+				files: [],
+			}),
+			'utf8'
+		);
+		const loaded = await loadProjectStatus(root);
+		expect(loaded?.version).toBe(2);
+		expect(loaded?.current.stoppedAt).toBe('legacy stop');
+		await saveProjectStatus(root, {
+			objective: 'v2',
+			stoppedAt: 'new stop',
+			next: 'continue',
+		});
+		const next = await loadProjectStatus(root);
+		expect(next?.current.stoppedAt).toBe('new stop');
+		expect(next?.history[0]?.stoppedAt).toBe('legacy stop');
+		fs.rmSync(root, { recursive: true, force: true });
+	});
+
+	it('caps history and prefers rolling summary for the digest', async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cf-status-'));
+		for (let i = 0; i < HISTORY_MAX + 5; i++) {
+			await appendProjectStatus(root, {
+				source: 'harness',
+				outcome: 'done',
+				objective: `t${i}`,
+				stoppedAt: `stop-${i}`,
+			});
+		}
+		const file = await loadProjectStatus(root);
+		expect(file?.history.length).toBeLessThanOrEqual(HISTORY_MAX);
+		expect(buildDigest({ rollingSummary: 'Rolling story of the cart.', entries: file!.history })).toContain(
+			'Rolling story'
+		);
+		expect(buildDigest({ entries: [{ stoppedAt: 'a' }, { stoppedAt: 'b' }] as never })).toContain('a');
+		fs.rmSync(root, { recursive: true, force: true });
+	});
+
+	it('builds a mechanical harness entry and finishTurn writes once per turn', async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cf-status-'));
+		const entry = buildHarnessEntry({
+			task: 'Ship cart',
+			actionsSummary: 'Progress: writes=1',
+			files: ['src/Cart.cs'],
+			openErrors: ['CS1002'],
+			outcome: 'max-steps',
+		});
+		expect(entry.source).toBe('harness');
+		expect(entry.files).toContain('src/Cart.cs');
+		expect(entry.outcome).toBe('max-steps');
+
+		expect(
+			await finishTurn({
+				workspaceRoot: root,
+				task: 'Ship cart',
+				modelUpdated: false,
+				actionsSummary: 'Progress: writes=1',
+				files: ['src/Cart.cs'],
+				outcome: 'max-steps',
+			})
+		).toBe('written');
+		expect(
+			await finishTurn({
+				workspaceRoot: root,
+				isolated: true,
+				task: 'ignored',
+				modelUpdated: false,
+				actionsSummary: 'x',
+				files: [],
+				outcome: 'done',
+			})
+		).toBe('skipped');
+		expect(
+			await finishTurn({
+				workspaceRoot: root,
+				depth: 1,
+				task: 'ignored',
+				modelUpdated: false,
+				actionsSummary: 'x',
+				files: [],
+				outcome: 'done',
+			})
+		).toBe('skipped');
+
+		await saveProjectStatus(root, {
+			objective: 'model wrote',
+			stoppedAt: 'model stop',
+			next: 'n',
+			files: ['a.cs'],
+		});
+		expect(
+			await finishTurn({
+				workspaceRoot: root,
+				task: 'Ship cart',
+				modelUpdated: true,
+				actionsSummary: 'Progress: writes=2',
+				files: ['b.cs'],
+				outcome: 'done',
+			})
+		).toBe('merged');
+		const after = await loadProjectStatus(root);
+		expect(after?.current.stoppedAt).toBe('model stop');
+		expect(after?.current.files).toEqual(expect.arrayContaining(['a.cs', 'b.cs']));
+		fs.rmSync(root, { recursive: true, force: true });
+	});
+
+	it('serialises concurrent appends without dropping entries', async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cf-status-'));
+		await Promise.all(
+			[1, 2, 3, 4, 5].map(i =>
+				appendProjectStatus(root, {
+					source: 'harness',
+					outcome: 'done',
+					objective: `o${i}`,
+					stoppedAt: `s${i}`,
+				})
+			)
+		);
+		const file = await loadProjectStatus(root);
+		expect(file?.current.stoppedAt).toMatch(/^s\d$/);
+		expect((file?.history.length ?? 0) + 1).toBe(5);
+		fs.rmSync(root, { recursive: true, force: true });
+	});
+
+	it('marks staleness when HEAD differs and writes status.md', async () => {
+		const saved = parseRepoSnapshot({
+			head: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+			statusShort: '## main\n M src/A.cs',
+		})!;
+		const live = parseRepoSnapshot({
+			head: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+			statusShort: '## main\n M src/B.cs',
+		})!;
+		expect(stalenessLine(saved, live)).toContain('status is from');
+		expect(stalenessLine(saved, saved)).toBe('');
+
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cf-status-'));
+		await saveProjectStatus(root, {
+			objective: 'Cart',
+			stoppedAt: 'Totals are in',
+			next: 'Tests',
+		});
+		const md = fs.readFileSync(path.join(projectMemoryDir(root), 'status.md'), 'utf8');
+		expect(md).toContain('Totals are in');
+		expect(formatStatusMarkdown((await loadProjectStatus(root))!)).toContain('Totals are in');
+		fs.rmSync(root, { recursive: true, force: true });
+	});
+
+	it('includes status in assembleContext budget', () => {
+		expect(DEFAULT_BUDGET.alloc.status).toBeGreaterThan(0);
+		const assembled = assembleContext(
+			[{ kind: 'status', priority: 96, content: '## PROJECT STATUS\nStopped at: here' }],
+			DEFAULT_BUDGET
+		);
+		expect(assembled.included).toContain('status');
+		expect(assembled.markdown).toContain('Stopped at: here');
+	});
+
+	it('keeps a project stop point when the session text would replace it, and writes one when the file is empty', async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cf-status-'));
+		await saveProjectStatus(root, {
+			objective: 'Cart',
+			stoppedAt: 'Totals are in',
+			next: 'Tests',
+		});
+		expect(
+			await salvageSessionProgress({
+				workspaceFolder: root,
+				task: 'other chat',
+				rollingSummary: 'session-only note',
+			})
+		).toBe('kept');
+		expect((await loadProjectStatus(root))?.current.stoppedAt).toBe('Totals are in');
+
+		const empty = fs.mkdtempSync(path.join(os.tmpdir(), 'cf-status-'));
+		expect(
+			await salvageSessionProgress({
+				workspaceFolder: empty,
+				task: 'Cart',
+				lastAssistant: 'Stopped after the total method.',
+			})
+		).toBe('written');
+		expect((await loadProjectStatus(empty))?.current.stoppedAt).toBe('Stopped after the total method.');
+		fs.rmSync(root, { recursive: true, force: true });
+		fs.rmSync(empty, { recursive: true, force: true });
 	});
 });

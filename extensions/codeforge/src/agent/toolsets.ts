@@ -5,6 +5,9 @@
 
 export type AgentPhase = 'explore' | 'implement' | 'fix' | 'review';
 
+/** Standing status is written every turn, including questions that do not match a phase. */
+const ALWAYS_TOOLS = ['update_status'];
+
 const READONLY = [
 	'read',
 	'retrieve',
@@ -33,6 +36,16 @@ const EXTRA_GROUPS: Array<{ tools: string[]; when: RegExp }> = [
 	{ tools: ['open'], when: /\babr[ea]\b|\bopen\b.*\beditor\b/i },
 ];
 
+/** A question about where the work stopped. Not a request to continue or change code. */
+export function isStatusQuestion(task: string): boolean {
+	if (/\b(continu[ae]|continue|implement\w*|fix|corrig\w*|cria\w*|create|build|add|adicion\w*)\b/i.test(task)) {
+		return false;
+	}
+	return /\b(onde\s+(paramos|ficamos|estavamos|estávamos)|em\s+que\s+ponto|o\s+andamento|where\s+did\s+we\s+(stop|leave)|where\s+we\s+left)\b/i.test(
+		task
+	);
+}
+
 const CODING_TASK =
 	/\b(create|implement|add|fix|write|build|make|change|update|refactor|migrate|gerar|criar|cria|implementar|implementa|corrigir|corrige|adicionar|adiciona|alterar|altera|refatorar|desenvolv\w*|executar|executa)\b/i;
 const REVIEW_TASK =
@@ -60,8 +73,11 @@ export function toolNamesFor(
 	task: string,
 	opts: { weakProfile: boolean; allNames: string[]; planMode?: boolean }
 ): Set<string> {
+	if (isStatusQuestion(task)) {
+		return new Set(opts.allNames.filter(n => n === 'update_status'));
+	}
 	if (!opts.weakProfile) return new Set(opts.allNames);
-	const names = new Set(PHASE_TOOLS[phase]);
+	const names = new Set([...PHASE_TOOLS[phase], ...ALWAYS_TOOLS]);
 	for (const g of EXTRA_GROUPS) {
 		if (g.when.test(task)) g.tools.forEach(t => names.add(t));
 	}

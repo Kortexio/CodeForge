@@ -6,6 +6,7 @@ import { StableFacts, formatStableFactsBlock, normalizeFacts } from '../agent/st
 
 export type ContextSourceKind =
 	| 'system'
+	| 'status'
 	| 'wiki_session'
 	| 'wiki_project'
 	| 'ide'
@@ -33,6 +34,7 @@ export const DEFAULT_BUDGET: ContextBudget = {
 	total: 32768,
 	alloc: {
 		system: 0.12,
+		status: 0.05,
 		wiki_session: 0.1,
 		wiki_project: 0.1,
 		facts: 0.06,
@@ -41,12 +43,13 @@ export const DEFAULT_BUDGET: ContextBudget = {
 		retrieve: 0.12,
 		git: 0.05,
 		mcp: 0.04,
-		history: 0.27,
+		history: 0.22,
 	},
 };
 
 const RANK: Record<ContextSourceKind, number> = {
 	system: 100,
+	status: 96,
 	wiki_session: 90,
 	facts: 88,
 	lessons: 92,

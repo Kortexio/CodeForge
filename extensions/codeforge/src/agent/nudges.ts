@@ -31,6 +31,13 @@ export const LENGTH_CAP_NOTE = [
 export const EMPTY_TURN_NOTE =
 	'The reply was empty. Continue with the next tool call, or reply with a summary if the task is done.';
 
+/** Finish refused once: this run has not written .CodeForge/memory/status.json. */
+export const STATUS_UPDATE_NOTE = [
+	'The final reply waits for update_status.',
+	'Call update_status with objective, stoppedAt, and next (blockers and files when you have them).',
+	'That file is what the next turn reads. Do not scan the repo to reconstruct where the work stopped.',
+].join('\n');
+
 /** Finish refused: the oracle is red. `oracleText` is the formatted oracle result. */
 export function oracleRejectNote(oracleText: string): string {
 	return [

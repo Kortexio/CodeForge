@@ -47,6 +47,18 @@ import { runAgentHooks } from '../hooks/hooksRunner';
 import { getSessionWikiStore } from '../memory/sessionWiki';
 import { learnFromShellFailure, isShellNoiseFailure } from '../memory/extendedMemory';
 import { getProjectWikiStore } from '../memory/projectWiki';
+import {
+	discoverStatusRefs,
+	finishTurn,
+	parseRepoSnapshot,
+	saveProjectStatus,
+	shouldRequireStatusUpdate,
+	type StatusOutcome,
+} from './projectStatus';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
+
+const execFileAsync = promisify(execFile);
 import { getArtifactStore } from '../storage/artifacts';
 import { AgentStateMachine } from './stateMachine';
 import { DEFAULT_BUDGET } from '../context/engine';
@@ -58,6 +70,7 @@ import {
 	LENGTH_CAP_NOTE,
 	oracleRejectNote,
 	parseBlockedClaim,
+	STATUS_UPDATE_NOTE,
 } from './nudges';
 import { clipData, clipToolOutput } from './clip';
 import {
@@ -73,6 +86,7 @@ import {
 	currentPhase,
 	DOTNET_TOOL,
 	isPartialRewrite,
+	isStatusQuestion,
 	LARGE_FILE_LINES,
 	mentionsErrorFile,
 	toolNamesFor,
@@ -623,6 +637,29 @@ export const AGENT_TOOLS = [
 	{
 		type: 'function' as const,
 		function: {
+			name: 'update_status',
+			description:
+				'Write where the work stopped to .CodeForge/memory/status.json. Call this before the final reply of every turn. The next turn reads this file instead of scanning the repo.',
+			parameters: {
+				type: 'object',
+				properties: {
+					objective: { type: 'string', description: 'What the current work is trying to do' },
+					stoppedAt: { type: 'string', description: 'Where the work stopped, in one or two sentences' },
+					next: { type: 'string', description: 'The next concrete step' },
+					blockers: { type: 'string', description: 'What is blocking progress, if anything' },
+					files: {
+						type: 'array',
+						items: { type: 'string' },
+						description: 'Paths touched or still relevant',
+					},
+				},
+				required: ['objective', 'stoppedAt', 'next'],
+			},
+		},
+	},
+	{
+		type: 'function' as const,
+		function: {
 			name: 'browser_navigate',
 			description: 'Open a URL in the embedded browser agent (Playwright optional)',
 			parameters: {
@@ -822,6 +859,7 @@ const PLAN_MODE_TOOLS = new Set([
 	'wiki_write',
 	'wiki_fact',
 	'wiki_facts',
+	'update_status',
 ]);
 
 export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string> {
@@ -860,6 +898,11 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 		: '';
 	const agentsMdSection = await loadAgentsMdForPrompt();
 
+	const statusQuestion = isStatusQuestion(opts.task);
+	if (statusQuestion) {
+		stepBudget = 4;
+		nextCheckpoint = hardCap;
+	}
 	const planModeHint = opts.planMode && opts.isolated
 		? 'Only exploration tools are available in this run.'
 		: opts.planMode
@@ -877,7 +920,8 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 		'Shell runs cmd.exe in the workspace root: `&&` works; PowerShell syntax and Unix pipes (tail/grep/head) do not.',
 		'Shell results include the exit code and output. When a command fails, change the command or the files before running it again.',
 		'Long-running servers (dotnet run, npm start) hand off after startup and keep streaming in the Agent Terminal; one start is enough.',
-		'The CONTEXT PACKET (IDE STATE, RETRIEVE, STABLE FACTS) is your starting point. STABLE FACTS hold the canonical project roots and open build errors.',
+		'The CONTEXT PACKET (PROJECT STATUS, IDE STATE, RETRIEVE, STABLE FACTS) is your starting point. PROJECT STATUS is where the work stopped; answer that from the block. STABLE FACTS hold the canonical project roots and open build errors.',
+		'Before the final reply, call update_status (objective, stoppedAt, next) so .CodeForge/memory/status.json stays current for the next turn.',
 		'Typical flow: retrieve/search → read the slice you will change → edit (existing file) or write (new file) → build/test.',
 		'Tool results stay in this chat. A repeated read of a range you already have returns the remembered text, marked as already in context.',
 		'The IDE runs the project build/test (oracle) after a few writes and when you finish; the task is done when it is green. If you cannot finish, reply with `blocked: <reason>`.',
@@ -887,6 +931,9 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 			: '',
 		opts.proseToolsOnly
 			? 'This model has no native tools: reply with only JSON tool_calls in content (no markdown). Example: {"tool_calls":[{"id":"call_1","type":"function","function":{"name":"retrieve","arguments":{"query":"..."}}}]}'
+			: '',
+		statusQuestion
+			? 'This turn asks where the work stopped. Answer from PROJECT STATUS only. Do not explore the repo, run shell, or call git. The only tool is update_status, after the answer.'
 			: '',
 		planModeHint,
 		agentsMdSection,
@@ -969,7 +1016,14 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 	let successfulWriteCount = 0;
 	let consecutiveToolFails = 0;
 	const touchedPaths = new Set<string>();
+	/** Paths successfully written/edited this turn — used for the project handoff. */
+	const writtenPaths = new Set<string>();
 	let emptyFinishNudges = 0;
+	let statusUpdated = false;
+	let statusNudges = 0;
+	let turnOutcome: StatusOutcome = 'done';
+	let turnBlockedReason = '';
+	let handoffDone = false;
 	/** Extra retries when completion hits max_tokens (~8192) without a tool call. */
 	let lengthTruncationNudges = 0;
 	/** Retries when gateway rejects truncated tool-call JSON (common with large writes). */
@@ -1185,6 +1239,40 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 		elapsed: 0,
 	});
 
+	const recordHandoff = async (): Promise<void> => {
+		if (handoffDone) return;
+		handoffDone = true;
+		try {
+			const rolling =
+				opts.sessionId && opts.sessionStore
+					? opts.sessionStore.get(opts.sessionId)?.rollingSummary
+					: undefined;
+			const [repo, refs] = await Promise.all([
+				gatherRepoSnapshotForHandoff(opts.workspaceRoot),
+				discoverStatusRefs(opts.workspaceRoot),
+			]);
+			const modelFiles = statusUpdated ? [...writtenPaths] : [];
+			await finishTurn({
+				workspaceRoot: opts.workspaceRoot,
+				isolated: opts.isolated,
+				depth,
+				task: opts.task,
+				modelUpdated: statusUpdated,
+				actionsSummary: summarizeActionsForLlm(actions),
+				reviewLog: reviewLog.length ? reviewLog[reviewLog.length - 1] : undefined,
+				files: uniqHandoffPaths([...writtenPaths, ...modelFiles]),
+				openErrors: facts.openErrors,
+				outcome: turnOutcome,
+				blockedReason: turnBlockedReason,
+				repo: repo ?? undefined,
+				refs,
+				rollingSummary: rolling,
+			});
+		} catch {
+			/* handoff is best-effort */
+		}
+	};
+
 	try {
 		for (let step = 0; step < stepBudget; step++) {
 			if (opts.cancelled() || opts.abortSignal?.aborted) {
@@ -1195,6 +1283,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					result: 'Cancelled',
 					elapsed: Date.now() - started,
 				});
+				turnOutcome = 'cancelled';
 				return 'Cancelled.';
 			}
 
@@ -1217,6 +1306,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 							total: contextBudget,
 							alloc: {
 								system: 0.1,
+								status: 0.05,
 								wiki_session: 0.08,
 								wiki_project: 0.08,
 								facts: 0.06,
@@ -1225,7 +1315,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 								retrieve: 0.14,
 								git: 0.04,
 								mcp: 0.03,
-								history: 0.22,
+								history: 0.17,
 							},
 						},
 						boostPaths: [...touchedPaths],
@@ -1335,6 +1425,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					result: 'Cancelled',
 					elapsed: Date.now() - started,
 				});
+				turnOutcome = 'cancelled';
 				return 'Cancelled.';
 			}
 
@@ -1692,6 +1783,22 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					doneNote = finalReplyNote('unverified');
 				}
 
+				if (
+					shouldRequireStatusUpdate({
+						isolated: opts.isolated,
+						alreadyUpdated: statusUpdated,
+						nudges: statusNudges,
+					}) &&
+					step + 1 < stepBudget
+				) {
+					statusNudges += 1;
+					trace?.info('harness', String(STATUS_UPDATE_NOTE.length));
+					messages.push({ role: 'assistant', content: summary });
+					messages.push({ role: 'user', content: STATUS_UPDATE_NOTE });
+					opts.onStatus?.('A gravar o ponto de situação…');
+					continue;
+				}
+
 				opts.onTaskUpdate?.({
 					id: taskId,
 					name: truncateHistory(opts.task, 60),
@@ -1704,6 +1811,8 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					label: blocked ? 'Blocked' : 'Turn summary',
 					detail: blocked ?? summarizeActionsForLlm(actions).slice(0, 400),
 				});
+				turnOutcome = blocked ? 'blocked' : 'done';
+				turnBlockedReason = blocked ?? '';
 				return summary + doneNote;
 			}
 
@@ -1731,6 +1840,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 			for (const call of toolCalls) {
 				if (opts.cancelled() || opts.abortSignal?.aborted) {
 					ensureToolResultsForCalls(messages, toolCalls, 'Cancelled by user');
+					turnOutcome = 'cancelled';
 					return 'Cancelled.';
 				}
 
@@ -1765,6 +1875,14 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					refuse(
 						'Not written: content is larger than one tool call can carry reliably (14k chars). Write the file in parts (write the first part, then add the rest with edit).',
 						'too large'
+					);
+					continue;
+				}
+
+				if (statusQuestion && !activeToolNames.has(name)) {
+					refuse(
+						`Tool "${name}" is not available on a status question. Answer from PROJECT STATUS. The only tool is update_status.`,
+						'status'
 					);
 					continue;
 				}
@@ -1973,6 +2091,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 
 				if (opts.cancelled() || opts.abortSignal?.aborted) {
 					ensureToolResultsForCalls(messages, toolCalls, 'Cancelled by user');
+					turnOutcome = 'cancelled';
 					return 'Cancelled.';
 				}
 
@@ -2156,9 +2275,15 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					gates.onSuccessfulWrite(args.path);
 					successfulWriteCount += 1;
 					writesSinceOracle += 1;
+					if (typeof args.path === 'string' && args.path.trim()) {
+						writtenPaths.add(args.path.replace(/\\/g, '/'));
+					}
 				}
 				if (name === 'delete' || name === 'rename') {
 					if (success) successfulWriteCount += 1;
+				}
+				if (name === 'update_status' && success) {
+					statusUpdated = true;
 				}
 
 				facts = extractFactsFromTool(
@@ -2323,6 +2448,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 			result: 'max steps',
 			elapsed: Date.now() - started,
 		});
+		turnOutcome = 'max-steps';
 
 		let finalSummary = '';
 		try {
@@ -2371,7 +2497,15 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 			finalSummary = '';
 		}
 
+		let statusFallback = '';
+		if (statusQuestion) {
+			const { loadProjectStatus, formatStatusForPrompt, emptyStatusPrompt } = await import('./projectStatus');
+			const saved = await loadProjectStatus(opts.workspaceRoot);
+			statusFallback = (saved ? formatStatusForPrompt(saved) : emptyStatusPrompt()) + '\n\n';
+		}
+
 		return (
+			statusFallback +
 			`Reached max tool steps (${stepBudget}/${hardCap}) without finishing tools.\n\n` +
 			(finalSummary ? `${finalSummary}\n\n` : '') +
 			`${summarizeActionsForLlm(actions)}\n` +
@@ -2379,6 +2513,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 			`Tip: ask to continue, or break the task into smaller steps.`
 		);
 	} catch (err) {
+		turnOutcome = 'error';
 		const message = err instanceof Error ? err.message : String(err);
 		opts.onTaskUpdate?.({
 			id: taskId,
@@ -2388,6 +2523,8 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 			elapsed: Date.now() - started,
 		});
 		throw err;
+	} finally {
+		await recordHandoff();
 	}
 }
 
@@ -2536,6 +2673,18 @@ async function executeTool(
 				return facts.length
 					? facts.map(f => `- ${f.key}: ${f.value}`).join('\n')
 					: 'No current facts.';
+			}
+			case 'update_status': {
+				const files = Array.isArray(args.files) ? args.files.map(f => String(f)) : [];
+				const saved = await saveProjectStatus(opts.workspaceRoot, {
+					objective: String(args.objective ?? ''),
+					stoppedAt: String(args.stoppedAt ?? ''),
+					next: String(args.next ?? ''),
+					blockers: args.blockers ? String(args.blockers) : '',
+					files,
+					outcome: 'done',
+				});
+				return `Project status saved (${saved.updatedAt}). Stopped at: ${saved.stoppedAt}`;
 			}
 			case 'browser_navigate':
 				return await browser.browserNavigate(String(args.url));
@@ -3350,6 +3499,49 @@ async function runProseToolFallback(
 	return actions.length
 		? `Done.\n${summarizeActionsForLlm(actions)}`
 		: text;
+}
+
+function uniqHandoffPaths(paths: string[]): string[] {
+	const seen = new Set<string>();
+	const out: string[] = [];
+	for (const p of paths) {
+		const n = String(p ?? '')
+			.trim()
+			.replace(/\\/g, '/');
+		if (!n) continue;
+		const k = n.toLowerCase();
+		if (seen.has(k)) continue;
+		seen.add(k);
+		out.push(n);
+		if (out.length >= 24) break;
+	}
+	return out;
+}
+
+async function gatherRepoSnapshotForHandoff(workspaceRoot?: string) {
+	if (!workspaceRoot) return null;
+	try {
+		const [headRes, statusRes] = await Promise.all([
+			execFileAsync('git', ['rev-parse', 'HEAD'], {
+				cwd: workspaceRoot,
+				windowsHide: true,
+				maxBuffer: 64 * 1024,
+			}),
+			execFileAsync('git', ['status', '--short', '--branch'], {
+				cwd: workspaceRoot,
+				windowsHide: true,
+				maxBuffer: 512 * 1024,
+			}),
+		]);
+		return (
+			parseRepoSnapshot({
+				head: (headRes.stdout || '').trim(),
+				statusShort: (statusRes.stdout || statusRes.stderr || '').trim(),
+			}) ?? null
+		);
+	} catch {
+		return null;
+	}
 }
 
 /** Compact action stats for LLM context (not a raw tool log). */

@@ -9,6 +9,7 @@ import * as path from 'path';
 import { StableFacts, normalizeFacts } from '../agent/stableFacts';
 import { ensureDir, ensureHomeLayout, sessionDir, sessionsDir } from '../storage/paths';
 import { getSessionWikiStore } from '../memory/sessionWiki';
+import { salvageSessionProgress } from '../agent/projectStatus';
 
 export type SessionState = 'running' | 'completed' | 'failed' | 'paused' | 'cancelled';
 
@@ -249,6 +250,8 @@ export class SessionStore {
 
 	async remove(id: string): Promise<void> {
 		await this.ensureReady();
+		const session = this.list().find(s => s.id === id);
+		await this.keepProjectProgress(session);
 		await this.persist(this.list().filter(s => s.id !== id));
 		try {
 			await fs.rm(sessionDir(id), { recursive: true, force: true });
@@ -262,16 +265,42 @@ export class SessionStore {
 
 	async clear(): Promise<void> {
 		await this.ensureReady();
-		const ids = this.list().map(s => s.id);
+		const sessions = this.list();
+		for (const session of sessions) {
+			await this.keepProjectProgress(session);
+		}
 		await this.persist([]);
 		await this.setActiveId(null);
-		for (const id of ids) {
+		for (const session of sessions) {
 			try {
-				await fs.rm(sessionDir(id), { recursive: true, force: true });
+				await fs.rm(sessionDir(session.id), { recursive: true, force: true });
 			} catch {
 				/* ignore */
 			}
 		}
+	}
+
+	/** Chat is disposable. The stop point stays in the workspace memory file. */
+	private async keepProjectProgress(session: ChatSession | undefined): Promise<void> {
+		if (!session?.workspaceFolder) return;
+		let plan = '';
+		let blockers = '';
+		try {
+			const wiki = await getSessionWikiStore().load(session.id);
+			plan = wiki.workingMemory.plan.join('; ');
+			blockers = wiki.workingMemory.blockers.join('; ');
+		} catch {
+			/* session wiki is optional */
+		}
+		const lastAssistant = [...session.messages].reverse().find(m => m.role === 'assistant' && m.content.trim());
+		await salvageSessionProgress({
+			workspaceFolder: session.workspaceFolder,
+			task: session.task,
+			rollingSummary: session.rollingSummary,
+			lastAssistant: lastAssistant?.content,
+			plan,
+			blockers,
+		});
 	}
 
 	async exportSession(id: string): Promise<string | undefined> {
