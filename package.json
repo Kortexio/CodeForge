@@ -1,6 +1,6 @@
 {
   "name": "codeforge",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "CodeForge - An open-source, model-independent, memory-native, agentic coding IDE",
   "author": {
     "name": "Kortexio",

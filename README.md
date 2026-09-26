@@ -17,11 +17,13 @@ Also discoverable via: *Cursor AI*, *Cursor-style AI IDE*, *open source AI codin
 | | CodeForge |
 |---|---|
 | Models | OpenAI, Anthropic, Gemini, xAI, OpenRouter, Ollama, vLLM, LM Studio, any OpenAI-compatible API |
-| Agent | Multi-file agent with approvals, Plan / Ask / Agent / Auto modes |
-| Weak local models | Auto harness for ~≤34B models (plan-first, TDD gate, build-after-write) |
+| Agent | Multi-file agent with approvals; composer modes Ask / Plan / Agent + permission chip (Default → Assisted → Allow all) |
+| Chat UI | Cursor-like sidebar: footer composer, context ring, clean tool rows, Undo/Review, Restore checkpoints |
+| Weak local models | Opt-in small-model harness (`codeforge.ai.weakModelMode`: on/off) |
+| Sandbox | Configurable shell sandbox + optional Full agent freedom |
 | Memory | Session wiki, project wiki, stable facts on disk (`~/.CodeForge/`) |
 | Governance | Editable skills, rules, policies, hard guardrails |
-| MCP | Inbound tools + outbound wiki server |
+| MCP | Inbound tools + outbound wiki server + Plugins catalog |
 
 ## Install (Windows)
 
@@ -48,12 +50,18 @@ See [docs/code-oss-integration.md](docs/code-oss-integration.md) for details.
 ## Features
 
 - **Embedded AI Platform** — agent, chat, settings, and tools inside the IDE
+- **Cursor-like composer** — Ask / Plan / Agent in the chat footer; Shift+Tab cycles mode; permissions chip separate from mode (Allow all ≈ former Auto)
+- **Context ring** — live prompt tokens vs window limit on the composer
+- **Tool timeline** — short Cursor-style labels (`Shell npm test`, `Read path`), exploration grouping, failures stay expanded
+- **Edit journal** — Undo All / Review Changes (`vscode.diff` against pre-edit snapshots)
+- **Restore checkpoint** — revert a user turn (messages + related tool traces + journaled files)
+- **Shell sandbox** — `codeforge.ai.shellSandbox` (restricted → unrestricted) and **Full agent freedom** in Agent settings
 - **Model Independence** — bring your own API keys or local servers
 - **Plan mode** — explore + write a wiki plan without mutating source
-- **Weak-model harness** — automatic tighter guardrails for small/local LLMs
+- **Small-model harness** — opt-in phase tools + tighter guardrails for small/local LLMs
 - **Persistent Memory** — session/project wiki and temporal facts
 - **Code Intelligence** — hybrid search (lexical + semantic embeddings)
-- **MCP Support** — inbound tools + outbound wiki server
+- **MCP + Plugins** — inbound tools, outbound wiki server, marketplace-style plugins catalog
 - **Tab Completion** — inline completions with your model
 - **Browser Agent** — visual checks (Playwright optional)
 - **Git Intelligence** — status, diff, blame, conflicts, commit messages
@@ -63,11 +71,12 @@ See [docs/code-oss-integration.md](docs/code-oss-integration.md) for details.
 ```
 CodeForge/
 ├── extensions/codeforge/   # Shipped AI platform (source of truth)
-│   ├── src/agent/               # Agent loop, context, weak-model harness
+│   ├── src/agent/               # Agent loop, edit journal, tool registry, harness
+│   ├── src/views/               # Chat host + chatViewHtml (Cursor-like UI)
 │   ├── src/memory/              # Session + project wiki + temporal facts
 │   ├── src/storage/             # ~/.CodeForge paths, sessions, artifacts, traces
 │   ├── src/context/             # Context budget / ranking
-│   ├── src/sandbox/             # Shell isolation levels
+│   ├── src/sandbox/             # Shell isolation + unrestricted / freedom
 │   ├── src/intelligence/        # Index, LSP, git, embeddings
 │   ├── src/browser/             # Browser agent
 │   ├── src/mcp/                 # Inbound + outbound MCP
@@ -88,7 +97,9 @@ Legacy mirrors (active server only):
 ```json
 {
   "codeforge.ai.mode": "agent",
-  "codeforge.ai.weakModelMode": "auto"
+  "codeforge.ai.weakModelMode": "off",
+  "codeforge.ai.shellSandbox": "restricted",
+  "codeforge.ai.fullAgentFreedom": false
 }
 ```
 
