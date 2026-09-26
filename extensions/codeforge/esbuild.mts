@@ -11,4 +11,14 @@ run({
 	},
 	srcDir,
 	outdir: outDir,
+	// Optional browser agent — do not bundle Playwright (chromium-bidi is unresolved in CI).
+	additionalOptions: {
+		external: [
+			'vscode',
+			'playwright',
+			'playwright-core',
+			'chromium-bidi',
+			'chromium-bidi/*',
+		],
+	},
 }, process.argv);
