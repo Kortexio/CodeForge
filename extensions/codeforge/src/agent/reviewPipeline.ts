@@ -64,11 +64,11 @@ function docsFor(root: string): string[] {
 	return out.slice(0, 6);
 }
 
-/** Only in the weak profile (or /review): strong models review fine in a single loop. */
+/** Only when forced (/review): harness no longer auto-starts review from model size. */
 export async function runReviewPipeline(opts: AgentLoopOptions, o: ReviewOptions = {}): Promise<string | undefined> {
 	const root = opts.workspaceRoot;
 	if (!root) return undefined;
-	if (!o.forced && !opts.weakProfile) return undefined;
+	if (!o.forced) return undefined;
 	const reportPath = o.reportPath ?? 'BUGS.md';
 
 	const shell = async (command: string): Promise<string> => {

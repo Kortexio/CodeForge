@@ -5,7 +5,41 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 
-export type AttachmentKind = 'text' | 'image' | 'uri';
+export type BuiltinAttachmentKind = 'text' | 'image' | 'uri';
+export type AttachmentKind = BuiltinAttachmentKind | string;
+
+export interface AttachmentKindDefinition {
+	id: string;
+	label: string;
+	/** Chip CSS hint for the webview (optional). */
+	chipClass?: string;
+}
+
+export interface Disposable {
+	dispose(): void;
+}
+
+const customKinds = new Map<string, AttachmentKindDefinition>();
+
+export function registerAttachmentKind(kind: AttachmentKindDefinition): Disposable {
+	const id = kind.id.trim();
+	if (!id) throw new Error('AttachmentKindDefinition.id is required');
+	customKinds.set(id, { ...kind, id });
+	return {
+		dispose: () => {
+			customKinds.delete(id);
+		},
+	};
+}
+
+export function listAttachmentKinds(): AttachmentKindDefinition[] {
+	const builtins: AttachmentKindDefinition[] = [
+		{ id: 'text', label: 'Text' },
+		{ id: 'image', label: 'Image' },
+		{ id: 'uri', label: 'URI' },
+	];
+	return [...builtins, ...customKinds.values()];
+}
 
 export interface PendingAttachment {
 	id: string;
@@ -21,6 +55,8 @@ export interface PendingAttachment {
 	mime?: string;
 	/** External http(s) link. */
 	url?: string;
+	/** Structured payload for custom kinds. */
+	data?: unknown;
 }
 
 const MAX_ATTACHMENTS = 8;

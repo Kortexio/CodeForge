@@ -10,7 +10,6 @@ import { AiSettingsStore } from '../settings/aiSettingsStore';
 import { runAgentWithTools, AgentActivityEvent, type AgentLoopOptions } from '../agent/agentLoop';
 import { runOrchestrated } from '../agent/orchestratorRun';
 import { runReviewPipeline } from '../agent/reviewPipeline';
-import { isReviewTask } from '../agent/toolsets';
 import { SessionStore } from '../sessions/sessionStore';
 import { getApprovalPolicy, PermissionLevel } from '../policy/approvalPolicy';
 import { ensureWorkspaceIndex, getIndexedCount } from '../intelligence/workspaceIndex';
@@ -28,6 +27,7 @@ import {
 	SLASH_COMMANDS,
 	formatSlashHelp,
 	parseSlashInput,
+	getSlashCommand,
 } from './slashCommands';
 import {
 	agentsMdExists,
@@ -35,8 +35,16 @@ import {
 	loadAgentsMdForPrompt,
 } from '../agent/projectInstructions';
 import { isWeakModel, resolveWeakModelMode } from '../agent/weakModelProfile';
+import {
+	getEditJournal,
+	OriginalContentProvider,
+	absFromRel,
+	type JournalSummary,
+} from '../agent/editJournal';
 
-type AgentMode = 'ask' | 'plan' | 'agent' | 'auto';
+import { getChatViewHtml } from './chatViewHtml';
+
+type AgentMode = 'ask' | 'plan' | 'agent';
 type Permissions = PermissionLevel;
 
 interface TimelineItem {
@@ -48,6 +56,8 @@ interface TimelineItem {
 	success?: boolean;
 	toolCallId?: string;
 	toolStatus?: 'running' | 'ok' | 'failed';
+	/** User-turn index (0-based). */
+	turn?: number;
 	ts: number;
 }
 
@@ -65,6 +75,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 	private _mode: AgentMode = 'agent';
 	private _permissions: Permissions = 'default';
 	private _contextBadge = { indexed: 0, inContext: 0 };
+	private _contextUsage: { used: number; limit: number } | null = null;
+	private _editSummary: JournalSummary | null = null;
 	private _weakHarness = false;
 	private _pendingAttachments: PendingAttachment[] = [];
 	private _pendingImages: Array<{ mime: string; dataUrl: string; label?: string }> = [];
@@ -73,6 +85,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 	private _queue: Array<{ id: string; text: string; mode?: AgentMode }> = [];
 	/** Set by /cards, /plan-run and /review for the next run only. */
 	private _runKind?: 'cards' | 'plan-run' | 'review';
+	private _currentTurn = 0;
 
 	constructor(
 		extensionUri: vscode.Uri,
@@ -86,11 +99,24 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		this._store = store;
 		this._sessions = sessions;
 		const cfg = vscode.workspace.getConfiguration('codeforge.ai');
-		this._mode = normalizeMode(cfg.get<string>('mode'));
-		try {
-			this._permissions = getApprovalPolicy().getPermissionLevel(this._mode);
-		} catch {
-			this._permissions = this._mode === 'auto' ? 'allowAll' : cfg.get<boolean>('previewEdits') ? 'assisted' : 'default';
+		const rawMode = cfg.get<string>('mode');
+		// Migrate legacy "auto" mode → agent + allowAll permissions.
+		if (rawMode === 'auto') {
+			this._mode = 'agent';
+			this._permissions = 'allowAll';
+			void cfg.update('mode', 'agent', vscode.ConfigurationTarget.Global);
+			try {
+				void getApprovalPolicy().allowAutoSession();
+			} catch {
+				/* ignore */
+			}
+		} else {
+			this._mode = normalizeMode(rawMode);
+			try {
+				this._permissions = getApprovalPolicy().getPermissionLevel(this._mode);
+			} catch {
+				this._permissions = cfg.get<boolean>('previewEdits') ? 'assisted' : 'default';
+			}
 		}
 		void ensureWorkspaceIndex().then(() => {
 			this._contextBadge = { indexed: getIndexedCount(), inContext: this._contextBadge.inContext };
@@ -99,6 +125,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		void agentsMdExists().then(v => {
 			this._hasAgentsMd = v;
 			this.pushConfig();
+		});
+		getEditJournal().onDidChange(() => {
+			void this.refreshEditSummary();
 		});
 		vscode.workspace.onDidChangeConfiguration(e => {
 			if (
@@ -132,28 +161,81 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			/* ignore */
 		}
 		this._cancelled = false;
-		this._timeline = (session.toolTraces || []).slice(-40).map(t => ({
-			id: t.id,
-			kind: 'tool' as const,
-			label: t.success ? `${t.name} ok` : `${t.name} failed`,
-			detail: (t.output || '').slice(0, 300),
-			tool: t.name,
-			toolCallId: t.id,
-			toolStatus: (t.success ? 'ok' : 'failed') as 'ok' | 'failed',
-			success: t.success,
-			ts: Date.parse(t.timestamp) || Date.now(),
-		}));
+		const userTurns = session.messages.filter(m => m.role === 'user').length;
+		const lastTurn = Math.max(0, userTurns - 1);
+		this._timeline = (session.toolTraces || []).slice(-80).map(t => {
+			const args = (t.arguments || {}) as Record<string, unknown>;
+			const primary = String(
+				args.path ?? args.command ?? args.pattern ?? args.query ?? ''
+			)
+				.replace(/\s+/g, ' ')
+				.trim();
+			const title = t.name.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+			const label =
+				t.name === 'shell' || t.name === 'dotnet'
+					? `Shell ${primary.slice(0, 72) || ''}`.trim()
+					: primary
+						? `${title} ${primary.slice(0, 72)}`
+						: title;
+			return {
+				id: t.id,
+				kind: 'tool' as const,
+				label,
+				detail: String(t.output || '')
+					.replace(/\n*\(lesson —[\s\S]*$/i, '')
+					.split(/\r?\n/)
+					.filter(
+						line =>
+							line.trim() &&
+							!/^cwd:\s/i.test(line) &&
+							!/^sandbox:\s/i.test(line) &&
+							!/^exit\s+\d+\s*$/i.test(line.trim())
+					)
+					.slice(0, 6)
+					.join('\n')
+					.slice(0, 400),
+				tool: t.name,
+				toolCallId: t.id,
+				toolStatus: (t.success ? 'ok' : 'failed') as 'ok' | 'failed',
+				success: t.success,
+				turn: t.turn ?? lastTurn,
+				ts: Date.parse(t.timestamp) || Date.now(),
+			};
+		});
 		this._messages = session.messages.map(m => ({
 			role: m.role,
 			content: m.content,
 			timestamp: new Date(m.timestamp),
 		}));
+		this._currentTurn = lastTurn;
 		this._queue = [];
 		this.pushQueue();
 		await this.focus();
 		this.updateView();
 		if (this._view) {
 			this._view.title = session.title.slice(0, 40);
+		}
+		void this.refreshEditSummary();
+	}
+
+	/** QuickPick of past sessions (history icon in view title). */
+	async pickSessionHistory(): Promise<void> {
+		const sessions = this._sessions.list({ workspaceOnly: true });
+		if (!sessions.length) {
+			vscode.window.showInformationMessage('No chat sessions yet.');
+			return;
+		}
+		const picked = await vscode.window.showQuickPick(
+			sessions.map(s => ({
+				label: s.title || 'Untitled',
+				description: new Date(s.updatedAt).toLocaleString(),
+				detail: s.state,
+				id: s.id,
+			})),
+			{ placeHolder: 'Open chat session' }
+		);
+		if (picked?.id) {
+			await this.loadSession(picked.id);
 		}
 	}
 
@@ -255,6 +337,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 					this._queue = [];
 					this.pushQueue();
 					break;
+				case 'undoAll':
+					await this.undoAllEdits();
+					break;
+				case 'reviewChanges':
+					await this.reviewPendingEdits();
+					break;
+				case 'restoreCheckpoint':
+					await this.restoreCheckpoint(Number(message.messageIndex ?? -1));
+					break;
 			}
 		});
 	}
@@ -268,10 +359,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		this._abort?.abort();
 		this._abort = undefined;
 		this._currentSessionId = null;
+		this._currentTurn = 0;
+		this._contextUsage = null;
+		this._editSummary = null;
 		this._pendingAttachments = [];
 		void this._sessions.setActiveId(null);
+		getEditJournal().clearSession();
 		try {
 			getApprovalPolicy().clearSession();
+			if (this._permissions === 'allowAll') {
+				void getApprovalPolicy().allowAutoSession();
+			}
 		} catch {
 			/* policy may not be ready */
 		}
@@ -327,6 +425,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		}
 	}
 
+	/** Used by CodeForgeApi.chat.openWithPrompt. */
+	addPendingAttachments(attachments: PendingAttachment[]): void {
+		this._pendingAttachments = mergeAttachments(this._pendingAttachments, attachments);
+		this.updateView();
+	}
+
 	async runTask(task: string, mode?: AgentMode) {
 		if (mode) {
 			await this.setMode(mode);
@@ -350,9 +454,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		this._cancelled = false;
 		this._abort?.abort();
 		this._abort = new AbortController();
-		this._timeline = [];
+		this.pushConfig();
+		this.pushQueue();
+		// Keep prior-turn timeline; new tools tag with the upcoming turn index.
 
 		await this.maybeResumeForContinue(task);
+
+		// Implicitly accept prior pending edits when starting a new turn.
+		getEditJournal().accept();
+		void this.refreshEditSummary();
 
 		const { server, model } = this._store.getActiveSelection();
 		if (!this._currentSessionId) {
@@ -369,7 +479,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			await this._sessions.setActiveId(this._currentSessionId);
 		}
 
-		if (this._mode === 'auto') {
+		if (this._permissions === 'allowAll' || vscode.workspace.getConfiguration('codeforge.ai').get<boolean>('fullAgentFreedom') === true) {
 			try {
 				await getApprovalPolicy().allowAutoSession();
 			} catch {
@@ -401,12 +511,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		await this._sessions.appendMessage(this._currentSessionId, 'user', historyText);
 		await this._sessions.updateState(this._currentSessionId, 'running');
 
+		this._currentTurn = this._messages.filter(m => m.role === 'user').length - 1;
+		if (this._currentSessionId) {
+			getEditJournal().setContext(this._currentSessionId, this._currentTurn);
+		}
+
 		this.addMessage(
 			'assistant',
 			this._mode === 'ask' ? 'Thinking...' : 'Working...',
 			'pending'
 		);
 		this.updateView();
+		this.pushQueue();
 
 		try {
 			const reply = await this.executeLocalAgent(fullTask, images);
@@ -444,6 +560,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			this._abort = undefined;
 			this._pendingImages = [];
 			this._running = false;
+			void this.refreshEditSummary();
+			this.pushConfig();
+			this.pushQueue();
 			this.updateView();
 			await this.drainQueue();
 		}
@@ -553,32 +672,37 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		await vscode.workspace
 			.getConfiguration('codeforge.ai')
 			.update('mode', this._mode, vscode.ConfigurationTarget.Global);
-		if (mode !== 'auto') {
-			try {
-				getApprovalPolicy().clearSession();
-			} catch {
-				/* ignore */
-			}
-		}
+		// Keep Allow all if the session already granted it; otherwise refresh from policy.
 		try {
-			this._permissions = getApprovalPolicy().getPermissionLevel(this._mode);
+			const fromPolicy = getApprovalPolicy().getPermissionLevel();
+			if (fromPolicy === 'allowAll' || this._permissions === 'allowAll') {
+				this._permissions = 'allowAll';
+			} else if (fromPolicy === 'assisted') {
+				this._permissions = 'assisted';
+			} else if (this._permissions !== 'assisted') {
+				this._permissions = 'default';
+			}
 		} catch {
-			this._permissions = mode === 'auto' ? 'allowAll' : this._permissions === 'assisted' ? 'assisted' : 'default';
+			/* keep current permissions */
 		}
 		this.pushConfig();
 	}
 
 	private async setPermissions(level: Permissions) {
 		try {
-			const nextMode = await getApprovalPolicy().applyPermissionLevel(level);
+			await getApprovalPolicy().applyPermissionLevel(level);
 			this._permissions = level;
-			await this.setMode(nextMode);
+			if (level === 'allowAll' && this._mode === 'ask') {
+				await this.setMode('agent');
+			} else {
+				this.pushConfig();
+			}
 		} catch (err) {
 			vscode.window.showWarningMessage(
 				`Could not set permissions: ${err instanceof Error ? err.message : String(err)}`
 			);
+			this.pushConfig();
 		}
-		this.pushConfig();
 	}
 
 	async runGenerateInstructions(): Promise<void> {
@@ -617,14 +741,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		return 'Add server in Settings';
 	}
 
-	private detectWeakHarness(server: { baseUrl?: string; numCtx?: number } | null | undefined, model: string | null | undefined): boolean {
+	private detectWeakHarness(
+		_server?: { baseUrl?: string; numCtx?: number } | null,
+		_model?: string | null
+	): boolean {
 		const mode = resolveWeakModelMode(
 			vscode.workspace.getConfiguration('codeforge.ai').get<string>('weakModelMode')
 		);
-		return isWeakModel(
-			{ modelId: model, baseUrl: server?.baseUrl, numCtx: server?.numCtx },
-			mode
-		);
+		return isWeakModel({}, mode);
 	}
 
 	private pushConfig() {
@@ -644,6 +768,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			hasKey: configured,
 			workspace: this._bridge.getWorkspaceRoot() ?? null,
 			badge: this._contextBadge,
+			contextUsage: this._contextUsage,
+			editSummary: this._editSummary,
+			running: this._running,
 			hasAgentsMd: this._hasAgentsMd,
 			weakHarness: this._weakHarness,
 			slashCommands: SLASH_COMMANDS,
@@ -666,6 +793,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 				existing.success = event.success;
 				existing.toolStatus = event.toolStatus;
 				existing.ts = Date.now();
+				existing.turn = this._currentTurn;
 				this.updateView();
 				return;
 			}
@@ -679,13 +807,119 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			success: event.success,
 			toolCallId: event.toolCallId,
 			toolStatus: event.toolStatus,
+			turn: this._currentTurn,
 			ts: Date.now(),
 		};
 		this._timeline.push(item);
-		if (this._timeline.length > 80) {
-			this._timeline = this._timeline.slice(-80);
+		if (this._timeline.length > 120) {
+			this._timeline = this._timeline.slice(-120);
 		}
 		this.updateView();
+	}
+
+	private async refreshEditSummary(): Promise<void> {
+		try {
+			const summary = await getEditJournal().summary(p => this._bridge.readRaw(p));
+			this._editSummary = summary.files > 0 ? summary : null;
+		} catch {
+			this._editSummary = null;
+		}
+		this.pushConfig();
+	}
+
+	private async undoAllEdits(): Promise<void> {
+		if (this._running) {
+			vscode.window.showWarningMessage('Stop the agent before undoing edits.');
+			return;
+		}
+		const n = await getEditJournal().undoAllPending({
+			write: (p, c) => this._bridge.writeRaw(p, c),
+			delete: p => this._bridge.deleteRaw(p),
+			readRaw: p => this._bridge.readRaw(p),
+		});
+		await this.refreshEditSummary();
+		vscode.window.showInformationMessage(
+			n > 0 ? `Reverted ${n} file(s).` : 'No pending edits to undo.'
+		);
+	}
+
+	private async reviewPendingEdits(): Promise<void> {
+		const pending = getEditJournal().listPending();
+		if (!pending.length) {
+			vscode.window.showInformationMessage('No pending edits to review.');
+			return;
+		}
+		const byPath = new Map<string, (typeof pending)[0]>();
+		for (const e of pending) {
+			if (!byPath.has(e.path)) byPath.set(e.path, e);
+		}
+		for (const e of byPath.values()) {
+			const abs = absFromRel(e.path);
+			const left = OriginalContentProvider.uriFor(e.path);
+			const right = vscode.Uri.file(abs);
+			await vscode.commands.executeCommand(
+				'vscode.diff',
+				left,
+				right,
+				`${e.path} (original ↔ current)`
+			);
+		}
+	}
+
+	private async restoreCheckpoint(messageIndex: number): Promise<void> {
+		if (this._running) {
+			vscode.window.showWarningMessage('Stop the agent before restoring a checkpoint.');
+			return;
+		}
+		if (!Number.isFinite(messageIndex) || messageIndex < 0 || messageIndex >= this._messages.length) {
+			vscode.window.showWarningMessage('Could not find that message to restore.');
+			return;
+		}
+		const msg = this._messages[messageIndex];
+		if (msg.role !== 'user') {
+			vscode.window.showWarningMessage('Restore checkpoint only works on your messages.');
+			return;
+		}
+
+		const confirm = await vscode.window.showWarningMessage(
+			'Restore checkpoint? File edits from this turn onward will be reverted and later chat messages removed. Your prompt will return to the input box.',
+			{ modal: true },
+			'Restore'
+		);
+		if (confirm !== 'Restore') return;
+
+		const userTurn =
+			this._messages.slice(0, messageIndex + 1).filter(m => m.role === 'user').length - 1;
+		// Prefer the short user-visible prompt (strip attachment blocks).
+		const promptText = msg.content.split(/\n\n(?:Attached |Images:|---)/)[0]?.trim() || msg.content;
+
+		try {
+			await getEditJournal().revertTurns(Math.max(0, userTurn), {
+				write: (p, c) => this._bridge.writeRaw(p, c),
+				delete: p => this._bridge.deleteRaw(p),
+				readRaw: p => this._bridge.readRaw(p),
+			});
+		} catch (err) {
+			vscode.window.showErrorMessage(
+				`Could not revert files: ${err instanceof Error ? err.message : String(err)}`
+			);
+		}
+
+		if (this._currentSessionId) {
+			await this._sessions.truncateFrom(this._currentSessionId, messageIndex);
+		}
+
+		this._messages = this._messages.slice(0, messageIndex);
+		this._timeline = this._timeline.filter(
+			t => t.turn !== undefined && t.turn !== null && t.turn < userTurn
+		);
+		this._currentTurn = Math.max(0, userTurn - 1);
+		this._cancelled = false;
+		await this.refreshEditSummary();
+		this.updateView();
+		this.pushConfig();
+		this._view?.webview.postMessage({ type: 'restorePrompt', text: promptText });
+		vscode.window.showInformationMessage('Checkpoint restored — prompt is back in the input box.');
 	}
 
 	private async executeLocalAgent(
@@ -770,9 +1004,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 					this._contextBadge = badge;
 					this.pushConfig();
 				},
+				onContextUsage: usage => {
+					this._contextUsage = usage;
+					this.pushConfig();
+				},
 				onTaskUpdate: this._onTaskUpdate,
 				sessionStore: this._sessions,
 				sessionId: this._currentSessionId,
+				turnIndex: this._currentTurn,
 				maxSteps: cfgAgentPlan.get<number>('agentCheckpointSteps') ?? 30,
 				hardCap: cfgAgentPlan.get<number>('agentHardCap') ?? 100,
 				weakProfile,
@@ -854,15 +1093,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 				this._contextBadge = badge;
 				this.pushConfig();
 			},
+			onContextUsage: usage => {
+				this._contextUsage = usage;
+				this.pushConfig();
+			},
 			onTaskUpdate: this._onTaskUpdate,
 			sessionStore: this._sessions,
 			sessionId: this._currentSessionId,
+			turnIndex: this._currentTurn,
 			maxSteps: cfgAgent.get<number>('agentCheckpointSteps') ?? 30,
 			hardCap: cfgAgent.get<number>('agentHardCap') ?? 100,
 			weakProfile,
 		};
-		if (runKind === 'review' || (!runKind && weakProfile && isReviewTask(task))) {
-			const reviewed = await runReviewPipeline(agentOpts, { forced: runKind === 'review' });
+		if (runKind === 'review') {
+			const reviewed = await runReviewPipeline(agentOpts, { forced: true });
 			if (reviewed) return reviewed;
 		}
 		if (runKind !== 'review') {
@@ -981,7 +1225,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		}
 		const data = JSON.parse(raw) as {
 			choices?: Array<{ message?: { content?: string } }>;
+			usage?: { prompt_tokens?: number; input_tokens?: number };
 		};
+		const used = Number(data.usage?.prompt_tokens ?? data.usage?.input_tokens ?? 0) || 0;
+		const { server: askServer } = this._store.getActiveSelection();
+		const limit = askServer?.numCtx && askServer.numCtx > 0 ? askServer.numCtx : 0;
+		if (used > 0 && limit > 0) {
+			this._contextUsage = { used, limit };
+			this.pushConfig();
+		}
 		return data.choices?.[0]?.message?.content ?? '(empty response)';
 	}
 
@@ -1096,9 +1348,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 				this.addMessage('assistant', 'Switched to Agent mode (Default permissions).');
 				return true;
 			case 'auto':
+				await this.setMode('agent');
 				await this.setPermissions('allowAll');
 				this.addMessage('user', '/auto');
-				this.addMessage('assistant', 'Switched to Auto mode (Allow all this session).');
+				this.addMessage('assistant', 'Allow all enabled for this session (Agent mode).');
 				return true;
 			case 'permissions': {
 				const next = getApprovalPolicy().cyclePermissionLevel(this._permissions);
@@ -1113,13 +1366,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			case 'instructions':
 				await this.runGenerateInstructions();
 				return true;
-			default:
+			default: {
+				const ext = getSlashCommand(command);
+				if (ext?.run) {
+					this.addMessage('user', `/${command}${args ? ` ${args}` : ''}`);
+					await ext.run(args);
+					return true;
+				}
 				this.addMessage('user', `/${command}`);
 				this.addMessage(
 					'assistant',
 					`Unknown command /${command}. Try /help for the list.`
 				);
 				return true;
+			}
 		}
 	}
 
@@ -1152,956 +1412,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 	}
 
 	private _getHtmlContent(): string {
-		return `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>CodeForge AI</title>
-<style>
-  :root { --gap: 8px; --radius: 8px; }
-  * { box-sizing: border-box; }
-  html, body {
-    height: 100%; margin: 0;
-    font-family: var(--vscode-font-family);
-    font-size: var(--vscode-font-size);
-    color: var(--vscode-foreground);
-    background: var(--vscode-sideBar-background);
-  }
-  body { display: flex; flex-direction: column; padding: 0; }
-  .topbar {
-    display: flex; align-items: center; gap: 6px;
-    padding: 8px 10px; border-bottom: 1px solid var(--vscode-panel-border); flex-shrink: 0;
-  }
-  .modes {
-    display: inline-flex; background: var(--vscode-input-background);
-    border: 1px solid var(--vscode-input-border, transparent); border-radius: 999px; padding: 2px;
-  }
-  .modes button {
-    border: 0; background: transparent; color: var(--vscode-descriptionForeground);
-    padding: 4px 8px; border-radius: 999px; cursor: pointer; font: inherit;
-  }
-  .modes button.active {
-    background: var(--vscode-button-background); color: var(--vscode-button-foreground);
-  }
-  .spacer { flex: 1; }
-  .chip, .icon-btn {
-    border: 1px solid var(--vscode-panel-border); background: var(--vscode-input-background);
-    color: var(--vscode-foreground); border-radius: 999px; padding: 4px 10px;
-    font: inherit; cursor: pointer; max-width: 160px; overflow: hidden;
-    text-overflow: ellipsis; white-space: nowrap;
-  }
-  .icon-btn {
-    width: 28px; height: 28px; padding: 0; display: grid; place-items: center; border-radius: 6px;
-  }
-  .badge {
-    font-size: 0.72em; color: var(--vscode-descriptionForeground);
-    border: 1px solid var(--vscode-panel-border); border-radius: 999px; padding: 2px 8px;
-    max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  }
-  .messages {
-    flex: 1; overflow-y: auto; padding: 12px 10px 8px;
-    display: flex; flex-direction: column; gap: 10px;
-  }
-  .empty {
-    margin: auto; text-align: center; color: var(--vscode-descriptionForeground);
-    max-width: 300px; line-height: 1.45;
-  }
-  .empty h1 { font-size: 1.15rem; font-weight: 600; color: var(--vscode-foreground); margin: 0 0 8px; }
-  .empty .sparkle { font-size: 1.6rem; margin-bottom: 6px; opacity: 0.9; }
-  .empty .cta-row { display: flex; flex-direction: column; gap: 8px; margin-top: 14px; }
-  .empty .cta {
-    border: 0; border-radius: 6px; padding: 8px 12px; font: inherit; cursor: pointer;
-    background: var(--vscode-button-background); color: var(--vscode-button-foreground);
-  }
-  .empty .cta.secondary {
-    background: transparent; color: var(--vscode-textLink-foreground);
-    border: 1px solid var(--vscode-panel-border);
-  }
-  .empty .disclaimer { font-size: 0.78em; margin-top: 10px; opacity: 0.85; }
-  .empty kbd {
-    font-family: var(--vscode-editor-font-family); font-size: 0.85em;
-    border: 1px solid var(--vscode-panel-border); border-radius: 4px; padding: 1px 5px;
-    background: var(--vscode-input-background);
-  }
-  .msg {
-    padding: 0; border-radius: 0; line-height: 1.45; border: 0; max-width: 100%;
-  }
-  .msg.user {
-    align-self: flex-end;
-    max-width: min(92%, 520px);
-    margin: 2px 0 6px;
-  }
-  .msg.user .bubble {
-    background: var(--vscode-input-background);
-    border: 1px solid var(--vscode-panel-border);
-    border-radius: 14px;
-    padding: 10px 14px;
-    box-shadow: 0 1px 0 color-mix(in srgb, var(--vscode-widget-shadow, #000) 12%, transparent);
-  }
-  .msg.assistant {
-    align-self: stretch;
-    background: transparent;
-    border: 0;
-    padding: 4px 2px 10px;
-    max-width: 100%;
-  }
-  .msg.pending { opacity: 0.85; }
-  .role {
-    font-size: 0.72em; color: var(--vscode-descriptionForeground);
-    margin-bottom: 4px; letter-spacing: 0.02em;
-  }
-  .msg.user .role { display: none; }
-  .msg-body { word-wrap: break-word; overflow-wrap: anywhere; }
-  .msg.user .msg-body { white-space: pre-wrap; }
-  .md > :first-child { margin-top: 0; }
-  .md > :last-child { margin-bottom: 0; }
-  .md p { margin: 0.55em 0; }
-  .md h1, .md h2, .md h3, .md h4 {
-    margin: 0.85em 0 0.35em; font-weight: 600; line-height: 1.3;
-    color: var(--vscode-foreground);
-  }
-  .md h1 { font-size: 1.2em; }
-  .md h2 { font-size: 1.1em; }
-  .md h3, .md h4 { font-size: 1em; }
-  .md ul, .md ol { margin: 0.4em 0; padding-left: 1.35em; }
-  .md li { margin: 0.15em 0; }
-  .md li::marker { color: var(--vscode-descriptionForeground); }
-  .md blockquote {
-    margin: 0.5em 0; padding: 0.15em 0 0.15em 0.75em;
-    border-left: 3px solid var(--vscode-panel-border);
-    color: var(--vscode-descriptionForeground);
-  }
-  .md hr {
-    border: 0; border-top: 1px solid var(--vscode-panel-border); margin: 0.75em 0;
-  }
-  .md a { color: var(--vscode-textLink-foreground); text-decoration: none; }
-  .md a:hover { text-decoration: underline; }
-  .md code {
-    font-family: var(--vscode-editor-font-family);
-    font-size: 0.9em;
-    background: var(--vscode-textCodeBlock-background, var(--vscode-input-background));
-    border: 1px solid var(--vscode-panel-border);
-    border-radius: 4px; padding: 0.05em 0.35em;
-  }
-  .md pre {
-    margin: 0.55em 0; padding: 8px 10px; overflow: auto; max-height: 280px;
-    background: var(--vscode-textCodeBlock-background, var(--vscode-input-background));
-    border: 1px solid var(--vscode-panel-border); border-radius: 6px;
-  }
-  .md pre code {
-    border: 0; background: transparent; padding: 0; font-size: 0.85em;
-    white-space: pre;
-  }
-  .md strong { font-weight: 600; }
-  .msg-meta {
-    margin-top: 8px; border: 1px solid var(--vscode-panel-border);
-    border-radius: 6px; padding: 4px 8px;
-    background: var(--vscode-input-background);
-  }
-  .msg-meta summary {
-    cursor: pointer; font-size: 0.78em; color: var(--vscode-descriptionForeground);
-    list-style: none;
-  }
-  .msg-meta summary::-webkit-details-marker { display: none; }
-  .msg-meta pre {
-    margin: 6px 0 2px; white-space: pre-wrap; font-size: 0.78em;
-    color: var(--vscode-descriptionForeground); max-height: 160px; overflow: auto;
-  }
-  .timeline {
-    border: 1px solid var(--vscode-panel-border); border-radius: var(--radius);
-    padding: 6px 8px; background: var(--vscode-input-background); align-self: stretch;
-  }
-  .timeline summary {
-    cursor: pointer; font-size: 0.8em; color: var(--vscode-descriptionForeground);
-    list-style: none; display: flex; align-items: center; gap: 6px;
-  }
-  .timeline summary::-webkit-details-marker { display: none; }
-  .tl-item {
-    margin-top: 6px; padding: 6px 8px; border-left: 2px solid var(--vscode-panel-border);
-    font-size: 0.8em; line-height: 1.35;
-  }
-  .tl-item.thought { border-left-color: var(--vscode-charts-yellow, #cca700); }
-  .tl-item.tool { border-left-color: var(--vscode-charts-blue, #3794ff); }
-  .tl-item.compact { border-left-color: var(--vscode-charts-purple, #b180d7); }
-  .tl-item.checkpoint, .tl-item.context { border-left-color: var(--vscode-charts-green, #89d185); }
-  .tl-label { font-weight: 600; }
-  .tl-detail {
-    margin-top: 4px; color: var(--vscode-descriptionForeground); white-space: pre-wrap;
-    max-height: 120px; overflow: auto;
-  }
-  .tool-stream {
-    align-self: stretch; display: flex; flex-direction: column; gap: 6px; margin: 4px 0 8px;
-  }
-  .tool-card {
-    border: 1px solid var(--vscode-panel-border); border-radius: 6px;
-    background: var(--vscode-editor-background); font-size: 0.82em;
-  }
-  .tool-card summary {
-    list-style: none; cursor: pointer; padding: 8px 10px; display: flex; gap: 8px; align-items: center;
-  }
-  .tool-card summary::-webkit-details-marker { display: none; }
-  .tool-card .badge {
-    font-size: 0.75em; padding: 1px 6px; border-radius: 999px;
-    background: var(--vscode-badge-background); color: var(--vscode-badge-foreground);
-  }
-  .tool-card.running .badge { opacity: 0.85; }
-  .tool-card.ok .badge { background: var(--vscode-testing-iconPassed, #73c991); color: #000; }
-  .tool-card.failed .badge { background: var(--vscode-testing-iconFailed, #f14c4c); color: #fff; }
-  .tool-card .body {
-    padding: 0 10px 8px; color: var(--vscode-descriptionForeground);
-    white-space: pre-wrap; max-height: 160px; overflow: auto; border-top: 1px solid var(--vscode-panel-border);
-  }
-  .composer {
-    flex-shrink: 0; border-top: 1px solid var(--vscode-panel-border);
-    padding: 10px; display: flex; flex-direction: column; gap: 8px;
-    background: var(--vscode-sideBar-background);
-  }
-  .composer-box {
-    border: 1px solid var(--vscode-input-border, var(--vscode-panel-border));
-    background: var(--vscode-input-background); border-radius: 10px; padding: 8px 10px 6px;
-    position: relative;
-  }
-  .composer-box.drag-over {
-    outline: 2px dashed var(--vscode-focusBorder);
-    outline-offset: 2px;
-  }
-  .drop-hint {
-    display: none; position: absolute; inset: 0; border-radius: 10px;
-    background: color-mix(in srgb, var(--vscode-focusBorder) 18%, transparent);
-    align-items: center; justify-content: center; font-size: 0.85em;
-    color: var(--vscode-foreground); pointer-events: none; z-index: 2;
-  }
-  .composer-box.drag-over .drop-hint { display: flex; }
-  textarea {
-    width: 100%; min-height: 56px; max-height: 160px; resize: vertical; border: 0;
-    outline: none; background: transparent; color: var(--vscode-input-foreground);
-    font: inherit; line-height: 1.4;
-  }
-  .attach-row {
-    display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 4px;
-  }
-  .attach-chip {
-    font-size: 0.72em; border: 1px solid var(--vscode-panel-border);
-    border-radius: 999px; padding: 2px 8px; color: var(--vscode-descriptionForeground);
-    display: inline-flex; align-items: center; gap: 4px; max-width: 100%;
-  }
-  .attach-chip .kind { opacity: 0.7; }
-  .attach-chip button {
-    border: 0; background: transparent; color: inherit; cursor: pointer;
-    padding: 0 2px; font: inherit; line-height: 1;
-  }
-  .composer-actions { display: flex; align-items: center; gap: 6px; margin-top: 4px; flex-wrap: wrap; }
-  .hint { color: var(--vscode-descriptionForeground); font-size: 0.75em; flex: 1; min-width: 80px; }
-  .perm-chip {
-    border: 1px solid var(--vscode-panel-border); background: var(--vscode-input-background);
-    color: var(--vscode-foreground); border-radius: 999px; padding: 3px 10px;
-    font: inherit; font-size: 0.78em; cursor: pointer;
-  }
-  .slash-menu {
-    display: none; position: absolute; left: 8px; right: 8px; bottom: 100%;
-    margin-bottom: 4px; max-height: 180px; overflow: auto; z-index: 5;
-    background: var(--vscode-editorWidget-background, var(--vscode-input-background));
-    border: 1px solid var(--vscode-panel-border); border-radius: 8px;
-    box-shadow: 0 4px 16px rgba(0,0,0,0.25);
-  }
-  .slash-menu.open { display: block; }
-  .slash-item {
-    display: flex; gap: 8px; padding: 7px 10px; cursor: pointer; font-size: 0.85em;
-  }
-  .slash-item:hover, .slash-item.active { background: var(--vscode-list-hoverBackground); }
-  .slash-item .name { font-weight: 600; min-width: 100px; }
-  .slash-item .desc { color: var(--vscode-descriptionForeground); }
-  .send, .stop {
-    border: 0; border-radius: 6px; padding: 6px 12px; font: inherit; cursor: pointer;
-  }
-  .send { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
-  .stop { background: var(--vscode-inputValidation-errorBackground, #5a1d1d); color: var(--vscode-errorForeground, #f48771); display: none; }
-  .send:disabled { opacity: 0.5; cursor: default; }
-  body.busy .stop { display: inline-block; }
-  .queue-panel {
-    display: none; flex-direction: column; gap: 6px;
-    border: 1px solid var(--vscode-panel-border); border-radius: 8px;
-    padding: 8px; background: var(--vscode-input-background);
-  }
-  .queue-panel.visible { display: flex; }
-  .queue-head {
-    display: flex; align-items: center; gap: 8px;
-    font-size: 0.78em; color: var(--vscode-descriptionForeground);
-  }
-  .queue-head strong { color: var(--vscode-foreground); font-weight: 600; }
-  .queue-head .spacer { flex: 1; }
-  .queue-head button {
-    border: 0; background: transparent; color: var(--vscode-textLink-foreground);
-    cursor: pointer; font: inherit; font-size: 0.95em; padding: 0;
-  }
-  .queue-item {
-    display: flex; align-items: flex-start; gap: 8px;
-    padding: 6px 8px; border-radius: 6px;
-    background: color-mix(in srgb, var(--vscode-sideBar-background) 70%, transparent);
-    border: 1px solid var(--vscode-panel-border);
-    font-size: 0.82em; line-height: 1.35;
-  }
-  .queue-item .idx {
-    color: var(--vscode-descriptionForeground); min-width: 1.2em; flex-shrink: 0;
-  }
-  .queue-item .qtext {
-    flex: 1; white-space: pre-wrap; word-break: break-word;
-    max-height: 3.6em; overflow: hidden;
-  }
-  .queue-item button {
-    border: 0; background: transparent; color: var(--vscode-descriptionForeground);
-    cursor: pointer; font: inherit; line-height: 1; padding: 0 2px; flex-shrink: 0;
-  }
-  .queue-item button:hover { color: var(--vscode-errorForeground, #f48771); }
-</style>
-</head>
-<body>
-  <div class="topbar">
-    <div class="modes" role="tablist">
-      <button type="button" id="modeAgent" class="active" data-mode="agent">Agent</button>
-      <button type="button" id="modePlan" data-mode="plan">Plan</button>
-      <button type="button" id="modeAsk" data-mode="ask">Ask</button>
-      <button type="button" id="modeAuto" data-mode="auto">Auto</button>
-    </div>
-    <div class="spacer"></div>
-    <span class="badge" id="weakBadge" title="Weak-model harness active" style="display:none">Weak harness</span>
-    <span class="badge" id="contextBadge" title="Indexed paths · in context">0 · 0</span>
-    <button type="button" class="chip" id="modelChip" title="Switch model">model</button>
-    <button type="button" class="icon-btn" id="settingsBtn" title="Settings">⚙</button>
-    <button type="button" class="icon-btn" id="newChatBtn" title="New chat">＋</button>
-  </div>
-
-  <div class="messages" id="messages">
-    <div class="empty" id="emptyState">
-      <div class="sparkle">✦</div>
-      <h1>Build with Agent</h1>
-      <p>Plan, edit, and verify across your workspace.</p>
-      <div class="cta-row">
-        <button type="button" class="cta" id="ctaStart">Start building</button>
-        <button type="button" class="cta secondary" id="ctaInstructions">Generate Agent Instructions</button>
-      </div>
-      <p class="disclaimer">AI responses may be inaccurate. Press <kbd>Ctrl</kbd>+<kbd>L</kbd> to focus.</p>
-    </div>
-  </div>
-
-  <div class="composer">
-    <div class="queue-panel" id="queuePanel" aria-live="polite">
-      <div class="queue-head">
-        <strong>Queue</strong>
-        <span id="queueCount">0</span>
-        <span class="spacer"></span>
-        <button type="button" id="clearQueueBtn">Clear</button>
-      </div>
-      <div id="queueList"></div>
-    </div>
-    <div class="composer-box" id="composerBox">
-      <div class="drop-hint">Drop files, images, or links</div>
-      <div class="slash-menu" id="slashMenu"></div>
-      <div class="attach-row" id="attachRow"></div>
-      <textarea id="messageInput" placeholder="Plan, search, edit… Type / for commands. Enter to send"></textarea>
-      <div class="composer-actions">
-        <button type="button" class="icon-btn" id="attachBtn" title="Attach files">📎</button>
-        <button type="button" class="perm-chip" id="permChip" title="Permissions">Default</button>
-        <span class="hint" id="modeHint">Agent can use workspace tools</span>
-        <button class="stop" id="stopButton" type="button">Stop</button>
-        <button class="send" id="sendButton" type="button">Send</button>
-      </div>
-    </div>
-  </div>
-
-<script>
-  const vscode = acquireVsCodeApi();
-  let mode = 'agent';
-  let permissions = 'default';
-  let busy = false;
-  let timeline = [];
-  let collapseToolCards = true;
-  let slashCommands = [];
-  let hasAgentsMd = false;
-  let slashOpen = false;
-  let slashIndex = 0;
-  let slashFiltered = [];
-
-  const messagesEl = document.getElementById('messages');
-  const input = document.getElementById('messageInput');
-  const sendButton = document.getElementById('sendButton');
-  const stopButton = document.getElementById('stopButton');
-  const modelChip = document.getElementById('modelChip');
-  const modeHint = document.getElementById('modeHint');
-  const modeAgent = document.getElementById('modeAgent');
-  const modePlan = document.getElementById('modePlan');
-  const modeAsk = document.getElementById('modeAsk');
-  const modeAuto = document.getElementById('modeAuto');
-  const weakBadge = document.getElementById('weakBadge');
-  const contextBadge = document.getElementById('contextBadge');
-  const attachRow = document.getElementById('attachRow');
-  const composerBox = document.getElementById('composerBox');
-  const permChip = document.getElementById('permChip');
-  const slashMenu = document.getElementById('slashMenu');
-  const queuePanel = document.getElementById('queuePanel');
-  const queueList = document.getElementById('queueList');
-  const queueCount = document.getElementById('queueCount');
-  let attachmentCount = 0;
-  let queuedItems = [];
-
-  function syncSendButton() {
-    sendButton.disabled = false;
-    sendButton.textContent = busy ? 'Queue' : 'Send';
-    input.placeholder = busy
-      ? 'Add to queue… Enter queues while Agent is working'
-      : (mode === 'ask'
-        ? 'Ask about the codebase… Type / for commands'
-        : 'Plan, search, edit… Type / for commands');
-  }
-
-  function renderQueue(items) {
-    queuedItems = Array.isArray(items) ? items : [];
-    queueCount.textContent = String(queuedItems.length);
-    queuePanel.classList.toggle('visible', queuedItems.length > 0);
-    queueList.innerHTML = queuedItems.map(function (item, i) {
-      return '<div class="queue-item" data-id="' + escapeHtml(item.id) + '">' +
-        '<span class="idx">' + (i + 1) + '</span>' +
-        '<span class="qtext">' + escapeHtml(item.text) + '</span>' +
-        '<button type="button" title="Remove from queue">×</button>' +
-        '</div>';
-    }).join('');
-    queueList.querySelectorAll('.queue-item button').forEach(function (btn) {
-      btn.addEventListener('click', function () {
-        const row = btn.closest('.queue-item');
-        const id = row && row.getAttribute('data-id');
-        if (id) vscode.postMessage({ type: 'removeQueued', id: id });
-      });
-    });
-  }
-
-  function permLabel(p) {
-    return p === 'allowAll' ? 'Allow all' : p === 'assisted' ? 'Assisted' : 'Default';
-  }
-
-  function syncPermChip() {
-    permChip.textContent = permLabel(permissions);
-  }
-
-  function setMode(next) {
-    mode = next === 'ask' ? 'ask' : next === 'plan' ? 'plan' : next === 'auto' ? 'auto' : 'agent';
-    modeAgent.classList.toggle('active', mode === 'agent');
-    if (modePlan) modePlan.classList.toggle('active', mode === 'plan');
-    modeAsk.classList.toggle('active', mode === 'ask');
-    modeAuto.classList.toggle('active', mode === 'auto');
-    modeHint.textContent = mode === 'ask'
-      ? 'Ask answers without running tools'
-      : mode === 'plan'
-        ? 'Plan: explore + wiki plan only (no code writes)'
-      : mode === 'auto'
-        ? 'Auto-approves edits + shell this session'
-        : permissions === 'assisted'
-          ? 'Agent with edit preview'
-          : 'Agent can use workspace tools';
-    input.placeholder = busy
-      ? 'Add to queue… Enter queues while Agent is working'
-      : (mode === 'ask'
-        ? 'Ask about the codebase… Type / for commands'
-        : mode === 'plan'
-          ? 'Describe the feature to plan… Type / for commands'
-        : 'Plan, search, edit… Type / for commands');
-    vscode.postMessage({ type: 'setMode', mode });
-  }
-
-  modeAgent.addEventListener('click', () => setMode('agent'));
-  if (modePlan) modePlan.addEventListener('click', () => setMode('plan'));
-  modeAsk.addEventListener('click', () => setMode('ask'));
-  modeAuto.addEventListener('click', () => setMode('auto'));
-	modelChip.addEventListener('click', () => {
-    if (!modelChip.textContent || modelChip.textContent.indexOf('Add server') >= 0) {
-      vscode.postMessage({ type: 'openSettings' });
-    } else {
-      vscode.postMessage({ type: 'configure' });
-    }
-  });
-  document.getElementById('settingsBtn').addEventListener('click', () => vscode.postMessage({ type: 'openSettings' }));
-  document.getElementById('newChatBtn').addEventListener('click', () => vscode.postMessage({ type: 'newChat' }));
-  document.getElementById('attachBtn').addEventListener('click', () => vscode.postMessage({ type: 'attachFiles' }));
-  stopButton.addEventListener('click', () => vscode.postMessage({ type: 'cancel' }));
-  permChip.addEventListener('click', () => {
-    const order = ['default', 'assisted', 'allowAll'];
-    const i = order.indexOf(permissions);
-    const next = order[(i + 1) % order.length];
-    vscode.postMessage({ type: 'setPermissions', level: next });
-  });
-  document.getElementById('ctaStart').addEventListener('click', () => {
-    vscode.postMessage({ type: 'emptyCta', action: 'start' });
-  });
-  document.getElementById('ctaInstructions').addEventListener('click', () => {
-    vscode.postMessage({ type: 'emptyCta', action: 'instructions' });
-  });
-
-  function sendMessage() {
-    const text = input.value.trim();
-    if (!text && attachmentCount === 0) return;
-    hideSlash();
-    vscode.postMessage({ type: 'sendMessage', text: text || 'Analyze the attached items.', mode });
-    input.value = '';
-  }
-
-  function filterSlash(prefix) {
-    const q = prefix.replace(/^\\//, '').toLowerCase();
-    if (!q) return slashCommands.slice();
-    return slashCommands.filter(c => c.name.startsWith(q) || c.name.includes(q));
-  }
-
-  function renderSlash() {
-    if (!slashOpen || !slashFiltered.length) {
-      slashMenu.classList.remove('open');
-      slashMenu.innerHTML = '';
-      return;
-    }
-    slashMenu.innerHTML = slashFiltered.map((c, i) =>
-      '<div class="slash-item' + (i === slashIndex ? ' active' : '') + '" data-i="' + i + '">' +
-      '<span class="name">/' + escapeHtml(c.name) + '</span>' +
-      '<span class="desc">' + escapeHtml(c.description || '') + '</span></div>'
-    ).join('');
-    slashMenu.classList.add('open');
-    slashMenu.querySelectorAll('.slash-item').forEach(el => {
-      el.addEventListener('mousedown', (e) => {
-        e.preventDefault();
-        applySlash(Number(el.getAttribute('data-i')));
-      });
-    });
-  }
-
-  function applySlash(i) {
-    const c = slashFiltered[i];
-    if (!c) return;
-    input.value = '/' + c.name + ' ';
-    hideSlash();
-    input.focus();
-  }
-
-  function hideSlash() {
-    slashOpen = false;
-    slashMenu.classList.remove('open');
-  }
-
-  function updateSlashFromInput() {
-    const val = input.value;
-    const m = /^\\/([a-zA-Z0-9_-]*)$/.exec(val);
-    if (m) {
-      slashOpen = true;
-      slashFiltered = filterSlash(m[1]);
-      slashIndex = 0;
-      renderSlash();
-    } else {
-      hideSlash();
-    }
-  }
-
-  sendButton.addEventListener('click', sendMessage);
-  input.addEventListener('input', updateSlashFromInput);
-  input.addEventListener('keydown', (e) => {
-    if (slashOpen && slashFiltered.length) {
-      if (e.key === 'ArrowDown') {
-        e.preventDefault();
-        slashIndex = (slashIndex + 1) % slashFiltered.length;
-        renderSlash();
-        return;
-      }
-      if (e.key === 'ArrowUp') {
-        e.preventDefault();
-        slashIndex = (slashIndex - 1 + slashFiltered.length) % slashFiltered.length;
-        renderSlash();
-        return;
-      }
-      if (e.key === 'Tab') {
-        e.preventDefault();
-        applySlash(slashIndex);
-        return;
-      }
-      if (e.key === 'Escape') {
-        hideSlash();
-        return;
-      }
-    }
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      if (slashOpen && slashFiltered.length && /^\\/[a-zA-Z0-9_-]*$/.test(input.value.trim())) {
-        applySlash(slashIndex);
-        return;
-      }
-      sendMessage();
-    }
-  });
-
-  function collectUriList(dt) {
-    const parts = [];
-    const uriList = dt.getData('text/uri-list');
-    if (uriList) parts.push(uriList);
-    try {
-      const resourceUrls = dt.getData('resourceurls');
-      if (resourceUrls) {
-        const arr = JSON.parse(resourceUrls);
-        if (Array.isArray(arr)) parts.push(arr.map(decodeURIComponent).join('\\n'));
-      }
-    } catch (_) {}
-    try {
-      const codeList = dt.getData('application/vnd.code.uri-list');
-      if (codeList) parts.push(codeList);
-    } catch (_) {}
-    const plain = dt.getData('text/plain');
-    if (plain && /^https?:\\/\\//i.test(plain.trim())) {
-      vscode.postMessage({ type: 'attachUrl', url: plain.trim() });
-    }
-    return parts.filter(Boolean).join('\\n');
-  }
-
-  function readFilesAsBlobs(fileList) {
-    const files = Array.from(fileList || []).slice(0, 8);
-    if (!files.length) return Promise.resolve([]);
-    return Promise.all(files.map(file => new Promise((resolve) => {
-      const reader = new FileReader();
-      reader.onload = () => {
-        const result = String(reader.result || '');
-        const comma = result.indexOf(',');
-        const base64 = comma >= 0 ? result.slice(comma + 1) : result;
-        resolve({ name: file.name, mime: file.type || undefined, base64 });
-      };
-      reader.onerror = () => resolve(null);
-      reader.readAsDataURL(file);
-    }))).then(list => list.filter(Boolean));
-  }
-
-  ['dragenter', 'dragover'].forEach(ev => {
-    composerBox.addEventListener(ev, (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      composerBox.classList.add('drag-over');
-    });
-  });
-  ['dragleave', 'drop'].forEach(ev => {
-    composerBox.addEventListener(ev, (e) => {
-      if (ev === 'dragleave' && e.target !== composerBox) return;
-      composerBox.classList.remove('drag-over');
-    });
-  });
-  composerBox.addEventListener('drop', async (e) => {
-    e.preventDefault();
-    e.stopPropagation();
-    composerBox.classList.remove('drag-over');
-    const dt = e.dataTransfer;
-    if (!dt) return;
-    const uriList = collectUriList(dt);
-    if (uriList) vscode.postMessage({ type: 'attachUris', uriList });
-    if (dt.files && dt.files.length) {
-      const blobs = await readFilesAsBlobs(dt.files);
-      if (blobs.length) vscode.postMessage({ type: 'attachBlobs', blobs });
-    }
-  });
-
-  input.addEventListener('paste', async (e) => {
-    const items = e.clipboardData && e.clipboardData.items;
-    if (!items) return;
-    const files = [];
-    for (let i = 0; i < items.length; i++) {
-      const item = items[i];
-      if (item.kind === 'file') {
-        const f = item.getAsFile();
-        if (f) files.push(f);
-      }
-    }
-    if (files.length) {
-      e.preventDefault();
-      const blobs = await readFilesAsBlobs(files);
-      if (blobs.length) vscode.postMessage({ type: 'attachBlobs', blobs });
-      return;
-    }
-    const text = e.clipboardData.getData('text/plain');
-    if (text && /^https?:\\/\\/\\S+$/i.test(text.trim()) && !input.value) {
-      e.preventDefault();
-      vscode.postMessage({ type: 'attachUrl', url: text.trim() });
-    }
-  });
-
-  window.addEventListener('message', (event) => {
-    const msg = event.data;
-    if (msg.type === 'focusInput') {
-      input.focus();
-    }
-    if (msg.type === 'config') {
-      mode = msg.mode === 'ask' ? 'ask' : msg.mode === 'plan' ? 'plan' : msg.mode === 'auto' ? 'auto' : 'agent';
-      permissions = msg.permissions === 'assisted' || msg.permissions === 'allowAll' ? msg.permissions : 'default';
-      slashCommands = msg.slashCommands || [];
-      hasAgentsMd = !!msg.hasAgentsMd;
-      modeAgent.classList.toggle('active', mode === 'agent');
-      if (modePlan) modePlan.classList.toggle('active', mode === 'plan');
-      modeAsk.classList.toggle('active', mode === 'ask');
-      modeAuto.classList.toggle('active', mode === 'auto');
-      if (weakBadge) weakBadge.style.display = msg.weakHarness ? '' : 'none';
-      syncPermChip();
-      modelChip.textContent = msg.configured
-        ? ((msg.serverName || msg.provider || 'server') + (msg.model ? ' · ' + msg.model : ' · add a model'))
-        : 'Add server in Settings';
-      modelChip.title = msg.configured ? 'Switch model' : 'Open Settings to add a server';
-      modeHint.textContent = !msg.configured
-        ? 'Open Settings (⚙) to add a server'
-        : mode === 'ask'
-          ? 'Ask answers without running tools'
-          : mode === 'plan'
-            ? 'Plan: explore + wiki plan only (no code writes)'
-          : mode === 'auto'
-            ? 'Auto-approves edits + shell this session'
-            : (permissions === 'assisted' ? 'Agent with edit preview' : 'Agent can use workspace tools');
-      if (msg.badge) {
-        contextBadge.textContent = (msg.badge.indexed || 0) + ' indexed · ' + (msg.badge.inContext || 0) + ' in context';
-      }
-      const atts = msg.attachments || [];
-      attachmentCount = atts.length;
-      attachRow.innerHTML = atts.map(a => {
-        const label = typeof a === 'string' ? a : (a.label || a.id || 'file');
-        const id = typeof a === 'string' ? '' : (a.id || '');
-        const kind = typeof a === 'string' ? '' : (a.kind || '');
-        const kindMark = kind === 'image' ? '🖼 ' : kind === 'uri' ? '🔗 ' : '';
-        return '<span class="attach-chip" title="' + escapeHtml(label) + '">' +
-          '<span class="kind">' + kindMark + '</span>' +
-          '<span>' + escapeHtml(label) + '</span>' +
-          (id ? '<button type="button" data-id="' + escapeHtml(id) + '" title="Remove">×</button>' : '') +
-          '</span>';
-      }).join('');
-      attachRow.querySelectorAll('button[data-id]').forEach(btn => {
-        btn.addEventListener('click', () => {
-          vscode.postMessage({ type: 'removeAttachment', id: btn.getAttribute('data-id') });
-        });
-      });
-    }
-    if (msg.type === 'timeline') {
-      timeline = msg.items || [];
-    }
-    if (msg.type === 'queue') {
-      renderQueue(msg.items || []);
-      if (typeof msg.running === 'boolean') {
-        busy = msg.running || busy;
-        document.body.classList.toggle('busy', busy);
-        syncSendButton();
-      }
-    }
-    if (msg.type === 'updateMessages') {
-      if (msg.timeline) timeline = msg.timeline;
-      if (typeof msg.collapseToolCards === 'boolean') {
-        collapseToolCards = msg.collapseToolCards;
-      }
-      renderMessages(msg.messages || []);
-      busy = (msg.messages || []).some(m => m.status === 'pending');
-      document.body.classList.toggle('busy', busy);
-      syncSendButton();
-    }
-  });
-
-  function emptyHtml() {
-    const instrBtn = hasAgentsMd
-      ? '<button type="button" class="cta secondary" id="ctaInstructions">Update Agent Instructions</button>'
-      : '<button type="button" class="cta secondary" id="ctaInstructions">Generate Agent Instructions</button>';
-    return '<div class="empty" id="emptyState">' +
-      '<div class="sparkle">✦</div>' +
-      '<h1>Build with Agent</h1>' +
-      '<p>Plan, edit, and verify across your workspace.</p>' +
-      '<div class="cta-row">' +
-      '<button type="button" class="cta" id="ctaStart">Start building</button>' +
-      instrBtn +
-      '</div>' +
-      '<p class="disclaimer">AI responses may be inaccurate. Press <kbd>Ctrl</kbd>+<kbd>L</kbd> to focus. Tip: /instructions</p>' +
-      '</div>';
-  }
-
-  function bindEmptyCtas() {
-    const start = document.getElementById('ctaStart');
-    const instr = document.getElementById('ctaInstructions');
-    if (start) start.addEventListener('click', () => vscode.postMessage({ type: 'emptyCta', action: 'start' }));
-    if (instr) instr.addEventListener('click', () => vscode.postMessage({ type: 'emptyCta', action: 'instructions' }));
-  }
-
-  function renderMessages(messages) {
-    if (!messages.length) {
-      messagesEl.innerHTML = emptyHtml();
-      bindEmptyCtas();
-      return;
-    }
-    const roleLabel = mode === 'ask' ? 'Ask' : mode === 'plan' ? 'Plan' : mode === 'auto' ? 'Auto' : 'Agent';
-    const tools = timeline.filter(t => t.kind === 'tool');
-    const other = timeline.filter(t => t.kind !== 'tool');
-    const toolHtml = tools.length
-      ? '<div class="tool-stream">' + tools.slice(-16).map(t => {
-          const st = t.toolStatus || (t.success === false ? 'failed' : t.success ? 'ok' : 'running');
-          const detail = t.detail
-            ? '<div class="body">' + escapeHtml(t.detail) + '</div>'
-            : '';
-          const open =
-            st === 'running' || (!collapseToolCards && st !== 'running');
-          return '<details class="tool-card ' + escapeHtml(st) + '"' +
-            (open ? ' open' : '') + '>' +
-            '<summary><span class="badge">' + escapeHtml(st) + '</span>' +
-            '<span>' + escapeHtml(t.label) + '</span></summary>' + detail + '</details>';
-        }).join('') + '</div>'
-      : '';
-    const activityHtml = other.length
-      ? (() => {
-          const items = other.slice(-16).map(t => {
-            const detail = t.detail
-              ? '<div class="tl-detail">' + escapeHtml(t.detail) + '</div>'
-              : '';
-            return '<div class="tl-item ' + escapeHtml(t.kind) + '"><div class="tl-label">' +
-              escapeHtml(t.label) + '</div>' + detail + '</div>';
-          }).join('');
-          return '<details class="timeline"><summary>Activity · ' + other.length +
-            '</summary>' + items + '</details>';
-        })()
-      : '';
-
-    let html = '';
-    messages.forEach((m, idx) => {
-      const isLastPending = m.status === 'pending' && idx === messages.length - 1;
-      // Tool cards sit in the stream before the pending assistant prose (Cursor-like).
-      if (isLastPending && toolHtml) {
-        html += toolHtml;
-      }
-      const inner = m.role === 'assistant'
-        ? renderAssistantBody(m.content)
-        : '<div class="msg-body">' + escapeHtml(m.content) + '</div>';
-      const body = m.role === 'user'
-        ? '<div class="bubble">' + inner + '</div>'
-        : inner;
-      html += '<div class="msg ' + m.role + ' ' + (m.status || '') + '">' +
-        '<div class="role">' + (m.role === 'user' ? 'You' : roleLabel) + '</div>' +
-        body +
-      '</div>';
-    });
-    // After turn completes, keep tool cards under the last assistant reply.
-    const hasPending = messages.some(m => m.status === 'pending');
-    if (!hasPending && toolHtml) {
-      html += toolHtml;
-    }
-    if (activityHtml) {
-      html += activityHtml;
-    }
-
-    messagesEl.innerHTML = html;
-    messagesEl.scrollTop = messagesEl.scrollHeight;
-  }
-
-  function escapeHtml(text) {
-    return String(text)
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;');
-  }
-
-  /** Unwrap local-model JSON envelopes and split Actions/Checkpoints footers. */
-  function normalizeAssistantContent(raw) {
-    const NL = String.fromCharCode(10);
-    let text = String(raw || '');
-    let meta = '';
-    const footer = text.match(new RegExp(NL + NL + '---' + NL + '([\\s\\S]*)$'));
-    if (footer) {
-      meta = footer[1].trim();
-      text = text.slice(0, footer.index).trim();
-    }
-    const trimmed = text.trim();
-    if (trimmed.startsWith('{') && /"message"|"content"/.test(trimmed)) {
-      try {
-        const parsed = JSON.parse(trimmed);
-        if (parsed && typeof parsed.message === 'string') text = parsed.message;
-        else if (parsed && typeof parsed.content === 'string') text = parsed.content;
-        else if (parsed && typeof parsed.text === 'string') text = parsed.text;
-      } catch (e) { /* keep raw */ }
-    }
-    return { text: text.trim(), meta };
-  }
-
-  function renderAssistantBody(raw) {
-    const parts = normalizeAssistantContent(raw);
-    let html = '<div class="msg-body md">' + renderMarkdown(parts.text) + '</div>';
-    if (parts.meta) {
-      html += '<details class="msg-meta"><summary>Details</summary><pre>' +
-        escapeHtml(parts.meta) + '</pre></details>';
-    }
-    return html;
-  }
-
-  function renderMarkdown(src) {
-    const NL = String.fromCharCode(10);
-    const ph0 = String.fromCharCode(0xE000);
-    const ph1 = String.fromCharCode(0xE001);
-    const text = String(src || '');
-    if (!text) return '';
-    const fenceOpen = String.fromCharCode(96, 96, 96);
-    const fences = [];
-    const fenceRe = new RegExp(fenceOpen + '([\\w+-]*)' + NL + '?([\\s\\S]*?)' + fenceOpen, 'g');
-    let s = text.replace(fenceRe, function (_m, lang, code) {
-      const i = fences.length;
-      fences.push(
-        '<pre><code' + (lang ? ' class="language-' + escapeHtml(lang) + '"' : '') + '>' +
-        escapeHtml(String(code).replace(new RegExp(NL + '$'), '')) + '</code></pre>'
-      );
-      return ph0 + 'FENCE' + i + ph1;
-    });
-    s = escapeHtml(s);
-    s = s.replace(/^### (.+)$/gm, '<h3>$1</h3>');
-    s = s.replace(/^## (.+)$/gm, '<h2>$1</h2>');
-    s = s.replace(/^# (.+)$/gm, '<h1>$1</h1>');
-    s = s.replace(/^&gt; (.+)$/gm, '<blockquote>$1</blockquote>');
-    s = s.replace(/^([-*_]{3,})$/gm, '<hr/>');
-    s = s.replace(/\\*\\*([^*]+)\\*\\*/g, '<strong>$1</strong>');
-    s = s.replace(/\\*([^*]+)\\*/g, '<em>$1</em>');
-    s = s.replace(/__([^_]+)__/g, '<strong>$1</strong>');
-    s = s.replace(/_([^_]+)_/g, '<em>$1</em>');
-    const tick = String.fromCharCode(96);
-    s = s.replace(new RegExp(tick + '([^' + tick + ']+)' + tick, 'g'), '<code>$1</code>');
-    s = s.replace(/\\[([^\\]]+)\\]\\((https?:\\/\\/[^\\s)]+)\\)/g, '<a href="$2" title="$2">$1</a>');
-    s = s.replace(new RegExp('^(?:[-*] .+' + NL + '?)+', 'gm'), function (block) {
-      const items = block.trim().split(NL).map(function (line) {
-        return '<li>' + line.replace(new RegExp('^[-*]\\\\s+'), '') + '</li>';
-      }).join('');
-      return '<ul>' + items + '</ul>';
-    });
-    s = s.replace(new RegExp('^(?:\\\\d+\\\\. .+' + NL + '?)+', 'gm'), function (block) {
-      const items = block.trim().split(NL).map(function (line) {
-        return '<li>' + line.replace(new RegExp('^\\\\d+\\\\.\\\\s+'), '') + '</li>';
-      }).join('');
-      return '<ol>' + items + '</ol>';
-    });
-    s = s.split(new RegExp(NL + '{2,}')).map(function (block) {
-      const t = block.trim();
-      if (t.indexOf(ph0 + 'FENCE') === 0) return t;
-      if (/^<(h[1-4]|ul|ol|pre|blockquote|hr)/.test(t)) return block;
-      return '<p>' + block.split(NL).join('<br/>') + '</p>';
-    }).join(NL);
-    s = s.replace(new RegExp(ph0 + 'FENCE(\\\\d+)' + ph1, 'g'), function (_m, i) {
-      return fences[Number(i)] || '';
-    });
-    return s;
-  }
-
-  messagesEl.addEventListener('click', function (e) {
-    const a = e.target && e.target.closest ? e.target.closest('a[href]') : null;
-    if (!a) return;
-    e.preventDefault();
-    const href = a.getAttribute('href');
-    if (href && /^https?:\\/\\//i.test(href)) {
-      vscode.postMessage({ type: 'openExternal', url: href });
-    }
-  });
-
-  var clearBtn = document.getElementById('clearQueueBtn');
-  if (clearBtn) {
-    clearBtn.addEventListener('click', function () {
-      vscode.postMessage({ type: 'clearQueue' });
-    });
-  }
-
-  bindEmptyCtas();
-  vscode.postMessage({ type: 'ready' });
-</script>
-</body>
-</html>`;
+		return getChatViewHtml();
 	}
 }
 
@@ -2139,7 +1450,8 @@ function looksLikeContinue(text: string): boolean {
 }
 
 function normalizeMode(mode: unknown): AgentMode {
-	if (mode === 'ask' || mode === 'plan' || mode === 'auto') return mode;
+	if (mode === 'ask' || mode === 'plan') return mode;
+	// Legacy "auto" → agent (permissions handled separately).
 	return 'agent';
 }
 

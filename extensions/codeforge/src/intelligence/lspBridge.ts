@@ -5,16 +5,49 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 
-export async function documentSymbols(filePath: string): Promise<string> {
+export interface SymbolRange {
+	name: string;
+	kind: string;
+	startLine: number;
+	endLine: number;
+	depth: number;
+}
+
+export async function documentSymbolRanges(filePath: string): Promise<SymbolRange[]> {
 	const uri = resolveUri(filePath);
 	const symbols = await vscode.commands.executeCommand<vscode.DocumentSymbol[]>(
 		'vscode.executeDocumentSymbolProvider',
 		uri
 	);
 	if (!symbols?.length) {
+		return [];
+	}
+	return collectSymbolRanges(symbols, 0);
+}
+
+export async function documentSymbols(filePath: string): Promise<string> {
+	const ranges = await documentSymbolRanges(filePath);
+	if (!ranges.length) {
 		return `No symbols found in ${filePath}`;
 	}
-	return flattenSymbols(symbols).join('\n');
+	return ranges
+		.map(s => {
+			const pad = '  '.repeat(s.depth);
+			return `${pad}${s.kind} ${s.name} @${s.startLine}`;
+		})
+		.join('\n');
+}
+
+/** Compact outline for read tool: `name (kind) L10-85`. */
+export function formatOutlineBlock(ranges: SymbolRange[], max = 40): string {
+	if (!ranges.length) return '';
+	const lines = ranges.slice(0, max).map(s => {
+		const pad = '  '.repeat(s.depth);
+		return `${pad}${s.name} (${s.kind}) L${s.startLine}-${s.endLine}`;
+	});
+	const more =
+		ranges.length > max ? `\n…[+${ranges.length - max} symbols; use symbols tool]` : '';
+	return ['OUTLINE', ...lines].join('\n') + more;
 }
 
 export async function workspaceSymbols(query: string): Promise<string> {
@@ -83,14 +116,19 @@ function resolveUri(filePath: string): vscode.Uri {
 	return vscode.Uri.file(path.join(root, filePath));
 }
 
-function flattenSymbols(symbols: vscode.DocumentSymbol[], indent = 0): string[] {
-	const lines: string[] = [];
+function collectSymbolRanges(symbols: vscode.DocumentSymbol[], depth: number): SymbolRange[] {
+	const out: SymbolRange[] = [];
 	for (const s of symbols) {
-		const pad = '  '.repeat(indent);
-		lines.push(`${pad}${vscode.SymbolKind[s.kind]} ${s.name} @${s.range.start.line + 1}`);
+		out.push({
+			name: s.name,
+			kind: vscode.SymbolKind[s.kind] ?? String(s.kind),
+			startLine: s.range.start.line + 1,
+			endLine: s.range.end.line + 1,
+			depth,
+		});
 		if (s.children?.length) {
-			lines.push(...flattenSymbols(s.children, indent + 1));
+			out.push(...collectSymbolRanges(s.children, depth + 1));
 		}
 	}
-	return lines;
+	return out;
 }

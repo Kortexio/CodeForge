@@ -46,13 +46,13 @@ Classes:
 |---|---|---|
 | Re-read refusal ("already read") | replace | done — `readMemory.ts`: returns the remembered content with a marker |
 | Retrieve-repeat refusal | remove | done |
-| `list` quota / anti-explore / exploreBudget | replace | done — per-phase toolsets (`toolsets.ts`) |
+| `list` quota / anti-explore / exploreBudget | remove | done — full tool surface for all models (`toolsets.ts`); status questions still limited to `update_status` |
 | VERIFY / CONTINUE nudges, `evaluateProgress`, replan | replace | done — the oracle decides when it is done (`oracle.ts`), `blocked:` is a legitimate exit |
 | "N writes without build" (text) | replace | done — the oracle runs automatically after the batch |
-| "mass rewrite" (text) | replace | done — gate: partial write on a file > 60 lines → `edit` |
-| BUILD-FIX MODE (text) | replace | done — `fix` phase + gate on reads outside the files with errors |
+| "mass rewrite" (text) | replace | done — gate: partial write on a file > 60 lines → `edit` (when small-model harness is **on**) |
+| BUILD-FIX MODE (text) | replace | done — gate on reads outside the files with errors (when harness is **on**) |
 | Command circuit breaker | replace | done — only refuses the same failed command when no files changed |
-| EXTENDED MEMORY in every packet | replace | done — the lesson is only attached to the output of the failed command |
+| EXTENDED MEMORY in every packet | replace | done — a lesson is recorded from the failure text (no fixed tag list) and attached to that command; later turns include it only when the task matches |
 | Shell `### ADVICE` | remove | done — neutral line with cwd/command |
 | "Green" claim without verification | keep | `nudges.ts` + oracle; the bench measures `falseDone` |
 | Stable facts cleared by any `exit 0` | remove | done — only build/test clear `openErrors` |
@@ -66,6 +66,10 @@ Classes:
 | Tools outside Plan mode sent to the model | remove | done — in Plan mode only the allowed tools are sent |
 | One-shot review in a single loop | replace | done — `reviewPipeline.ts`: signals → sub-run per file → evidence check → `BUGS.md` |
 | Extended memory lessons in every packet | remove | done (see above) |
+| Index embeddings as fixed 800-char prefixes (manual command only) | replace | done — symbol/blank-line chunker, incremental hash, vectors.f32, auto watcher (`semanticIndex`) |
+| Retrieve without rerank / mid-text context truncation | replace | done — LLM rerank + `ContextSource.items` (drop whole hits/lessons); status `noTruncate` |
+| Compact erases what was already read | replace | done — `FILES ALREADY READ` ledger in mid/hard compact |
+| Explore via many serial list/read steps | replace | done — packet retrieve + optional explore subagent (`exploreSubagent`) |
 
 ## Modules
 
@@ -76,10 +80,22 @@ Classes:
 | `nudges.ts` | claims (green / blocked) and every text the loop injects |
 | `editTool.ts` | `edit` with useful errors |
 | `oracle.ts` | build/test detection and parsing |
-| `toolsets.ts` | phases, tools per phase, `dotnet` tool |
+| `toolsets.ts` | phase labels (telemetry), `dotnet` tool, status-question tool filter |
 | `orchestrator.ts` / `orchestratorRun.ts` | card plan and per-item execution |
 | `reviewCore.ts` / `reviewPipeline.ts` | bug-hunting pipeline |
+| `chunker.ts` / `workspaceIndex.ts` / `rerank.ts` / `indexWatcher.ts` | hybrid retrieve index |
+| `toolHistory.ts` | soft/mid compact + read ledger |
+| `exploreMode.ts` | optional read-only explore subagent |
 
 ## Pending
 
 No pending "replace" items. Model validation (bench CS1–CS6, T1–T4) runs in the IDE.
+
+## Baseline (traces, `--since 2026-09-20`)
+
+Captured by `scripts/traceStats.mjs` before this work:
+
+- tools/step ≈ 1.29; explore share ≈ 0.66; read+list/run ≈ 17.1; retrieve/run ≈ 0.39
+- median steps before first write ≈ 9
+
+Success target after shipping: read+list/run −30%, median steps-to-write ≤ 4, retrieve share up.

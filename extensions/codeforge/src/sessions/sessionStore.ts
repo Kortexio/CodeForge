@@ -28,6 +28,8 @@ export interface ToolTraceEntry {
 	error?: string;
 	durationMs: number;
 	timestamp: string;
+	/** Index of the user message this tool call belongs to (0-based among user turns). */
+	turn?: number;
 }
 
 export interface SessionCheckpoint {
@@ -246,6 +248,30 @@ export class SessionStore {
 		session.state = state;
 		session.updatedAt = new Date().toISOString();
 		await this.persist(all);
+	}
+
+	/**
+	 * Drop messages from `messageIndex` onward and tool traces for turns at/after
+	 * the user-turn count at that index. Used by Restore checkpoint.
+	 */
+	async truncateFrom(id: string, messageIndex: number): Promise<ChatSession | undefined> {
+		await this.ensureReady();
+		const all = this.list();
+		const idx = all.findIndex(s => s.id === id);
+		if (idx < 0) return undefined;
+		const session = all[idx];
+		if (messageIndex < 0 || messageIndex >= session.messages.length) return session;
+		const kept = session.messages.slice(0, messageIndex);
+		const userTurnsKept = kept.filter(m => m.role === 'user').length;
+		session.messages = kept;
+		session.toolTraces = (session.toolTraces ?? []).filter(
+			t => t.turn === undefined || t.turn < userTurnsKept
+		);
+		session.updatedAt = new Date().toISOString();
+		all.splice(idx, 1);
+		all.unshift(session);
+		await this.persist(all);
+		return session;
 	}
 
 	async remove(id: string): Promise<void> {

@@ -1,40 +1,10 @@
 /**
- * Tool surface per phase. Fewer, clearer tools per turn instead of advice text.
+ * Tool surface helpers. Phase labels remain for telemetry; the agent always
+ * gets the full tool list (except status questions and Plan mode).
  * Pure — no vscode.
  */
 
 export type AgentPhase = 'explore' | 'implement' | 'fix' | 'review';
-
-/** Standing status is written every turn, including questions that do not match a phase. */
-const ALWAYS_TOOLS = ['update_status'];
-
-const READONLY = [
-	'read',
-	'retrieve',
-	'list',
-	'search',
-	'symbols',
-	'definition',
-	'references',
-	'diagnostics',
-];
-
-const PHASE_TOOLS: Record<AgentPhase, string[]> = {
-	explore: ['read', 'retrieve', 'list', 'search', 'symbols', 'definition', 'references'],
-	implement: ['edit', 'write', 'dotnet', 'shell', 'read', 'retrieve', 'list', 'search', 'symbols', 'diagnostics', 'delete', 'rename'],
-	fix: ['read', 'edit', 'write', 'dotnet', 'shell', 'diagnostics', 'search', 'symbols', 'definition', 'references'],
-	// Review may write its report (BUGS.md); everything else is readonly.
-	review: [...READONLY, 'write'],
-};
-
-const EXTRA_GROUPS: Array<{ tools: string[]; when: RegExp }> = [
-	{ tools: ['git_status', 'git_diff', 'git_log', 'git_commit_msg', 'git_blame', 'git_conflicts'], when: /\bgit\b|commit|diff\b|branch|blame|merge|conflit|conflict/i },
-	{ tools: ['browser_navigate', 'browser_snapshot', 'browser_click', 'browser_type', 'browser_screenshot'], when: /browser|navegador|https?:\/\/|localhost:\d+|screenshot|p[áa]gina web|web page|\bui\b visual/i },
-	{ tools: ['wiki_read', 'wiki_write', 'wiki_search', 'wiki_fact', 'wiki_facts'], when: /\bwiki\b|mem[óo]ria|memory|\bfacts?\b|task-plan/i },
-	{ tools: ['delegate_task'], when: /delegat|subagent|sub-agente|paralel/i },
-	{ tools: ['mcp_call'], when: /\bmcp\b/i },
-	{ tools: ['open'], when: /\babr[ea]\b|\bopen\b.*\beditor\b/i },
-];
 
 /** A question about where the work stopped. Not a request to continue or change code. */
 export function isStatusQuestion(task: string): boolean {
@@ -47,7 +17,7 @@ export function isStatusQuestion(task: string): boolean {
 }
 
 const CODING_TASK =
-	/\b(create|implement|add|fix|write|build|make|change|update|refactor|migrate|gerar|criar|cria|implementar|implementa|corrigir|corrige|adicionar|adiciona|alterar|altera|refatorar|desenvolv\w*|executar|executa)\b/i;
+	/\b(create|implement|add|fix|write|build|make|change|update|refactor|migrate|gerar|criar|cria|escrev\w*|implementar|implementa|corrigir|corrige|adicionar|adiciona|alterar|altera|refatorar|desenvolv\w*|executar|executa|continu[ae]r?|continue)\b/i;
 const REVIEW_TASK =
 	/\b(review|revis\w*|audit\w*|find (the )?bugs?|encontr\w* (os )?(bugs?|erros?)|procur\w* (bugs?|erros?)|analis\w*|analy[sz]\w*|code review|bugs?\.md)\b/i;
 
@@ -59,7 +29,7 @@ export function isReviewTask(task: string): boolean {
 	return REVIEW_TASK.test(task) && !/\b(fix|corrig\w*|implement\w*)\b/i.test(task);
 }
 
-/** Phase for this turn (weak profile only; strong models keep the full surface). */
+/** Phase label for this turn (telemetry / activity feed only). */
 export function currentPhase(task: string, state: { buildRed: boolean }): AgentPhase {
 	if (isReviewTask(task)) return 'review';
 	if (state.buildRed) return 'fix';
@@ -67,21 +37,20 @@ export function currentPhase(task: string, state: { buildRed: boolean }): AgentP
 	return 'explore';
 }
 
-/** Tool names for this turn. Extra groups only when the task asks for them. */
+/**
+ * Tool names for this turn.
+ * Full surface for every model; only status questions (and Plan mode via caller) restrict tools.
+ */
 export function toolNamesFor(
-	phase: AgentPhase,
+	_phase: AgentPhase,
 	task: string,
 	opts: { weakProfile: boolean; allNames: string[]; planMode?: boolean }
 ): Set<string> {
+	void opts.weakProfile;
 	if (isStatusQuestion(task)) {
 		return new Set(opts.allNames.filter(n => n === 'update_status'));
 	}
-	if (!opts.weakProfile) return new Set(opts.allNames);
-	const names = new Set([...PHASE_TOOLS[phase], ...ALWAYS_TOOLS]);
-	for (const g of EXTRA_GROUPS) {
-		if (g.when.test(task)) g.tools.forEach(t => names.add(t));
-	}
-	return new Set(opts.allNames.filter(n => names.has(n)));
+	return new Set(opts.allNames);
 }
 
 /** Existing files above this size are changed with edit, not rewritten (weak profile). */

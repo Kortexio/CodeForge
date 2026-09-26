@@ -7,13 +7,11 @@ import * as path from 'path';
 import { oracleNote, runAgentWithTools, type AgentLoopOptions } from './agentLoop';
 import { detectOracle, nodeOracleFs, runOracle } from './oracle';
 import { parseBlockedClaim } from './nudges';
-import { isCodingTask } from './toolsets';
 import {
 	findCards,
 	formatPlanReport,
 	itemPrompt,
 	loadPlan,
-	mentionsCards,
 	orderCards,
 	parsePlanJson,
 	planFromCards,
@@ -77,9 +75,8 @@ export async function runOrchestrated(
 	const root = opts.workspaceRoot;
 	if (!root) return undefined;
 	const forced = o.forced === true;
-	const auto =
-		opts.weakProfile && isCodingTask(opts.task) && (mentionsCards(opts.task) || wantsNewApp(opts.task));
-	if (!forced && !auto) return undefined;
+	// Orchestrate only when explicitly forced (slash / multi-item). No auto-trigger from model size.
+	if (!forced) return undefined;
 
 	const oracleCfg = detectOracle(root, nodeOracleFs);
 	const plan = await buildPlan(opts, root, forced, !!oracleCfg);

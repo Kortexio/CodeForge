@@ -5,7 +5,25 @@
 import { spawn, SpawnOptionsWithoutStdio } from 'child_process';
 import * as path from 'path';
 
-export type SandboxLevel = 'safe-local' | 'restricted' | 'isolated' | 'container';
+export type SandboxLevel =
+	| 'safe-local'
+	| 'restricted'
+	| 'isolated'
+	| 'container'
+	/** No env scrubbing, no blocked-command patterns. Still runs in the workspace cwd. */
+	| 'unrestricted';
+
+export const SANDBOX_LEVELS: SandboxLevel[] = [
+	'safe-local',
+	'restricted',
+	'isolated',
+	'container',
+	'unrestricted',
+];
+
+export function isSandboxLevel(value: unknown): value is SandboxLevel {
+	return typeof value === 'string' && (SANDBOX_LEVELS as string[]).includes(value);
+}
 
 export interface SandboxOptions {
 	cwd: string;
@@ -113,9 +131,29 @@ export function pickSandboxLevel(
 	return 'restricted';
 }
 
+/**
+ * Resolve the effective sandbox level from settings + optional tool hint.
+ * `fullAgentFreedom` always wins as unrestricted.
+ */
+export function resolveSandboxLevel(
+	command: string,
+	opts?: {
+		requested?: SandboxLevel;
+		risk?: 'low' | 'medium' | 'high';
+		configured?: SandboxLevel | string | null;
+		fullFreedom?: boolean;
+	}
+): SandboxLevel {
+	if (opts?.fullFreedom) return 'unrestricted';
+	const configured = isSandboxLevel(opts?.configured) ? opts!.configured : undefined;
+	// Tool hint wins over configured default (except unrestricted setting forces floor).
+	if (configured === 'unrestricted') return 'unrestricted';
+	return pickSandboxLevel(command, opts?.requested ?? configured, opts?.risk ?? 'medium');
+}
+
 export async function runSandboxed(opts: SandboxOptions): Promise<SandboxResult> {
 	const level = opts.level ?? 'restricted';
-	const blocked = isBlockedCommand(opts.command);
+	const blocked = level === 'unrestricted' ? undefined : isBlockedCommand(opts.command);
 	if (blocked && level !== 'container') {
 		return {
 			exitCode: 126,
@@ -142,7 +180,7 @@ export async function runSandboxed(opts: SandboxOptions): Promise<SandboxResult>
 	const shell = opts.shell ?? (isWin ? 'cmd.exe' : '/bin/bash');
 	const args = opts.args ?? (isWin ? ['/d', '/s', '/c', opts.command] : ['-lc', opts.command]);
 	const env =
-		level === 'safe-local'
+		level === 'safe-local' || level === 'unrestricted'
 			? { ...process.env, ...(opts.env ?? {}) }
 			: scrubEnv({ ...process.env, ...(opts.env ?? {}) });
 

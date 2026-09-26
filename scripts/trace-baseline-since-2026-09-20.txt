@@ -1,0 +1,77 @@
+{
+  "dir": "C:\\Users\\vitor\\.CodeForge\\ai\\traces",
+  "files": 89,
+  "runs": 77,
+  "steps": 1873,
+  "tools": 2412,
+  "toolsPerStep": 1.29,
+  "exploreShare": 0.66,
+  "fails": 251,
+  "failRate": 0.1,
+  "reads": 785,
+  "lists": 532,
+  "retrieves": 30,
+  "readListPerRun": 17.1,
+  "retrievePerRun": 0.39,
+  "runsWithWrite": 19,
+  "medExploreBeforeFirstWrite": 9,
+  "medStepsBeforeFirstWrite": 9,
+  "meanStepsBeforeFirstWrite": 11.16
+}
+
+# tools per llm step (histogram)
+{
+  '0': 498,
+  '1': 850,
+  '2': 342,
+  '3': 72,
+  '4': 64,
+  '5': 11,
+  '6': 16,
+  '7': 3,
+  '8': 8,
+  '9': 2,
+  '10': 1,
+  '12': 3,
+  '17': 1,
+  '21': 1,
+  '23': 1
+}
+
+# by label (top)
+[
+  [ 'read', 785 ],
+  [ 'list', 532 ],
+  [ 'shell', 391 ],
+  [ 'search', 228 ],
+  [ 'write', 156 ],
+  [ 'mcp_call', 60 ],
+  [ 'edit', 51 ],
+  [ 'delete', 46 ],
+  [ 'retrieve', 30 ],
+  [ 'wiki_read', 25 ],
+  [ 'update_status', 20 ],
+  [ 'zuora_lint_working_copy', 19 ],
+  [ 'dotnet', 13 ],
+  [ 'wiki_search', 12 ],
+  [ 'symbols', 6 ],
+  [ 'wiki_write', 5 ],
+  [ 'git_status', 5 ],
+  [ 'zuora_workflow_summary', 5 ],
+  [ 'git_log', 3 ],
+  [ 'wiki_facts', 3 ]
+]
+
+# fails by label
+{
+  shell: 148,
+  list: 20,
+  search: 10,
+  read: 15,
+  git_status: 5,
+  git_log: 2,
+  zuora_workflow_summary: 2,
+  mcp_call: 35,
+  zuora_lint_working_copy: 10,
+  edit: 4
+}

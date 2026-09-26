@@ -1,9 +1,10 @@
 /**
  * CodeForge AI Settings — Cursor-like editor panel
  *
- * Tabs: Models · MCP · Guardrails · Agent
+ * Tabs: Models · MCP · Guardrails · Agent · Plugins
  * - Models / MCP / Guardrails: catalog UIs (same surface the Settings TOC opens)
  * - Agent: codeforge.ai.* prefs (shared with Settings TOC → AI → Agent)
+ * - Plugins: marketplace (Discover / Featured) — Cursor Customize layout
  *
  * Quick model switch while coding stays on QuickPick (separate command).
  */
@@ -21,8 +22,13 @@ import {
 } from './aiSettingsStore';
 import { GovernanceStore } from '../governance/governanceStore';
 import { GovernanceKind, GovernanceItem } from '../governance/types';
+import {
+	PLUGIN_CATALOG,
+	isPluginInstalled,
+} from './pluginsCatalog';
+import { getApprovalPolicy } from '../policy/approvalPolicy';
 
-export type AiSettingsTab = 'models' | 'mcp' | 'guardrails' | 'agent';
+export type AiSettingsTab = 'models' | 'mcp' | 'guardrails' | 'agent' | 'plugins';
 
 type AgentPrefs = {
 	enabled: boolean;
@@ -32,6 +38,8 @@ type AgentPrefs = {
 	autoApprove: string[];
 	autoApproveEdits: boolean;
 	previewEdits: boolean;
+	shellSandbox: string;
+	fullAgentFreedom: boolean;
 	traceLevel: string;
 	tabCompletion: boolean;
 	agentCheckpointSteps: number;
@@ -41,14 +49,25 @@ type AgentPrefs = {
 
 function readAgentPrefs(): AgentPrefs {
 	const cfg = vscode.workspace.getConfiguration('codeforge.ai');
+	const rawMode = cfg.get<string>('mode', 'agent');
+	const mode = rawMode === 'auto' ? 'agent' : rawMode;
+	const shellSandbox = cfg.get<string>('shellSandbox', 'restricted');
 	return {
 		enabled: cfg.get<boolean>('enabled', true),
-		mode: cfg.get<string>('mode', 'agent'),
-		weakModelMode: cfg.get<string>('weakModelMode', 'auto'),
+		mode,
+		weakModelMode: cfg.get<string>('weakModelMode', 'off'),
 		collapseToolCards: cfg.get<boolean>('collapseToolCards', true),
 		autoApprove: cfg.get<string[]>('autoApprove', []),
 		autoApproveEdits: cfg.get<boolean>('autoApproveEdits', false),
 		previewEdits: cfg.get<boolean>('previewEdits', false),
+		shellSandbox:
+			shellSandbox === 'safe-local' ||
+			shellSandbox === 'isolated' ||
+			shellSandbox === 'container' ||
+			shellSandbox === 'unrestricted'
+				? shellSandbox
+				: 'restricted',
+		fullAgentFreedom: cfg.get<boolean>('fullAgentFreedom', false),
 		traceLevel: cfg.get<string>('traceLevel', 'basic'),
 		tabCompletion: cfg.get<boolean>('tabCompletion', true),
 		agentCheckpointSteps: cfg.get<number>('agentCheckpointSteps', 30),
@@ -145,19 +164,38 @@ export class AiSettingsPanel {
 			case 'updateAgentPrefs': {
 				const prefs = msg.prefs as Partial<AgentPrefs>;
 				const cfg = vscode.workspace.getConfiguration('codeforge.ai');
+				let next = { ...prefs };
+				if (next.fullAgentFreedom === true) {
+					next = {
+						...next,
+						shellSandbox: 'unrestricted',
+						autoApproveEdits: true,
+						previewEdits: false,
+						autoApprove: Array.from(
+							new Set([...(next.autoApprove ?? cfg.get<string[]>('autoApprove') ?? []), 'shell', 'write', 'edit', 'delete', 'rename'])
+						),
+					};
+					try {
+						await getApprovalPolicy().allowAutoSession();
+					} catch {
+						/* policy may not be ready in settings-only path */
+					}
+				}
 				const entries: Array<[keyof AgentPrefs, unknown]> = [
-					['enabled', prefs.enabled],
-					['mode', prefs.mode],
-					['weakModelMode', prefs.weakModelMode],
-					['collapseToolCards', prefs.collapseToolCards],
-					['autoApprove', prefs.autoApprove],
-					['autoApproveEdits', prefs.autoApproveEdits],
-					['previewEdits', prefs.previewEdits],
-					['traceLevel', prefs.traceLevel],
-					['tabCompletion', prefs.tabCompletion],
-					['agentCheckpointSteps', prefs.agentCheckpointSteps],
-					['agentHardCap', prefs.agentHardCap],
-					['contextBudget', prefs.contextBudget],
+					['enabled', next.enabled],
+					['mode', next.mode],
+					['weakModelMode', next.weakModelMode],
+					['collapseToolCards', next.collapseToolCards],
+					['autoApprove', next.autoApprove],
+					['autoApproveEdits', next.autoApproveEdits],
+					['previewEdits', next.previewEdits],
+					['shellSandbox', next.shellSandbox],
+					['fullAgentFreedom', next.fullAgentFreedom],
+					['traceLevel', next.traceLevel],
+					['tabCompletion', next.tabCompletion],
+					['agentCheckpointSteps', next.agentCheckpointSteps],
+					['agentHardCap', next.agentHardCap],
+					['contextBudget', next.contextBudget],
 				];
 				for (const [key, value] of entries) {
 					if (value !== undefined) {
@@ -244,6 +282,130 @@ export class AiSettingsPanel {
 			case 'addMcp': {
 				state.mcpServers.push(this.store.createMcpDraft());
 				await this.store.save(state);
+				return;
+			}
+
+			case 'addAtlassianMcp': {
+				const { added, server } = await this.store.ensureAtlassianMcp();
+				await vscode.commands.executeCommand('codeforge.refreshMcp');
+				if (added) {
+					vscode.window.showInformationMessage(
+						`Added Atlassian MCP (${server.name}). Complete OAuth in the browser if prompted, then use the agent with Jira/Confluence.`
+					);
+				} else {
+					vscode.window.showInformationMessage(
+						`Atlassian MCP already configured (${server.name}).`
+					);
+				}
+				return;
+			}
+
+			case 'addAzureMcp': {
+				const { added, server } = await this.store.ensureAzureMcp();
+				await vscode.commands.executeCommand('codeforge.refreshMcp');
+				if (added) {
+					vscode.window.showInformationMessage(
+						`Added Azure MCP (${server.name}). Sign in with "az login" if needed, then ask the agent about your Azure resources.`
+					);
+				} else {
+					vscode.window.showInformationMessage(
+						`Azure MCP already configured (${server.name}).`
+					);
+				}
+				return;
+			}
+
+			case 'addGithubMcp': {
+				const { added, server } = await this.store.ensureGithubMcp();
+				await vscode.commands.executeCommand('codeforge.refreshMcp');
+				if (added) {
+					vscode.window.showInformationMessage(
+						`Added GitHub MCP (${server.name}). Paste a GitHub PAT in the MCP API key field, Save, then Refresh MCP.`
+					);
+					this.selectTab('mcp');
+				} else {
+					vscode.window.showInformationMessage(
+						`GitHub MCP already configured (${server.name}).`
+					);
+				}
+				return;
+			}
+
+			case 'addAzureDevOpsMcp': {
+				const { added, server, cancelled } = await this.store.ensureAzureDevOpsMcp();
+				if (cancelled) return;
+				await vscode.commands.executeCommand('codeforge.refreshMcp');
+				if (added) {
+					vscode.window.showInformationMessage(
+						`Added Azure DevOps MCP (${server.name}). Sign in with az login / Entra if prompted, then Refresh MCP.`
+					);
+					this.selectTab('mcp');
+				} else {
+					vscode.window.showInformationMessage(
+						`Azure DevOps MCP already configured (${server.name}).`
+					);
+				}
+				return;
+			}
+
+			case 'installPlugin': {
+				const pluginId = String(msg.pluginId ?? '');
+				const plugin = PLUGIN_CATALOG.find(p => p.id === pluginId);
+				if (!plugin) return;
+				if (plugin.installAction === 'atlassian') {
+					await this.onMessage({ type: 'addAtlassianMcp' });
+					return;
+				}
+				if (plugin.installAction === 'azure') {
+					await this.onMessage({ type: 'addAzureMcp' });
+					return;
+				}
+				if (plugin.installAction === 'github') {
+					await this.onMessage({ type: 'addGithubMcp' });
+					return;
+				}
+				if (plugin.installAction === 'azure-devops') {
+					await this.onMessage({ type: 'addAzureDevOpsMcp' });
+					return;
+				}
+				if (plugin.installAction === 'mcp-preset' && plugin.mcpPreset) {
+					const preset = plugin.mcpPreset;
+					const already = isPluginInstalled(plugin, state.mcpServers);
+					if (already) {
+						vscode.window.showInformationMessage(`${plugin.name} is already installed.`);
+						this.selectTab('mcp');
+						return;
+					}
+					const transport = preset.transport ?? (preset.url ? 'http' : 'stdio');
+					const server: McpServerConfig = {
+						id: preset.id,
+						name: preset.name,
+						transport,
+						command: preset.command ?? '',
+						args: [...(preset.args ?? [])],
+						url: preset.url ?? '',
+						apiKey: '',
+						env: undefined,
+						enabled: true,
+					};
+					state.mcpServers.push(server);
+					await this.store.save(state);
+					await vscode.commands.executeCommand('codeforge.refreshMcp');
+					vscode.window.showInformationMessage(
+						preset.hint
+							? `Added ${plugin.name}. ${preset.hint}`
+							: `Added ${plugin.name}. Configure in MCP if needed, then Refresh MCP.`
+					);
+					this.selectTab('mcp');
+					return;
+				}
+				if (plugin.kind === 'skill' || plugin.installAction === 'none') {
+					vscode.window.showInformationMessage(
+						`${plugin.name} ships with CodeForge — open Guardrails → Skills to review.`
+					);
+					this.selectTab('guardrails');
+					return;
+				}
 				return;
 			}
 
@@ -456,6 +618,104 @@ export class AiSettingsPanel {
   .subtabs button.active { background: var(--btn); color: var(--btn-fg); border-color: transparent; }
   .params { display: grid; gap: 6px; }
   .params .param-row { display: grid; grid-template-columns: 1fr 120px; gap: 8px; align-items: center; }
+
+  /* —— Plugins (Cursor Customize layout) —— */
+  .main.plugins-wide { max-width: 1100px; }
+  .plugins-search-row {
+    display: flex; gap: 10px; align-items: center; margin-bottom: 14px;
+  }
+  .plugins-search {
+    flex: 1; display: flex; align-items: center; gap: 8px;
+    border: 1px solid var(--input-border); background: var(--input);
+    border-radius: 999px; padding: 8px 14px;
+  }
+  .plugins-search svg { flex-shrink: 0; opacity: 0.55; }
+  .plugins-search input {
+    border: 0; background: transparent; outline: none; padding: 0;
+    flex: 1; font: inherit; color: var(--input-fg);
+  }
+  .plugins-manage {
+    border: 0; border-radius: 999px; padding: 8px 16px; font: inherit; cursor: pointer;
+    background: var(--fg); color: var(--bg); white-space: nowrap; font-weight: 500;
+  }
+  .plugins-filters {
+    display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 22px; align-items: center;
+  }
+  .plugins-filters button {
+    border: 0; background: transparent; color: var(--muted);
+    border-radius: 999px; padding: 6px 12px; cursor: pointer; font: inherit;
+  }
+  .plugins-filters button.active {
+    background: color-mix(in srgb, var(--fg) 10%, transparent);
+    color: var(--fg); font-weight: 500;
+  }
+  .plugins-filters .add-mkt {
+    color: var(--muted); border: 1px dashed var(--border);
+  }
+  .plugins-section { margin-bottom: 28px; }
+  .plugins-section h2 {
+    margin: 0 0 12px; font-size: 0.95rem; font-weight: 600;
+  }
+  .discover-row {
+    display: flex; gap: 12px; overflow-x: auto; padding-bottom: 4px;
+    scroll-snap-type: x mandatory;
+  }
+  .discover-card {
+    flex: 0 0 220px; scroll-snap-align: start;
+    border: 1px solid var(--border); border-radius: 12px;
+    padding: 16px; background: color-mix(in srgb, var(--fg) 3%, transparent);
+    cursor: pointer; display: flex; flex-direction: column; gap: 10px;
+    min-height: 160px; transition: border-color 0.12s ease;
+  }
+  .discover-card:hover { border-color: var(--focus); }
+  .plugin-icon {
+    width: 40px; height: 40px; border-radius: 10px;
+    display: flex; align-items: center; justify-content: center;
+    font-weight: 700; font-size: 13px; color: #fff; letter-spacing: 0.02em;
+  }
+  .plugin-icon.sm { width: 32px; height: 32px; border-radius: 8px; font-size: 11px; }
+  .discover-card .d-name { font-weight: 600; font-size: 0.95rem; }
+  .discover-card .d-desc {
+    color: var(--muted); font-size: 0.85em; line-height: 1.35;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+    flex: 1;
+  }
+  .discover-card .d-pub { color: var(--muted); font-size: 0.75em; }
+  .plugin-grid {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 4px 24px;
+  }
+  @media (max-width: 720px) {
+    .plugin-grid { grid-template-columns: 1fr; }
+  }
+  .plugin-row {
+    display: grid; grid-template-columns: 36px 1fr auto; gap: 12px;
+    align-items: center; padding: 10px 4px; border-radius: 8px;
+  }
+  .plugin-row:hover { background: var(--list-hover); }
+  .plugin-row .p-meta { min-width: 0; }
+  .plugin-row .p-name { font-weight: 600; font-size: 0.92rem; }
+  .plugin-row .p-desc {
+    color: var(--muted); font-size: 0.82em; line-height: 1.35;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .plugin-row .p-add, .plugin-row .p-installed {
+    border: 0; border-radius: 8px; padding: 6px 14px; font: inherit; cursor: pointer;
+    background: color-mix(in srgb, var(--fg) 8%, transparent); color: var(--fg);
+    white-space: nowrap;
+  }
+  .plugin-row .p-installed {
+    opacity: 0.7; cursor: default;
+  }
+  .plugin-row .p-add:hover { background: color-mix(in srgb, var(--fg) 14%, transparent); }
+  .show-more {
+    margin-top: 8px; background: none; border: 0; color: var(--muted);
+    cursor: pointer; font: inherit; padding: 4px 0;
+  }
+  .show-more:hover { color: var(--fg); }
+  .plugins-empty {
+    border: 1px dashed var(--border); border-radius: var(--radius);
+    padding: 28px; text-align: center; color: var(--muted);
+  }
 </style>
 </head>
 <body data-initial-tab="${initialTab}">
@@ -466,8 +726,9 @@ export class AiSettingsPanel {
     <button class="${tabActive('mcp')}" data-tab="mcp">MCP</button>
     <button class="${tabActive('guardrails')}" data-tab="guardrails">Guardrails</button>
     <button class="${tabActive('agent')}" data-tab="agent">Agent</button>
+    <button class="${tabActive('plugins')}" data-tab="plugins">Plugins</button>
   </aside>
-  <main class="main">
+  <main class="main${initialTab === 'plugins' ? ' plugins-wide' : ''}" id="settingsMain">
     <section id="tab-models" class="split ${tabActive('models')}">
       <h1>Models</h1>
       <p class="subtitle">Add API or local servers, manage their models, and choose what’s active. While coding, use the model QuickPick to switch quickly.</p>
@@ -484,9 +745,10 @@ export class AiSettingsPanel {
 
     <section id="tab-mcp" class="split ${tabActive('mcp')}">
       <h1>MCP</h1>
-      <p class="subtitle">Model Context Protocol servers give the agent extra tools (docs, browsers, databases…).</p>
+      <p class="subtitle">Configured Model Context Protocol servers. Discover one-click presets in <strong>Plugins</strong>; edit transports, env, and keys here.</p>
       <div class="toolbar">
         <button class="primary" id="addMcp">Add MCP server</button>
+        <button class="secondary" id="gotoPluginsFromMcp">Browse Plugins</button>
       </div>
       <div id="mcpList"></div>
       <div class="empty" id="mcpEmpty">No MCP servers configured.</div>
@@ -518,14 +780,12 @@ export class AiSettingsPanel {
             <option value="ask">ask</option>
             <option value="plan">plan</option>
             <option value="agent">agent</option>
-            <option value="auto">auto</option>
           </select>
         </div>
-        <div class="row"><label>Weak model mode</label>
+        <div class="row"><label>Small-model harness</label>
           <select id="agentWeakMode">
-            <option value="auto">auto</option>
-            <option value="force">force</option>
-            <option value="off">off</option>
+            <option value="off">off (full tools)</option>
+            <option value="on">on (phase filter + tighter guards)</option>
           </select>
         </div>
         <div class="row"><label><input type="checkbox" id="agentCollapse" /> Collapse completed tool cards</label></div>
@@ -542,6 +802,19 @@ export class AiSettingsPanel {
         <div class="row"><label>Auto-approve tools (comma-separated)</label><input type="text" id="agentAutoApprove" placeholder="read, list, grep" /></div>
         <div class="row"><label><input type="checkbox" id="agentAutoApproveEdits" /> Auto-approve file edits</label></div>
         <div class="row"><label><input type="checkbox" id="agentPreviewEdits" /> Preview edits before write</label></div>
+        <h2>Shell sandbox</h2>
+        <p class="subtitle" style="margin-top:0">Controls how agent shell commands run. Does not replace the chat Allow all chip for approvals.</p>
+        <div class="row"><label>Default sandbox</label>
+          <select id="agentShellSandbox">
+            <option value="restricted">restricted (scrub secrets, block dangerous cmds)</option>
+            <option value="safe-local">safe-local (known-safe commands only)</option>
+            <option value="isolated">isolated (stronger isolation when available)</option>
+            <option value="container">container (Docker)</option>
+            <option value="unrestricted">unrestricted (full env, no blocked patterns)</option>
+          </select>
+        </div>
+        <div class="row"><label><input type="checkbox" id="agentFullFreedom" /> Full agent freedom</label></div>
+        <p class="subtitle" style="margin-top:0">Enables unrestricted sandbox, auto-approves edits + shell, and disables edit preview. Use only on trusted machines.</p>
         <h2>Context &amp; Completion</h2>
         <div class="row"><label>Context budget (fallback tokens)</label>
           <select id="agentContextBudget">
@@ -557,15 +830,39 @@ export class AiSettingsPanel {
         </div>
       </div></div>
     </section>
+
+    <section id="tab-plugins" class="split ${tabActive('plugins')}">
+      <div class="plugins-search-row">
+        <div class="plugins-search">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+            <circle cx="7" cy="7" r="5.5" stroke="currentColor"/>
+            <path d="M11 11l3.5 3.5" stroke="currentColor" stroke-linecap="round"/>
+          </svg>
+          <input type="search" id="pluginsSearch" placeholder="Search Plugins, Skills, MCPs..." autocomplete="off" />
+        </div>
+        <button type="button" class="plugins-manage" id="pluginsManage">Manage</button>
+      </div>
+      <div class="plugins-filters" id="pluginsFilters">
+        <button type="button" class="active" data-filter="all">All</button>
+        <button type="button" data-filter="codeforge">CodeForge Marketplace</button>
+        <button type="button" data-filter="installed">Installed</button>
+        <button type="button" class="add-mkt" data-filter="personal" title="Personal / custom MCPs live under MCP">Personal</button>
+      </div>
+      <div id="pluginsBody"></div>
+    </section>
   </main>
 </div>
 <script>
   const vscode = acquireVsCodeApi();
+  const PLUGIN_CATALOG = ${JSON.stringify(PLUGIN_CATALOG)};
   let state = { servers: [], activeServerId: null, activeModel: null, mcpServers: [] };
   let governance = { skills: [], rules: [], policies: [], guardrails: [] };
   let agent = {};
   let govKind = 'skills';
   let agentDirty = false;
+  let pluginsFilter = 'all';
+  let pluginsQuery = '';
+  let pluginsExpanded = { featured: false, productivity: false, infrastructure: false, skills: false };
 
   function selectTab(tab) {
     const btn = document.querySelector('.nav button[data-tab="' + tab + '"]');
@@ -575,6 +872,9 @@ export class AiSettingsPanel {
     document.querySelectorAll('.split').forEach(s => s.classList.remove('active'));
     const section = document.getElementById('tab-' + tab);
     if (section) section.classList.add('active');
+    const main = document.getElementById('settingsMain');
+    if (main) main.classList.toggle('plugins-wide', tab === 'plugins');
+    if (tab === 'plugins') renderPlugins();
   }
 
   document.querySelectorAll('.nav button').forEach(btn => {
@@ -597,6 +897,20 @@ export class AiSettingsPanel {
   document.getElementById('addMcp').addEventListener('click', () => {
     vscode.postMessage({ type: 'addMcp' });
   });
+  document.getElementById('gotoPluginsFromMcp').addEventListener('click', () => selectTab('plugins'));
+  document.getElementById('pluginsManage').addEventListener('click', () => selectTab('mcp'));
+  document.getElementById('pluginsSearch').addEventListener('input', (e) => {
+    pluginsQuery = (e.target.value || '').trim().toLowerCase();
+    renderPlugins();
+  });
+  document.querySelectorAll('#pluginsFilters button').forEach(btn => {
+    btn.addEventListener('click', () => {
+      pluginsFilter = btn.dataset.filter || 'all';
+      document.querySelectorAll('#pluginsFilters button').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      renderPlugins();
+    });
+  });
 
   document.getElementById('govAdd').addEventListener('click', () => {
     const kind = govKind === 'skills' ? 'skill' : govKind === 'rules' ? 'rule' : govKind === 'policies' ? 'policy' : 'guardrail';
@@ -604,12 +918,30 @@ export class AiSettingsPanel {
   });
 
   function markAgentDirty() { agentDirty = true; }
-  ['agentEnabled','agentMode','agentWeakMode','agentCollapse','agentTrace','agentCheckpoint','agentHardCap','agentAutoApprove','agentAutoApproveEdits','agentPreviewEdits','agentContextBudget','agentTabCompletion']
+  ['agentEnabled','agentMode','agentWeakMode','agentCollapse','agentTrace','agentCheckpoint','agentHardCap','agentAutoApprove','agentAutoApproveEdits','agentPreviewEdits','agentShellSandbox','agentFullFreedom','agentContextBudget','agentTabCompletion']
     .forEach(id => {
       const el = document.getElementById(id);
       if (el) el.addEventListener('change', markAgentDirty);
       if (el && el.tagName === 'INPUT' && el.type === 'text') el.addEventListener('input', markAgentDirty);
     });
+
+  document.getElementById('agentFullFreedom')?.addEventListener('change', () => {
+    const on = document.getElementById('agentFullFreedom').checked;
+    if (on) {
+      document.getElementById('agentShellSandbox').value = 'unrestricted';
+      document.getElementById('agentAutoApproveEdits').checked = true;
+      document.getElementById('agentPreviewEdits').checked = false;
+      const list = document.getElementById('agentAutoApprove').value
+        .split(',')
+        .map(s => s.trim())
+        .filter(Boolean);
+      for (const t of ['shell', 'write', 'edit', 'delete', 'rename']) {
+        if (!list.includes(t)) list.push(t);
+      }
+      document.getElementById('agentAutoApprove').value = list.join(', ');
+    }
+    markAgentDirty();
+  });
 
   document.getElementById('agentSave').addEventListener('click', () => {
     const autoApprove = document.getElementById('agentAutoApprove').value
@@ -626,6 +958,8 @@ export class AiSettingsPanel {
         autoApprove,
         autoApproveEdits: document.getElementById('agentAutoApproveEdits').checked,
         previewEdits: document.getElementById('agentPreviewEdits').checked,
+        shellSandbox: document.getElementById('agentShellSandbox').value,
+        fullAgentFreedom: document.getElementById('agentFullFreedom').checked,
         traceLevel: document.getElementById('agentTrace').value,
         tabCompletion: document.getElementById('agentTabCompletion').checked,
         agentCheckpointSteps: Number(document.getElementById('agentCheckpoint').value),
@@ -639,8 +973,9 @@ export class AiSettingsPanel {
   function renderAgent() {
     if (agentDirty || !agent) return;
     document.getElementById('agentEnabled').checked = !!agent.enabled;
-    document.getElementById('agentMode').value = agent.mode || 'agent';
-    document.getElementById('agentWeakMode').value = agent.weakModelMode || 'auto';
+    document.getElementById('agentMode').value = (agent.mode === 'ask' || agent.mode === 'plan') ? agent.mode : 'agent';
+    const weakMode = agent.weakModelMode === 'on' || agent.weakModelMode === 'force' ? 'on' : 'off';
+    document.getElementById('agentWeakMode').value = weakMode;
     document.getElementById('agentCollapse').checked = !!agent.collapseToolCards;
     document.getElementById('agentTrace').value = agent.traceLevel || 'basic';
     document.getElementById('agentCheckpoint').value = agent.agentCheckpointSteps ?? 30;
@@ -648,8 +983,174 @@ export class AiSettingsPanel {
     document.getElementById('agentAutoApprove').value = (agent.autoApprove || []).join(', ');
     document.getElementById('agentAutoApproveEdits').checked = !!agent.autoApproveEdits;
     document.getElementById('agentPreviewEdits').checked = !!agent.previewEdits;
+    document.getElementById('agentShellSandbox').value = agent.shellSandbox || 'restricted';
+    document.getElementById('agentFullFreedom').checked = !!agent.fullAgentFreedom;
     document.getElementById('agentContextBudget').value = String(agent.contextBudget ?? 32768);
     document.getElementById('agentTabCompletion').checked = !!agent.tabCompletion;
+  }
+
+  function pluginInstalled(plugin) {
+    if (plugin.kind !== 'mcp' || !plugin.matchMcp) return false;
+    const mcpServers = state.mcpServers || [];
+    const ids = plugin.matchMcp.ids || [];
+    const nameRx = plugin.matchMcp.nameRe ? new RegExp(plugin.matchMcp.nameRe, 'i') : null;
+    const argsRx = plugin.matchMcp.argsRe ? new RegExp(plugin.matchMcp.argsRe, 'i') : null;
+    const urlRx = plugin.matchMcp.urlRe ? new RegExp(plugin.matchMcp.urlRe, 'i') : null;
+    return mcpServers.some(s => {
+      if (ids.includes(s.id)) return true;
+      if (nameRx && nameRx.test((s.name || '').trim())) return true;
+      if (argsRx && (s.args || []).some(a => argsRx.test(a))) return true;
+      if (urlRx && s.url && urlRx.test(s.url)) return true;
+      return false;
+    });
+  }
+
+  function filterPlugins(list) {
+    return list.filter(p => {
+      if (pluginsQuery) {
+        const hay = (p.name + ' ' + p.description + ' ' + p.kind + ' ' + p.section).toLowerCase();
+        if (!hay.includes(pluginsQuery)) return false;
+      }
+      if (pluginsFilter === 'codeforge' && p.marketplace !== 'codeforge') return false;
+      if (pluginsFilter === 'personal') return false;
+      if (pluginsFilter === 'installed' && !pluginInstalled(p)) return false;
+      return true;
+    });
+  }
+
+  function esc(s) {
+    return String(s)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
+  function pluginIcon(p, sm) {
+    return '<div class="plugin-icon' + (sm ? ' sm' : '') + '" style="background:' + esc(p.iconColor) + '">' + esc(p.iconLabel) + '</div>';
+  }
+
+  function pluginRowHtml(p) {
+    const installed = pluginInstalled(p);
+    const btn = installed
+      ? '<button type="button" class="p-installed" disabled>Installed</button>'
+      : (p.installAction === 'none'
+        ? '<button type="button" class="p-add" data-install="' + esc(p.id) + '">View</button>'
+        : '<button type="button" class="p-add" data-install="' + esc(p.id) + '">Add</button>');
+    return '<div class="plugin-row">' +
+      pluginIcon(p, true) +
+      '<div class="p-meta"><div class="p-name">' + esc(p.name) + '</div>' +
+      '<div class="p-desc">' + esc(p.description) + '</div></div>' +
+      btn +
+      '</div>';
+  }
+
+  function sectionGrid(title, items, expandKey, limit) {
+    if (!items.length) return '';
+    const expanded = !!pluginsExpanded[expandKey];
+    const shown = expanded || !limit ? items : items.slice(0, limit);
+    const more = items.length - shown.length;
+    let html = '<div class="plugins-section"><h2>' + esc(title) + '</h2><div class="plugin-grid">';
+    shown.forEach(p => { html += pluginRowHtml(p); });
+    html += '</div>';
+    if (more > 0) {
+      html += '<button type="button" class="show-more" data-expand="' + esc(expandKey) + '">Show ' + more + ' more</button>';
+    }
+    html += '</div>';
+    return html;
+  }
+
+  function renderPlugins() {
+    const body = document.getElementById('pluginsBody');
+    if (!body) return;
+
+    if (pluginsFilter === 'personal') {
+      const personal = (state.mcpServers || []).filter(s => !PLUGIN_CATALOG.some(p => isPluginInstalledAgainst(p, s)));
+      if (!personal.length) {
+        body.innerHTML = '<div class="plugins-empty">No personal MCPs yet. Add a custom server under <strong>Manage</strong>, or pick a marketplace preset above.</div>';
+        return;
+      }
+      let html = '<div class="plugins-section"><h2>Personal</h2><div class="plugin-grid">';
+      personal.forEach(s => {
+        html += '<div class="plugin-row">' +
+          '<div class="plugin-icon sm" style="background:#6B7280">MCP</div>' +
+          '<div class="p-meta"><div class="p-name">' + esc(s.name) + '</div>' +
+          '<div class="p-desc">' + esc((s.command || s.url || 'Custom MCP') + '') + '</div></div>' +
+          '<button type="button" class="p-installed" disabled>Installed</button></div>';
+      });
+      html += '</div></div>';
+      body.innerHTML = html;
+      return;
+    }
+
+    const all = filterPlugins(PLUGIN_CATALOG);
+    if (!all.length) {
+      body.innerHTML = '<div class="plugins-empty">No plugins match your search.</div>';
+      return;
+    }
+
+    let html = '';
+    const discover = all.filter(p => p.discover);
+    if (discover.length && pluginsFilter !== 'installed') {
+      html += '<div class="plugins-section"><h2>Discover</h2><div class="discover-row">';
+      discover.forEach(p => {
+        html += '<div class="discover-card" data-install="' + esc(p.id) + '" role="button" tabindex="0">' +
+          pluginIcon(p, false) +
+          '<div class="d-name">' + esc(p.name) + '</div>' +
+          '<div class="d-desc">' + esc(p.description) + '</div>' +
+          '<div class="d-pub">' + esc(p.publisher) + '</div></div>';
+      });
+      html += '</div></div>';
+    }
+
+    const featured = all.filter(p => p.featured);
+    html += sectionGrid('Featured', featured, 'featured', 4);
+
+    const productivity = all.filter(p => p.section === 'productivity' && !p.featured);
+    html += sectionGrid('Productivity', productivity, 'productivity', 4);
+
+    const infra = all.filter(p => p.section === 'infrastructure' && !p.featured);
+    html += sectionGrid('Infrastructure', infra, 'infrastructure', 4);
+
+    const skills = all.filter(p => p.section === 'skills');
+    html += sectionGrid('Skills', skills, 'skills', 4);
+
+    body.innerHTML = html || '<div class="plugins-empty">No plugins match your search.</div>';
+
+    body.querySelectorAll('[data-install]').forEach(el => {
+      const go = () => vscode.postMessage({ type: 'installPlugin', pluginId: el.getAttribute('data-install') });
+      el.addEventListener('click', (ev) => {
+        if (el.classList.contains('discover-card') || el.classList.contains('p-add')) {
+          ev.preventDefault();
+          go();
+        }
+      });
+      if (el.classList.contains('discover-card')) {
+        el.addEventListener('keydown', (ev) => {
+          if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); go(); }
+        });
+      }
+    });
+    body.querySelectorAll('[data-expand]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const key = btn.getAttribute('data-expand');
+        pluginsExpanded[key] = true;
+        renderPlugins();
+      });
+    });
+  }
+
+  function isPluginInstalledAgainst(plugin, server) {
+    if (!plugin.matchMcp) return false;
+    const ids = plugin.matchMcp.ids || [];
+    const nameRx = plugin.matchMcp.nameRe ? new RegExp(plugin.matchMcp.nameRe, 'i') : null;
+    const argsRx = plugin.matchMcp.argsRe ? new RegExp(plugin.matchMcp.argsRe, 'i') : null;
+    const urlRx = plugin.matchMcp.urlRe ? new RegExp(plugin.matchMcp.urlRe, 'i') : null;
+    if (ids.includes(server.id)) return true;
+    if (nameRx && nameRx.test((server.name || '').trim())) return true;
+    if (argsRx && (server.args || []).some(a => argsRx.test(a))) return true;
+    if (urlRx && server.url && urlRx.test(server.url)) return true;
+    return false;
   }
 
   window.addEventListener('message', (e) => {
@@ -665,6 +1166,7 @@ export class AiSettingsPanel {
         render();
         renderGov();
         renderAgent();
+        renderPlugins();
       });
     }
   });

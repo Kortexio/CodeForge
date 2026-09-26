@@ -285,6 +285,181 @@ export class AiSettingsStore {
 	}
 
 	/**
+	 * Official Atlassian Rovo MCP (Jira / Confluence / …) via mcp-remote OAuth proxy.
+	 * Same remote as Cursor’s Atlassian plugin: https://mcp.atlassian.com/v2/mcp
+	 */
+	createAtlassianMcpPreset(): McpServerConfig {
+		return {
+			id: 'atlassian-rovo',
+			name: 'Atlassian',
+			transport: 'stdio',
+			command: 'npx',
+			args: ['-y', 'mcp-remote@latest', 'https://mcp.atlassian.com/v2/mcp'],
+			url: '',
+			apiKey: '',
+			env: undefined,
+			enabled: true,
+		};
+	}
+
+	/** Add Atlassian preset if missing; returns the config (existing or new). */
+	async ensureAtlassianMcp(): Promise<{ added: boolean; server: McpServerConfig }> {
+		const state = this.getState();
+		const existing = state.mcpServers.find(
+			s =>
+				s.id === 'atlassian-rovo' ||
+				/^atlassian$/i.test(s.name.trim()) ||
+				(s.args ?? []).some(a => /mcp\.atlassian\.com/i.test(a))
+		);
+		if (existing) {
+			return { added: false, server: existing };
+		}
+		const server = this.createAtlassianMcpPreset();
+		state.mcpServers.push(server);
+		await this.save(state);
+		return { added: true, server };
+	}
+
+	/**
+	 * Official Azure MCP Server (`@azure/mcp`) — same args as Cursor / VS Code docs.
+	 * Auth uses local Azure credentials (`az login` / Entra ID).
+	 */
+	createAzureMcpPreset(): McpServerConfig {
+		return {
+			id: 'azure-mcp',
+			name: 'Azure',
+			transport: 'stdio',
+			command: 'npx',
+			args: ['-y', '@azure/mcp@latest', 'server', 'start'],
+			url: '',
+			apiKey: '',
+			env: undefined,
+			enabled: true,
+		};
+	}
+
+	/** Add Azure preset if missing; returns the config (existing or new). */
+	async ensureAzureMcp(): Promise<{ added: boolean; server: McpServerConfig }> {
+		const state = this.getState();
+		const existing = state.mcpServers.find(
+			s =>
+				s.id === 'azure-mcp' ||
+				/^azure(\s+mcp(\s+server)?)?$/i.test(s.name.trim()) ||
+				(s.args ?? []).some(a => /@azure\/mcp/i.test(a))
+		);
+		if (existing) {
+			return { added: false, server: existing };
+		}
+		const server = this.createAzureMcpPreset();
+		state.mcpServers.push(server);
+		await this.save(state);
+		return { added: true, server };
+	}
+
+	/**
+	 * Official GitHub remote MCP (hosted): https://api.githubcopilot.com/mcp/
+	 * Auth: paste a GitHub PAT into the MCP server API key field.
+	 */
+	createGithubMcpPreset(): McpServerConfig {
+		return {
+			id: 'github-mcp',
+			name: 'GitHub',
+			transport: 'http',
+			command: '',
+			args: [],
+			url: 'https://api.githubcopilot.com/mcp/',
+			apiKey: '',
+			env: undefined,
+			enabled: true,
+		};
+	}
+
+	async ensureGithubMcp(): Promise<{ added: boolean; server: McpServerConfig }> {
+		const state = this.getState();
+		const existing = state.mcpServers.find(
+			s =>
+				s.id === 'github-mcp' ||
+				/^github$/i.test(s.name.trim()) ||
+				/api\.githubcopilot\.com\/mcp/i.test(s.url ?? '') ||
+				(s.args ?? []).some(a => /github-mcp-server|@modelcontextprotocol\/server-github/i.test(a))
+		);
+		if (existing) {
+			return { added: false, server: existing };
+		}
+		const server = this.createGithubMcpPreset();
+		state.mcpServers.push(server);
+		await this.save(state);
+		return { added: true, server };
+	}
+
+	/**
+	 * Local Azure DevOps MCP (`@azure-devops/mcp`) — recommended for clients
+	 * without Microsoft Entra OAuth (same guidance as Cursor / Claude).
+	 */
+	createAzureDevOpsMcpPreset(organization: string): McpServerConfig {
+		const org = organization
+			.trim()
+			.replace(/^https?:\/\/dev\.azure\.com\//i, '')
+			.replace(/\/$/, '');
+		return {
+			id: 'azure-devops-mcp',
+			name: 'Azure DevOps',
+			transport: 'stdio',
+			command: 'npx',
+			args: ['-y', '@azure-devops/mcp', org],
+			url: '',
+			apiKey: '',
+			env: undefined,
+			enabled: true,
+		};
+	}
+
+	async ensureAzureDevOpsMcp(
+		organization?: string
+	): Promise<{ added: boolean; server: McpServerConfig; cancelled?: boolean }> {
+		const state = this.getState();
+		const existing = state.mcpServers.find(
+			s =>
+				s.id === 'azure-devops-mcp' ||
+				/azure\s*devops|^ado$/i.test(s.name.trim()) ||
+				(s.args ?? []).some(a => /@azure-devops\/mcp|mcp\.dev\.azure\.com/i.test(a)) ||
+				/mcp\.dev\.azure\.com/i.test(s.url ?? '')
+		);
+		if (existing) {
+			return { added: false, server: existing };
+		}
+		let org = (organization ?? '').trim();
+		if (!org) {
+			org =
+				(
+					await vscode.window.showInputBox({
+						title: 'Azure DevOps organization',
+						prompt: 'Organization name only (e.g. contoso), not the full URL',
+						placeHolder: 'contoso',
+						ignoreFocusOut: true,
+						validateInput: v =>
+							!v?.trim()
+								? 'Organization is required'
+								: /\s/.test(v.trim())
+									? 'Use the organization slug, without spaces'
+									: undefined,
+					})
+				)?.trim() ?? '';
+		}
+		if (!org) {
+			return {
+				added: false,
+				cancelled: true,
+				server: this.createAzureDevOpsMcpPreset('YOUR_ORG'),
+			};
+		}
+		const server = this.createAzureDevOpsMcpPreset(org);
+		state.mcpServers.push(server);
+		await this.save(state);
+		return { added: true, server };
+	}
+
+	/**
 	 * Only migrate legacy vscode settings when the user actually configured
 	 * a key or base URL. Never invent a fake OpenAI/gpt-4o server on first run.
 	 */

@@ -10,7 +10,7 @@ import * as os from 'os';
 
 export interface SkillDoc {
 	id: string;
-	scope: 'global' | 'workspace' | 'folder';
+	scope: 'global' | 'workspace' | 'folder' | 'extension' | 'system' | 'user';
 	title: string;
 	content: string;
 	triggers: string[];
@@ -21,7 +21,7 @@ export interface SkillDoc {
 
 export interface RuleDoc {
 	id: string;
-	scope: 'system' | 'user' | 'workspace' | 'folder';
+	scope: 'system' | 'user' | 'workspace' | 'folder' | 'extension';
 	title: string;
 	content: string;
 	description?: string;
@@ -31,9 +31,15 @@ export interface RuleDoc {
 	filePath?: string;
 }
 
+export interface Disposable {
+	dispose(): void;
+}
+
 export class SkillsRulesLoader {
 	private skills: SkillDoc[] = [];
 	private rules: RuleDoc[] = [];
+	private extensionSkillDirs: string[] = [];
+	private extensionRuleDirs: string[] = [];
 
 	listSkills(): SkillDoc[] {
 		return [...this.skills];
@@ -41,6 +47,30 @@ export class SkillsRulesLoader {
 
 	listRules(): RuleDoc[] {
 		return [...this.rules];
+	}
+
+	registerSkillsDir(dir: string, _scope: 'extension' = 'extension'): Disposable {
+		const normalized = path.resolve(dir);
+		if (!this.extensionSkillDirs.includes(normalized)) {
+			this.extensionSkillDirs.push(normalized);
+		}
+		return {
+			dispose: () => {
+				this.extensionSkillDirs = this.extensionSkillDirs.filter(d => d !== normalized);
+			},
+		};
+	}
+
+	registerRulesDir(dir: string, _scope: 'extension' = 'extension'): Disposable {
+		const normalized = path.resolve(dir);
+		if (!this.extensionRuleDirs.includes(normalized)) {
+			this.extensionRuleDirs.push(normalized);
+		}
+		return {
+			dispose: () => {
+				this.extensionRuleDirs = this.extensionRuleDirs.filter(d => d !== normalized);
+			},
+		};
 	}
 
 	async reload(extensionPath?: string): Promise<void> {
@@ -51,6 +81,13 @@ export class SkillsRulesLoader {
 		if (extensionPath) {
 			await this.loadDir(path.join(extensionPath, 'resources', 'skills'), 'global', 'skill');
 			await this.loadDir(path.join(extensionPath, 'resources', 'rules'), 'system', 'rule');
+		}
+
+		for (const dir of this.extensionSkillDirs) {
+			await this.loadDir(dir, 'extension', 'skill');
+		}
+		for (const dir of this.extensionRuleDirs) {
+			await this.loadDir(dir, 'extension', 'rule');
 		}
 
 		const home = path.join(os.homedir(), '.CodeForge');
@@ -85,9 +122,19 @@ export class SkillsRulesLoader {
 		});
 	}
 
-	buildPromptSection(task: string, filePaths: string[] = [], charBudget = 3500): string {
+	buildPromptSection(
+		task: string,
+		filePaths: string[] = [],
+		charBudget = 3500,
+		skillHints: string[] = []
+	): string {
+		const hinted = skillsMatchingHints(this.skills, skillHints);
+		const hintedIds = new Set(hinted.map(s => s.id));
+		const matched = this.matchingSkills(task)
+			.filter(s => !hintedIds.has(s.id))
+			.slice(0, 3);
 		return buildDiskPromptSection(
-			this.matchingSkills(task).slice(0, 3),
+			[...hinted, ...matched],
 			this.activeRules(filePaths).slice(0, 12),
 			charBudget
 		);
@@ -315,6 +362,30 @@ function normalizePath(p: string): string {
 function phraseRegex(phrase: string): RegExp {
 	const esc = phrase.trim().toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+');
 	return new RegExp(`(^|[^\\p{L}\\p{N}])${esc}(?=$|[^\\p{L}\\p{N}])`, 'iu');
+}
+
+/**
+ * Skills named by an agent mode: exact id, title, or trigger (case-insensitive).
+ * Hints shorter than 2 characters are ignored.
+ */
+export function skillsMatchingHints<T extends { id: string; title: string; triggers?: string[] }>(
+	skills: T[],
+	hints: string[]
+): T[] {
+	const wanted = new Set(hints.map(h => h.trim().toLowerCase()).filter(h => h.length >= 2));
+	if (!wanted.size) return [];
+	const out: T[] = [];
+	const seen = new Set<string>();
+	for (const skill of skills) {
+		const keys = [skill.id, skill.title, ...(skill.triggers ?? [])]
+			.map(s => s.trim().toLowerCase())
+			.filter(s => s.length >= 2);
+		if (!keys.some(k => wanted.has(k))) continue;
+		if (seen.has(skill.id)) continue;
+		seen.add(skill.id);
+		out.push(skill);
+	}
+	return out;
 }
 
 /** Skills whose title or an explicit trigger appears in the request as a whole word/phrase. */

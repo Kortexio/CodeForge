@@ -28,3 +28,17 @@ export {
 	recordLesson,
 	type MemoryLesson,
 } from './extendedMemory';
+
+export {
+	NativeWikiMemoryProvider,
+	registerNativeMemoryScopes,
+} from './nativeProvider';
+
+export {
+	getMemoryProvider,
+	setMemoryProvider,
+	tryGetMemoryProvider,
+	getMemoryScopeRegistry,
+	type IMemoryProvider,
+	type MemoryScope,
+} from './scopes';

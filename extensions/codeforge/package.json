@@ -61,6 +61,12 @@
         "icon": "$(add)"
       },
       {
+        "command": "codeforge.chatHistory",
+        "title": "Chat History",
+        "category": "CodeForge AI",
+        "icon": "$(history)"
+      },
+      {
         "command": "codeforge.runTask",
         "title": "Run AI Task",
         "category": "CodeForge AI"
@@ -151,6 +157,11 @@
         "command": "codeforge.generateInstructions",
         "title": "Generate Agent Instructions",
         "category": "CodeForge AI"
+      },
+      {
+        "command": "codeforge.checkForUpdates",
+        "title": "Check for Updates…",
+        "category": "CodeForge"
       }
     ],
     "keybindings": [
@@ -226,21 +237,19 @@
           "enum": [
             "ask",
             "plan",
-            "agent",
-            "auto"
+            "agent"
           ],
           "default": "agent",
-          "description": "Default AI interaction mode (Ask = answers only, Plan = explore + wiki plan, Agent = tools with approvals, Auto = agent + auto-approve)"
+          "description": "Default AI interaction mode (Ask = answers only, Plan = explore + wiki plan, Agent = tools with approvals). Use the Allow all permission chip for session auto-approve."
         },
         "codeforge.ai.weakModelMode": {
           "type": "string",
           "enum": [
-            "auto",
-            "force",
-            "off"
+            "off",
+            "on"
           ],
-          "default": "auto",
-          "markdownDescription": "Weak-model harness: **auto** detects small/local models (~≤34B) and tightens guardrails; **force** always on; **off** disables."
+          "default": "off",
+          "markdownDescription": "Small-model harness: **on** = phase tool filtering + tighter guardrails; **off** = full tool surface (default). Legacy values: `force`→on, `auto`→off."
         },
         "codeforge.ai.collapseToolCards": {
           "type": "boolean",
@@ -264,6 +273,23 @@
           "type": "boolean",
           "default": false,
           "description": "Show DiffPreview before writing existing files (off by default)"
+        },
+        "codeforge.ai.shellSandbox": {
+          "type": "string",
+          "enum": [
+            "restricted",
+            "safe-local",
+            "isolated",
+            "container",
+            "unrestricted"
+          ],
+          "default": "restricted",
+          "markdownDescription": "Default shell sandbox. **restricted** (default): scrub secret env vars and block dangerous patterns. **unrestricted**: full env + no blocked patterns (still runs in the workspace folder). Overridden by **Full agent freedom**."
+        },
+        "codeforge.ai.fullAgentFreedom": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Maximum autonomy: unrestricted shell sandbox, auto-approve file edits, and auto-approve shell for the session. Use only on trusted machines and workspaces."
         },
         "codeforge.ai.traceLevel": {
           "type": "string",
@@ -300,6 +326,22 @@
           "enum": [8192, 16384, 32768, 65536],
           "description": "Fallback context window (tokens) when the active server has no num_ctx. Prefer setting num_ctx per server in CodeForge AI Settings."
         },
+        "codeforge.ai.semanticIndex": {
+          "type": "string",
+          "default": "auto",
+          "enum": ["auto", "off"],
+          "description": "Build and refresh the code index (lexical + embeddings when the provider supports /embeddings). auto = on activation and on file changes; off = metadata index only."
+        },
+        "codeforge.ai.retrieveRerank": {
+          "type": "boolean",
+          "default": true,
+          "description": "Rerank retrieve candidates with a short LLM call before they enter the context packet."
+        },
+        "codeforge.ai.exploreSubagent": {
+          "type": "boolean",
+          "default": false,
+          "description": "Allow delegating broad exploration questions to a read-only explore subagent."
+        },
         "codeforge.ai.openModels": {
           "type": "boolean",
           "default": true,
@@ -314,6 +356,31 @@
           "type": "boolean",
           "default": true,
           "markdownDescription": "Manage Skills, Rules, Policies and Guardrails in **[CodeForge Settings → Guardrails](command:codeforge.openSettings?%5B%22guardrails%22%5D)**. Same UI as the CodeForge Settings panel."
+        },
+        "codeforge.update.checkOnStartup": {
+          "type": "boolean",
+          "default": true,
+          "description": "Check GitHub for a newer release a few seconds after startup and offer a download link when one is available."
+        },
+        "codeforge.update.githubRepo": {
+          "type": "string",
+          "default": "Kortexio/CodeForge",
+          "description": "GitHub owner/repo used for releases/latest (e.g. Kortexio/CodeForge). Leave empty to derive from the app name."
+        },
+        "codeforge.update.apiBaseUrl": {
+          "type": "string",
+          "default": "https://api.github.com",
+          "description": "GitHub API base URL. Change for GitHub Enterprise or a mirror. Path used: {apiBaseUrl}/repos/{githubRepo}/releases/latest"
+        },
+        "codeforge.update.downloadUrl": {
+          "type": "string",
+          "default": "",
+          "description": "Optional override URL for the Download button (internal page, CDN, SharePoint). When empty, opens the release page or Windows .exe asset."
+        },
+        "codeforge.update.currentVersion": {
+          "type": "string",
+          "default": "",
+          "description": "Optional local version override for update comparison. When empty, uses the codeforge extension package version."
         }
       }
     },
@@ -327,19 +394,19 @@
     "menus": {
       "view/title": [
         {
-          "command": "codeforge.newChat",
+          "command": "codeforge.chatHistory",
           "when": "view == codeforge.chat",
-          "group": "navigation"
+          "group": "navigation@1"
         },
         {
-          "command": "codeforge.switchModel",
+          "command": "codeforge.newChat",
           "when": "view == codeforge.chat",
-          "group": "navigation"
+          "group": "navigation@2"
         },
         {
           "command": "codeforge.openSettings",
           "when": "view == codeforge.chat",
-          "group": "navigation"
+          "group": "navigation@3"
         },
         {
           "command": "codeforge.clearSessions",

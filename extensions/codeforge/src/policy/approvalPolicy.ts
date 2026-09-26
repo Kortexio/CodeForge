@@ -101,20 +101,24 @@ export class ApprovalPolicy {
 	}
 
 	/** Composer permission chip level (does not replace Ask mode). */
-	getPermissionLevel(mode: string): PermissionLevel {
-		if (mode === 'auto' || this.sessionAllowAll) return 'allowAll';
+	getPermissionLevel(_mode?: string): PermissionLevel {
+		if (this.sessionAllowAll) return 'allowAll';
 		const preview =
 			vscode.workspace.getConfiguration('codeforge.ai').get<boolean>('previewEdits') === true;
 		if (preview) return 'assisted';
 		return 'default';
 	}
 
-	async applyPermissionLevel(level: PermissionLevel): Promise<'ask' | 'agent' | 'auto'> {
+	/**
+	 * Apply permission chip. Returns the agent mode to keep (always agent for
+	 * Default/Assisted/Allow all — Auto is no longer a mode).
+	 */
+	async applyPermissionLevel(level: PermissionLevel): Promise<'agent'> {
 		const cfg = vscode.workspace.getConfiguration('codeforge.ai');
 		if (level === 'allowAll') {
 			await this.allowAutoSession();
 			await cfg.update('previewEdits', false, vscode.ConfigurationTarget.Global);
-			return 'auto';
+			return 'agent';
 		}
 		this.clearSession();
 		if (level === 'assisted') {

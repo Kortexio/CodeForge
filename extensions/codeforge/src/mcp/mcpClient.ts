@@ -1,8 +1,12 @@
 /**
- * MCP client with proper stdio Content-Length framing + HTTP JSON-RPC.
+ * MCP client with stdio framing (Content-Length + NDJSON) + HTTP JSON-RPC.
+ *
+ * mcp-remote (Atlassian Rovo, etc.) speaks newline-delimited JSON on stdio.
+ * Official SDK servers (@azure/mcp, @azure-devops/mcp, …) use Content-Length.
  */
 
 import * as vscode from 'vscode';
+import * as path from 'path';
 import { spawn, ChildProcessWithoutNullStreams } from 'child_process';
 import { McpServerConfig } from '../settings/aiSettingsStore';
 
@@ -22,8 +26,11 @@ interface JsonRpcResponse {
 	error?: { message?: string; code?: number };
 }
 
+type StdioFraming = 'content-length' | 'ndjson';
+
 export class McpClientManager {
 	private processes = new Map<string, ChildProcessWithoutNullStreams>();
+	private framing = new Map<string, StdioFraming>();
 	private nextId = 1;
 	private pending = new Map<
 		number,
@@ -33,6 +40,10 @@ export class McpClientManager {
 	private tools: McpToolDef[] = [];
 	private httpMeta = new Map<string, McpServerConfig>();
 	private readonly output: vscode.OutputChannel;
+	/** Last refresh summary for UI / commands */
+	lastRefreshSummary = '';
+	private refreshGen = 0;
+	private refreshLock: Promise<void> = Promise.resolve();
 
 	constructor(output: vscode.OutputChannel) {
 		this.output = output;
@@ -42,36 +53,136 @@ export class McpClientManager {
 		return [...this.tools];
 	}
 
+	showOutput(preserveFocus = false): void {
+		this.output.show(preserveFocus);
+	}
+
 	getHttpServer(serverId: string): McpServerConfig | undefined {
 		return this.httpMeta.get(serverId);
 	}
 
 	async refresh(servers: McpServerConfig[]): Promise<void> {
-		await this.dispose();
-		for (const server of servers.filter(s => s.enabled)) {
-			try {
+		const run = async () => {
+			const gen = ++this.refreshGen;
+			const snap = {
+				tools: [...this.tools],
+				processes: new Map(this.processes),
+				framing: new Map(this.framing),
+				httpMeta: new Map(this.httpMeta),
+				buffers: new Map(this.buffers),
+			};
+
+			const enabled = servers.filter(
+				s => s.enabled && ((s.command ?? '').trim() || (s.url ?? '').trim())
+			);
+			for (const s of servers) {
+				if (s.enabled && !(s.command ?? '').trim() && !(s.url ?? '').trim()) {
+					this.output.appendLine(`[mcp] skip ${s.name || s.id}: empty command/url`);
+				}
+			}
+
+			const failures: string[] = [];
+			// Prefer mcp-remote (Atlassian) first so it is not delayed by Azure/ADO timeouts.
+			const ordered = [...enabled].sort((a, b) => {
+				const score = (s: McpServerConfig) =>
+					/mcp-remote|atlassian/i.test([s.command, s.name, ...(s.args ?? [])].join(' '))
+						? 0
+						: 1;
+				return score(a) - score(b);
+			});
+
+			// Stage into fresh maps; keep snap alive until we know the new catalog is usable.
+			this.processes = new Map();
+			this.framing = new Map();
+			this.buffers = new Map();
+			this.httpMeta = new Map();
+			this.tools = [];
+
+			const killMap = (procs: Map<string, ChildProcessWithoutNullStreams>) => {
+				for (const [, p] of procs) {
+					try {
+						p.kill();
+					} catch {
+						/* ignore */
+					}
+				}
+			};
+
+			const restoreSnap = () => {
+				killMap(this.processes);
+				this.processes = snap.processes;
+				this.framing = snap.framing;
+				this.httpMeta = snap.httpMeta;
+				this.buffers = snap.buffers;
+				this.tools = snap.tools;
+			};
+
+			for (const server of ordered) {
+				if (gen !== this.refreshGen) {
+					restoreSnap();
+					return;
+				}
 				const transport =
 					server.transport ??
 					(server.url ? 'http' : server.command ? 'stdio' : undefined);
-				if (transport === 'stdio' && server.command) {
-					await this.connectStdio(server);
-				} else if ((transport === 'http' || server.url) && server.url) {
-					await this.connectHttp(server);
+				try {
+					if (transport === 'stdio' && server.command) {
+						await this.connectStdio(server);
+					} else if ((transport === 'http' || server.url) && server.url) {
+						await this.connectHttp(server);
+					} else {
+						this.output.appendLine(`[mcp] skip ${server.name}: no transport`);
+					}
+				} catch (err) {
+					const msg = err instanceof Error ? err.message : String(err);
+					this.output.appendLine(`[mcp] failed ${server.name}: ${msg}`);
+					failures.push(`${server.name}: ${msg}`);
+					const proc = this.processes.get(server.id);
+					if (proc) {
+						try {
+							proc.kill();
+						} catch {
+							/* ignore */
+						}
+						this.processes.delete(server.id);
+						this.framing.delete(server.id);
+					}
 				}
-			} catch (err) {
-				const msg = err instanceof Error ? err.message : String(err);
-				this.output.appendLine(`[mcp] failed ${server.name}: ${msg}`);
 			}
-		}
-		this.output.appendLine(
-			`[mcp] loaded ${this.tools.length} tools from ${servers.filter(s => s.enabled).length} servers`
-		);
+
+			if (gen !== this.refreshGen) {
+				restoreSnap();
+				return;
+			}
+
+			// Never replace a healthy catalog with an empty one (e.g. Azure hang + Atlassian flake).
+			if (this.tools.length === 0 && snap.tools.length > 0 && enabled.length > 0) {
+				restoreSnap();
+				this.lastRefreshSummary = `Kept ${snap.tools.length} previous tool(s); refresh loaded 0. ${failures.join(' | ')}`;
+				this.output.appendLine(`[mcp] ${this.lastRefreshSummary}`);
+				return;
+			}
+
+			killMap(snap.processes);
+			this.lastRefreshSummary =
+				failures.length === 0
+					? `Loaded ${this.tools.length} tool(s) from ${enabled.length} server(s).`
+					: `Loaded ${this.tools.length} tool(s). Failures: ${failures.join(' | ')}`;
+			this.output.appendLine(`[mcp] ${this.lastRefreshSummary}`);
+		};
+
+		this.refreshLock = this.refreshLock.then(run, run);
+		await this.refreshLock;
 	}
 
 	async callTool(fullName: string, args: Record<string, unknown>): Promise<string> {
 		const tool = this.tools.find(t => t.fullName === fullName || t.name === fullName);
 		if (!tool) {
-			throw new Error(`Unknown MCP tool: ${fullName}`);
+			const available = this.tools.map(t => t.fullName).slice(0, 40);
+			const hint = available.length
+				? ` Available: ${available.join(', ')}${this.tools.length > 40 ? '…' : ''}`
+				: ' No MCP tools loaded — run CodeForge: Refresh MCP Servers (check Output → CodeForge MCP).';
+			throw new Error(`Unknown MCP tool: ${fullName}.${hint}`);
 		}
 		if (this.processes.has(tool.serverId)) {
 			const result = await this.rpc(tool.serverId, 'tools/call', {
@@ -127,6 +238,7 @@ export class McpClientManager {
 			}
 		}
 		this.processes.clear();
+		this.framing.clear();
 		this.pending.clear();
 		this.buffers.clear();
 		this.tools = [];
@@ -134,26 +246,63 @@ export class McpClientManager {
 	}
 
 	private async connectStdio(server: McpServerConfig): Promise<void> {
-		const proc = spawn(server.command!, server.args ?? [], {
+		const framing = detectStdioFraming(server);
+		const { command, args } = resolveStdioSpawn(server);
+		this.output.appendLine(
+			`[mcp] starting ${server.name} (${framing}): ${command} ${args.join(' ')}`
+		);
+
+		const readyHint = /mcp-remote/i.test([server.command, ...(server.args ?? [])].join(' '));
+		const readyPromise = readyHint ? deferred<void>() : undefined;
+
+		const proc = spawn(command, args, {
 			env: { ...process.env, ...(server.env ?? {}) },
-			shell: true,
+			shell: false,
+			windowsHide: true,
+			stdio: ['pipe', 'pipe', 'pipe'],
 		});
 		this.processes.set(server.id, proc);
+		this.framing.set(server.id, framing);
 		this.buffers.set(server.id, Buffer.alloc(0));
 
 		proc.stdout.on('data', (chunk: Buffer) => {
 			this.onData(server.id, chunk);
 		});
 		proc.stderr.on('data', (chunk: Buffer) => {
-			const text = chunk.toString('utf8').trim();
-			if (text) {
-				this.output.appendLine(`[mcp:${server.name}] ${text}`);
+			const text = chunk.toString('utf8');
+			const trimmed = text.trim();
+			if (trimmed) {
+				this.output.appendLine(`[mcp:${server.name}] ${trimmed.slice(0, 500)}`);
 			}
+			if (
+				readyPromise &&
+				/Local STDIO server running|Proxy established successfully/i.test(text)
+			) {
+				readyPromise.resolve();
+			}
+		});
+		proc.on('error', err => {
+			this.output.appendLine(`[mcp:${server.name}] spawn error: ${err.message}`);
 		});
 		proc.on('exit', code => {
 			this.output.appendLine(`[mcp:${server.name}] exited ${code}`);
 			this.processes.delete(server.id);
+			this.framing.delete(server.id);
 		});
+
+		if (readyPromise) {
+			await Promise.race([
+				readyPromise.promise,
+				sleep(25_000).then(() => {
+					throw new Error(
+						'Timed out waiting for mcp-remote (OAuth / proxy). Complete browser login if prompted, then Refresh MCP again.'
+					);
+				}),
+			]);
+		} else {
+			// Give SDK servers a moment to bind stdin.
+			await sleep(400);
+		}
 
 		await this.rpc(server.id, 'initialize', {
 			protocolVersion: '2024-11-05',
@@ -174,6 +323,9 @@ export class McpClientManager {
 				inputSchema: t.inputSchema,
 			});
 		}
+		this.output.appendLine(
+			`[mcp] ${server.name}: ${(listed.tools ?? []).length} tool(s)`
+		);
 	}
 
 	private async connectHttp(server: McpServerConfig): Promise<void> {
@@ -214,22 +366,50 @@ export class McpClientManager {
 			});
 		}
 		this.httpMeta.set(server.id, server);
+		this.output.appendLine(
+			`[mcp] ${server.name}: ${(result?.tools ?? []).length} tool(s) (http)`
+		);
 	}
 
 	private onData(serverId: string, chunk: Buffer): void {
 		const prev = this.buffers.get(serverId) ?? Buffer.alloc(0);
 		let buf = Buffer.concat([prev, chunk]);
+		const framing = this.framing.get(serverId) ?? 'content-length';
+
+		if (framing === 'ndjson') {
+			while (true) {
+				const nl = buf.indexOf(0x0a);
+				if (nl < 0) {
+					this.buffers.set(serverId, buf);
+					return;
+				}
+				const line = buf.subarray(0, nl).toString('utf8').replace(/\r$/, '').trim();
+				buf = buf.subarray(nl + 1);
+				if (line.startsWith('{')) {
+					this.handleMessage(line);
+				}
+			}
+		}
 
 		while (true) {
 			const headerEnd = indexOfDoubleCrlf(buf);
 			if (headerEnd < 0) {
-				this.buffers.set(serverId, buf);
-				return;
+				// Fallback: NDJSON line (some servers mix)
+				const nl = buf.indexOf(0x0a);
+				if (nl < 0) {
+					this.buffers.set(serverId, buf);
+					return;
+				}
+				const line = buf.subarray(0, nl).toString('utf8').trim();
+				buf = buf.subarray(nl + 1);
+				if (line.startsWith('{')) {
+					this.handleMessage(line);
+				}
+				continue;
 			}
 			const header = buf.subarray(0, headerEnd).toString('utf8');
 			const match = /Content-Length:\s*(\d+)/i.exec(header);
 			if (!match) {
-				// Fallback: try newline-delimited JSON for non-compliant servers
 				const nl = buf.indexOf(0x0a);
 				if (nl < 0) {
 					this.buffers.set(serverId, buf);
@@ -283,7 +463,11 @@ export class McpClientManager {
 			? { jsonrpc: '2.0', method, params }
 			: { jsonrpc: '2.0', id, method, params };
 		const payload = JSON.stringify(payloadObj);
-		const frame = `Content-Length: ${Buffer.byteLength(payload, 'utf8')}\r\n\r\n${payload}`;
+		const framing = this.framing.get(serverId) ?? 'content-length';
+		const frame =
+			framing === 'ndjson'
+				? `${payload}\n`
+				: `Content-Length: ${Buffer.byteLength(payload, 'utf8')}\r\n\r\n${payload}`;
 
 		return new Promise((resolve, reject) => {
 			if (isNotification) {
@@ -298,9 +482,91 @@ export class McpClientManager {
 					this.pending.delete(id);
 					reject(new Error(`MCP timeout: ${method}`));
 				}
-			}, 30000);
+			}, framing === 'ndjson' ? 45_000 : 15_000);
 		});
 	}
+}
+
+function detectStdioFraming(server: McpServerConfig): StdioFraming {
+	const blob = [server.command, ...(server.args ?? [])].join(' ');
+	// mcp-remote local side uses newline-delimited JSON (not Content-Length).
+	if (/mcp-remote/i.test(blob)) return 'ndjson';
+	return 'content-length';
+}
+
+/**
+ * Avoid `shell: true` on Windows — stdin often never reaches the MCP process.
+ * Prefer `node npx-cli.js …` when the command is npx.
+ * Important: in the VS Code / Electron extension host, `process.execPath` is the
+ * editor binary — not Node — so we resolve a real `node` from PATH.
+ */
+function resolveStdioSpawn(server: McpServerConfig): { command: string; args: string[] } {
+	const cmd = (server.command ?? '').trim();
+	const args = [...(server.args ?? [])];
+	if (/^npx(\.cmd)?$/i.test(cmd)) {
+		const nodePath = findNodeExecutable();
+		const npxCli = path.join(path.dirname(nodePath), 'node_modules', 'npm', 'bin', 'npx-cli.js');
+		return { command: nodePath, args: [npxCli, ...args] };
+	}
+	return { command: cmd, args };
+}
+
+function findNodeExecutable(): string {
+	// Real Node (not Electron / CodeForgeZ.exe).
+	if (/[/\\]node(\.exe)?$/i.test(process.execPath)) {
+		return process.execPath;
+	}
+	try {
+		const { execFileSync } = require('child_process') as typeof import('child_process');
+		if (process.platform === 'win32') {
+			const out = execFileSync('where.exe', ['node'], {
+				encoding: 'utf8',
+				windowsHide: true,
+			});
+			const first = out
+				.split(/\r?\n/)
+				.map(s => s.trim())
+				.find(s => /node\.exe$/i.test(s) && !/electron/i.test(s));
+			if (first) return first;
+		} else {
+			const out = execFileSync('which', ['node'], { encoding: 'utf8' }).trim();
+			if (out) return out;
+		}
+	} catch {
+		/* fall through */
+	}
+	const programFiles = process.env['ProgramFiles'] || 'C:\\Program Files';
+	const candidates = [
+		path.join(programFiles, 'nodejs', 'node.exe'),
+		path.join(process.env['ProgramFiles(x86)'] || '', 'nodejs', 'node.exe'),
+		'/usr/local/bin/node',
+		'/usr/bin/node',
+	];
+	for (const c of candidates) {
+		try {
+			const { accessSync, constants } = require('fs') as typeof import('fs');
+			accessSync(c, constants.X_OK);
+			return c;
+		} catch {
+			/* try next */
+		}
+	}
+	// Last resort — may still fail in Electron host.
+	return process.platform === 'win32' ? 'node.exe' : 'node';
+}
+
+function sleep(ms: number): Promise<void> {
+	return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function deferred<T>(): { promise: Promise<T>; resolve: (v: T) => void; reject: (e: Error) => void } {
+	let resolve!: (v: T) => void;
+	let reject!: (e: Error) => void;
+	const promise = new Promise<T>((res, rej) => {
+		resolve = res;
+		reject = rej;
+	});
+	return { promise, resolve, reject };
 }
 
 function indexOfDoubleCrlf(buf: Buffer): number {

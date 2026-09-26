@@ -6,7 +6,6 @@ import * as vscode from 'vscode';
 import * as lsp from '../intelligence/lspBridge';
 import * as git from '../intelligence/gitTools';
 import {
-	formatRetrievedBlock,
 	retrieveSnippets,
 	contextBadge,
 	ensureWorkspaceIndex,
@@ -24,8 +23,10 @@ import {
 	type ContextBudget,
 	type ContextSource,
 } from '../context/engine';
+import { getContextProviderRegistry } from '../context/providers';
 import { getSessionWikiStore } from '../memory/sessionWiki';
 import { getProjectWikiStore } from '../memory/projectWiki';
+import { getExtendedLessons, lessonsForText, formatLessonItem } from '../memory/extendedMemory';
 import { emptyStatusPrompt, formatStatusForPrompt, loadProjectStatus, parseRepoSnapshot } from './projectStatus';
 import { clipData } from './clip';
 import { execFile } from 'child_process';
@@ -52,6 +53,8 @@ export async function buildContextPacket(opts: {
 	boostPaths?: string[];
 	/** Recent chat history snippet for the history budget slot. */
 	historyText?: string;
+	/** Optional LLM rerank for retrieve candidates. */
+	rerankFn?: (prompt: string) => Promise<string>;
 }): Promise<ContextPacketResult> {
 	await ensureWorkspaceIndex().catch(() => undefined);
 
@@ -64,7 +67,10 @@ export async function buildContextPacket(opts: {
 	let retrieveNote = '';
 	if (opts.includeRetrieve !== false) {
 		try {
-			retrieved = await retrieveSnippets(opts.task, opts.retrieveK ?? 6);
+			retrieved = await retrieveSnippets(opts.task, opts.retrieveK ?? 6, {
+				rerank: true,
+				rerankFn: opts.rerankFn,
+			});
 		} catch (err) {
 			retrieveNote = `(retrieve failed: ${err instanceof Error ? err.message : String(err)})`;
 			retrieved = [];
@@ -114,13 +120,55 @@ export async function buildContextPacket(opts: {
 			kind: 'status',
 			priority: 96,
 			content: status ? formatStatusForPrompt(status, { liveRepo }) : emptyStatusPrompt(),
+			noTruncate: true,
 		});
 	} catch {
 		/* ignore */
 	}
 
-	// Extended-memory lessons are attached to the failing shell output that triggers them,
-	// not repeated in every packet.
+	try {
+		const openFiles = ide.editorPaths ?? [];
+		const extChunks = await getContextProviderRegistry().collect({
+			task: opts.task,
+			openFiles,
+		});
+		for (const chunk of extChunks) {
+			const body = chunk.title
+				? `### ${chunk.title}\n${chunk.content}`
+				: chunk.content;
+			if (!body.trim()) continue;
+			sources.push({
+				kind: 'extension',
+				priority: 75,
+				content: body,
+				tokensEstimate: chunk.tokensEstimate,
+			});
+		}
+	} catch {
+		/* ignore */
+	}
+
+	try {
+		const lessons = await getExtendedLessons(opts.workspaceRoot);
+		const relevant = lessonsForText(lessons, opts.task, 4);
+		const items = relevant.map((l, i) => ({
+			text: formatLessonItem(l),
+			priority: 100 - i,
+		}));
+		if (items.length) {
+			sources.push({
+				kind: 'lessons',
+				priority: 88,
+				content: '### Known issues from earlier errors',
+				items: [
+					{ text: '### Known issues from earlier errors', priority: 200 },
+					...items,
+				],
+			});
+		}
+	} catch {
+		/* ignore */
+	}
 
 	if (retrieved.length || retrieveNote) {
 		const boosted = retrieved.filter(r =>
@@ -130,12 +178,29 @@ export async function buildContextPacket(opts: {
 			r => !boost.has(r.path.replace(/\\/g, '/').toLowerCase())
 		);
 		const ordered = [...boosted, ...rest];
+		const hitItems = ordered.map((h, i) => {
+			const end = h.endLine ?? h.startLine;
+			const limit = Math.max(1, end - h.startLine + 1);
+			const sym = h.symbol ? ` ${h.symbol}` : '';
+			const boostedHit = boost.has(h.path.replace(/\\/g, '/').toLowerCase());
+			return {
+				priority: (boostedHit ? 100 : 50) - i,
+				text: `#### ${h.path}:${h.startLine}-${end}${sym} (${h.source ?? 'lexical'}${
+					h.score !== undefined ? ` score=${h.score.toFixed(3)}` : ''
+				})\n\`\`\`\n${h.text.slice(0, 600)}\n\`\`\`\n→ read { path: "${h.path}", startLine: ${h.startLine}, limit: ${limit} }`,
+			};
+		});
 		sources.push({
 			kind: 'retrieve',
 			priority: boosted.length ? 78 : 70,
-			content: ['### RETRIEVE', retrieveNote, formatRetrievedBlock(ordered)]
-				.filter(Boolean)
-				.join('\n'),
+			content: ['### RETRIEVE', retrieveNote].filter(Boolean).join('\n'),
+			items: [
+				{
+					text: ['### RETRIEVE', retrieveNote].filter(Boolean).join('\n'),
+					priority: 200,
+				},
+				...hitItems,
+			],
 		});
 	}
 

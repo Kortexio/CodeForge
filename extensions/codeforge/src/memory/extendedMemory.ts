@@ -33,59 +33,27 @@ interface LessonsFile {
 
 const MAX_LESSONS = 40;
 
-/** Built-in platform lessons (always present; hits grow when reinforced). */
-const SEED_LESSONS: MemoryLesson[] = [
-	{
-		id: 'shell.unix-tail',
-		kind: 'platform',
-		title: 'No Unix tail on cmd.exe',
-		pattern: '| tail / head / grep (Unix)',
-		advice: 'Shell is cmd.exe. Do not pipe to tail/head/grep. Run the full command (dotnet build/test) and read the output.',
-		hits: 0,
-		lastSeen: '',
-		match: '\\|\\s*(tail|head|grep)\\b',
-	},
-	{
-		id: 'shell.unix-cat',
-		kind: 'platform',
-		title: 'No cat for files',
-		pattern: 'cat / type used to browse source',
-		advice: 'Use the read or list tools for files — not shell cat/type/dir tours.',
-		hits: 0,
-		lastSeen: '',
-		match: '^(cat|type)\\s+',
-	},
-	{
-		id: 'shell.findstr-quotes',
-		kind: 'platform',
-		title: 'findstr multi-word quotes',
-		pattern: 'findstr /i "a b c" misparsed as filenames',
-		advice: 'Use a single findstr pattern (findstr /i error) or skip findstr and run the raw build/test.',
-		hits: 0,
-		lastSeen: '',
-		match: 'findstr.*"[^"]*\\s[^"]*"',
-	},
-	{
-		id: 'shell.findstr-exit1',
-		kind: 'platform',
-		title: 'findstr exit 1 ≠ build failed',
-		pattern: 'findstr exit 1 with (no output)',
-		advice: 'findstr returns exit 1 when there are no matches. That does NOT mean the build/test failed — re-run without findstr.',
-		hits: 0,
-		lastSeen: '',
-		match: 'findstr',
-	},
-	{
-		id: 'shell.cmd-semicolon',
-		kind: 'platform',
-		title: 'cmd does not chain with ;',
-		pattern: 'cmd1 ; cmd2',
-		advice: 'On Windows cmd.exe use && (or &) to chain commands — not bash-style semicolons.',
-		hits: 0,
-		lastSeen: '',
-		match: ';\\s*(echo|dotnet|npm|dir)',
-	},
-];
+const SIGNATURE_STOP = new Set([
+	'the',
+	'and',
+	'for',
+	'with',
+	'from',
+	'this',
+	'that',
+	'not',
+	'into',
+	'your',
+	'was',
+	'are',
+	'error',
+	'failed',
+	'failure',
+	'command',
+	'unknown',
+	'path',
+	'file',
+]);
 
 let cache: LessonsFile | null = null;
 let cacheKey: string | undefined;
@@ -106,36 +74,17 @@ async function load(workspaceFolder?: string): Promise<LessonsFile> {
 		cache = {
 			version: 1,
 			workspace: raw.workspace ?? workspaceFolder,
-			lessons: mergeSeed(raw.lessons ?? []),
+			lessons: Array.isArray(raw.lessons) ? raw.lessons : [],
 		};
 	} catch {
 		cache = {
 			version: 1,
 			workspace: workspaceFolder,
-			lessons: SEED_LESSONS.map(l => ({ ...l })),
+			lessons: [],
 		};
 	}
 	cacheKey = key;
 	return cache;
-}
-
-function mergeSeed(existing: MemoryLesson[]): MemoryLesson[] {
-	const map = new Map(existing.map(l => [l.id, l]));
-	for (const seed of SEED_LESSONS) {
-		if (!map.has(seed.id)) {
-			map.set(seed.id, { ...seed });
-		} else {
-			const cur = map.get(seed.id)!;
-			map.set(seed.id, {
-				...seed,
-				...cur,
-				advice: cur.advice || seed.advice,
-				pattern: cur.pattern || seed.pattern,
-				match: cur.match || seed.match,
-			});
-		}
-	}
-	return [...map.values()];
 }
 
 async function save(workspaceFolder: string | undefined, data: LessonsFile): Promise<void> {
@@ -194,7 +143,8 @@ export interface ShellLessonResult {
 }
 
 /**
- * Classify a failed shell result and reinforce extended memory.
+ * Learn from a failed command. The lesson id comes from the error text, so the same
+ * failure reinforces one record. Previously saved lessons match by their stored regex.
  */
 export async function learnFromShellFailure(
 	workspaceFolder: string | undefined,
@@ -203,122 +153,156 @@ export async function learnFromShellFailure(
 ): Promise<ShellLessonResult | null> {
 	const cmd = command.trim();
 	const out = output || '';
-	const classified = classifyShellFailure(cmd, out);
-	if (!classified) return null;
+	if (!cmd && !out.trim()) return null;
+
+	const derived = lessonFromFailure(cmd, out);
+	const known = (await load(workspaceFolder)).lessons.find(
+		l => l.hits > 0 && (l.id === derived.id || lessonHitsText(l, `${cmd}\n${out}`))
+	);
+	const classified = known
+		? {
+				...derived,
+				id: known.id,
+				kind: known.kind,
+				title: known.title,
+				advice: known.advice,
+				match: known.match || derived.match,
+			}
+		: derived;
 
 	const lesson = await recordLesson(workspaceFolder, classified);
+	const seen = lesson.hits > 1 ? ` Seen ${lesson.hits} times.` : '';
 	return {
 		lesson,
-		isCmdNoise: classified.kind === 'platform' || classified.id.startsWith('shell.'),
-		adviceBlock: `(known issue — ${lesson.title}: ${lesson.advice})`,
+		isCmdNoise: isShellNoiseFailure(cmd, out),
+		adviceBlock: `(lesson — ${lesson.title}: ${lesson.advice}${seen})`,
 	};
 }
 
+/** Build a lesson from the failure text. Same error signature → same id. */
+export function lessonFromFailure(
+	command: string,
+	output: string
+): Omit<MemoryLesson, 'hits' | 'lastSeen'> {
+	const cmd = command.trim();
+	const errorLine = firstErrorLine(output) || 'command failed with no output';
+	const signature = normalizeSignature(errorLine);
+	const id = `shell.${slugSignature(signature)}`;
+	return {
+		id,
+		kind: 'shell',
+		title: clipText(errorLine, 80),
+		pattern: clipText(cmd || errorLine, 160),
+		advice: `This command failed: ${clipText(errorLine, 180)}. Do not run it again unchanged.`,
+		match: matchFromError(errorLine),
+	};
+}
+
+/** @deprecated Use lessonFromFailure. Kept so older callers still compile. */
 export function classifyShellFailure(
 	command: string,
 	output: string
 ): Omit<MemoryLesson, 'hits' | 'lastSeen'> | null {
-	const cmd = command.trim();
-	const out = output;
-
-	if (/\|\s*(tail|head|grep)\b/i.test(cmd) || /'tail' is not recognized|'head' is not recognized|'grep' is not recognized/i.test(out)) {
-		return {
-			id: 'shell.unix-tail',
-			kind: 'platform',
-			title: 'No Unix tail/grep on cmd.exe',
-			pattern: cmd.slice(0, 160),
-			advice:
-				'Do not use | tail / | head / | grep. Re-run the same command WITHOUT the pipe and read the full output.',
-			match: '\\|\\s*(tail|head|grep)\\b',
-		};
-	}
-
-	if (/FINDSTR:\s*Cannot open/i.test(out)) {
-		return {
-			id: 'shell.findstr-quotes',
-			kind: 'platform',
-			title: 'findstr quotes broken',
-			pattern: cmd.slice(0, 160),
-			advice:
-				'findstr treated words as filenames. Use one simple pattern (findstr /i error) or omit findstr entirely.',
-			match: 'findstr',
-		};
-	}
-
-	if (
-		/\bfindstr\b/i.test(cmd) &&
-		(/\(no output\)/i.test(out) || /exit\s+1/i.test(out)) &&
-		!/Build FAILED|error CS|error RZ/i.test(out)
-	) {
-		return {
-			id: 'shell.findstr-exit1',
-			kind: 'platform',
-			title: 'findstr exit 1 is not a build failure',
-			pattern: cmd.slice(0, 160),
-			advice:
-				'findstr exit 1 usually means no matches. Re-run dotnet build/test WITHOUT findstr to see the real result.',
-			match: 'findstr',
-		};
-	}
-
-	if (/;\s*(echo|dotnet|npm|dir|type)\b/i.test(cmd) && /exit\s+[1-9]/i.test(out)) {
-		return {
-			id: 'shell.cmd-semicolon',
-			kind: 'platform',
-			title: 'cmd semicolon chaining',
-			pattern: cmd.slice(0, 160),
-			advice: 'Use && between commands on Windows cmd.exe, not ;',
-			match: ';\\s*(echo|dotnet|npm)',
-		};
-	}
-
-	if (/^(dir|ls)\b/i.test(cmd) && /\|/.test(cmd)) {
-		return {
-			id: 'shell.dir-pipe',
-			kind: 'shell',
-			title: 'Prefer list tool over dir|findstr',
-			pattern: cmd.slice(0, 160),
-			advice: 'Use the list / retrieve / search tools to discover files — not dir piped through findstr.',
-			match: '^(dir|ls)\\b.*\\|',
-		};
-	}
-
-	if (/is not recognized as an internal or external command/i.test(out)) {
-		const m = /'([^']+)' is not recognized/i.exec(out);
-		const bin = m?.[1] || 'command';
-		return {
-			id: `shell.missing-${bin.toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 24)}`,
-			kind: 'shell',
-			title: `Missing binary: ${bin}`,
-			pattern: cmd.slice(0, 160),
-			advice: `"${bin}" is not available in this shell. Use a Windows/cmd-compatible command or an IDE tool instead.`,
-		};
-	}
-
-	return null;
+	if (!command.trim() && !output.trim()) return null;
+	return lessonFromFailure(command, output);
 }
 
 export function formatLessonsForPrompt(lessons: MemoryLesson[], max = 8): string {
-	const top = lessons.filter(l => l.hits > 0 || l.kind === 'platform').slice(0, max);
-	if (!top.length) {
-		// Still show seed platform tips (hits may be 0)
-		const seeds = lessons.filter(l => l.kind === 'platform').slice(0, 5);
-		if (!seeds.length) return '';
-		return [
-			'### Platform notes',
-			...seeds.map(l => `- ${l.title}: ${l.advice}`),
-		].join('\n');
-	}
+	const top = lessons.filter(l => l.hits > 0).slice(0, max);
+	if (!top.length) return '';
 	return [
 		'### Known issues from earlier errors',
-		...top.map(l => {
-			const n = l.hits > 0 ? ` ×${l.hits}` : '';
-			return `- [${l.id}]${n} ${l.title}: ${l.advice}`;
-		}),
+		...top.map(formatLessonItem),
 	].join('\n');
 }
 
-/** True if this shell failure should not inflate "implementation blocked" heuristics. */
+/** One lesson as a context item (no heading). */
+export function formatLessonItem(lesson: MemoryLesson): string {
+	return `- [${lesson.id}] ×${lesson.hits} ${lesson.title}: ${lesson.advice}`;
+}
+
+/** Lessons already learned whose stored pattern appears in this text. */
+export function lessonsForText(lessons: MemoryLesson[], text: string, max = 4): MemoryLesson[] {
+	return lessons.filter(l => l.hits > 0 && lessonHitsText(l, text)).slice(0, max);
+}
+
+/** Shell rejected the invocation itself (missing program, Unix pipe). Real program failures stay visible. */
 export function isShellNoiseFailure(command: string, output: string): boolean {
-	return classifyShellFailure(command, output) !== null;
+	const blob = `${command}\n${output}`;
+	return (
+		/is not recognized as an internal or external command/i.test(blob) ||
+		/Removed Unix pipe/i.test(blob)
+	);
+}
+
+export function resetLessonsCacheForTests(): void {
+	cache = null;
+	cacheKey = undefined;
+}
+
+function lessonHitsText(lesson: MemoryLesson, text: string): boolean {
+	const source = lesson.match?.trim();
+	if (!source || !text) return false;
+	try {
+		return new RegExp(source, 'i').test(text);
+	} catch {
+		return false;
+	}
+}
+
+function firstErrorLine(output: string): string {
+	const lines = output
+		.split(/\r?\n/)
+		.map(l => l.trim())
+		.filter(Boolean);
+	const skip = /^(exit\s+\d+|cwd:|sandbox:|\[shell\])/i;
+	const preferred = lines.find(l =>
+		/fatal:|error:|is not recognized|not recognized|exception|failed/i.test(l)
+	);
+	if (preferred) return preferred;
+	return lines.find(l => !skip.test(l)) || '';
+}
+
+function normalizeSignature(line: string): string {
+	return line
+		.replace(/%[A-Za-z_][A-Za-z0-9_]*/g, '%VAR')
+		.replace(/'[^']*'/g, "'…'")
+		.replace(/"[^"]*"/g, '"…"')
+		.replace(/[A-Za-z]:\\[^\s]+/g, 'PATH')
+		.replace(/\b[0-9a-f]{7,}\b/gi, 'SHA')
+		.replace(/\d+/g, 'N')
+		.replace(/\s+/g, ' ')
+		.trim()
+		.toLowerCase()
+		.slice(0, 140);
+}
+
+function slugSignature(signature: string): string {
+	const words = signature
+		.replace(/[^a-z0-9]+/g, ' ')
+		.trim()
+		.split(/\s+/)
+		.filter(w => w.length > 2 && !SIGNATURE_STOP.has(w))
+		.slice(0, 6);
+	const base = (words.join('-') || 'failure').slice(0, 48);
+	return base.replace(/-+$/g, '') || 'failure';
+}
+
+function matchFromError(errorLine: string): string {
+	const words = errorLine
+		.toLowerCase()
+		.replace(/[^a-z0-9\s]/g, ' ')
+		.split(/\s+/)
+		.filter(w => w.length > 3 && !SIGNATURE_STOP.has(w))
+		.slice(0, 4);
+	if (!words.length) return '';
+	return words
+		.slice(0, 3)
+		.map(w => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+		.join('[\\s\\S]{0,40}');
+}
+
+function clipText(text: string, max: number): string {
+	const t = text.replace(/\s+/g, ' ').trim();
+	return t.length <= max ? t : `${t.slice(0, max - 1)}…`;
 }

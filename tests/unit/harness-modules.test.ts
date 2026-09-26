@@ -44,6 +44,15 @@ import {
 	stalenessLine,
 } from '../../extensions/codeforge/src/agent/projectStatus';
 import { assembleContext, DEFAULT_BUDGET } from '../../extensions/codeforge/src/context/engine';
+import { chunkFile } from '../../extensions/codeforge/src/intelligence/chunker';
+import { buildRerankPrompt, parseKeepIndices } from '../../extensions/codeforge/src/intelligence/rerank';
+import { formatOutlineBlock } from '../../extensions/codeforge/src/intelligence/lspBridge';
+import { pathsNeedingReindex } from '../../extensions/codeforge/src/intelligence/workspaceIndex';
+import {
+	formatReadLedger,
+	midCompactMessages,
+} from '../../extensions/codeforge/src/agent/toolHistory';
+import { EXPLORE_MODE } from '../../extensions/codeforge/src/agent/exploreMode';
 import { extractBuildErrorLines } from '../../extensions/codeforge/src/governance/guardrailEngine';
 import { buildPriorAgentTranscript } from '../../extensions/codeforge/src/agent/priorContext';
 import {
@@ -329,19 +338,14 @@ describe('toolsets', () => {
 		expect(currentPhase('o que faz este projeto?', { buildRed: false })).toBe('explore');
 	});
 
-	it('limits tools in the weak profile and adds extras only when asked', () => {
+	it('returns the full tool surface; status questions only get update_status', () => {
 		const explore = toolNamesFor('explore', 'o que faz?', { weakProfile: true, allNames: all });
-		expect(explore.has('write')).toBe(false);
-		expect(explore.has('git_status')).toBe(false);
+		expect(explore.size).toBe(all.length);
+		expect(explore.has('write')).toBe(true);
+		expect(toolNamesFor('explore', 'x', { weakProfile: false, allNames: all }).size).toBe(all.length);
 		const withGit = toolNamesFor('implement', 'faz commit no git', { weakProfile: true, allNames: all });
 		expect(withGit.has('git_status')).toBe(true);
-		expect(withGit.has('mcp_call')).toBe(false);
-		expect(toolNamesFor('explore', 'x', { weakProfile: false, allNames: all }).size).toBe(all.length);
-		const withStatus = toolNamesFor('explore', 'onde paramos?', {
-			weakProfile: true,
-			allNames: [...all, 'update_status'],
-		});
-		expect(withStatus.has('update_status')).toBe(true);
+		expect(withGit.has('mcp_call')).toBe(true);
 		const statusOnly = toolNamesFor('explore', 'onde paramos no projeto?', {
 			weakProfile: false,
 			allNames: [...all, 'update_status', 'shell', 'git_status'],
@@ -350,7 +354,6 @@ describe('toolsets', () => {
 		expect(isStatusQuestion('onde paramos?')).toBe(true);
 		expect(isStatusQuestion('continua de onde paramos')).toBe(false);
 	});
-
 	it('detects partial rewrites', () => {
 		const old = Array.from({ length: 20 }, (_, i) => `var line${i} = ${i};`).join('\n');
 		const partial = old.split('\n').slice(0, 15).join('\n') + '\nvar extra = 1;';
@@ -653,5 +656,179 @@ describe('project status', () => {
 		expect((await loadProjectStatus(empty))?.current.stoppedAt).toBe('Stopped after the total method.');
 		fs.rmSync(root, { recursive: true, force: true });
 		fs.rmSync(empty, { recursive: true, force: true });
+	});
+});
+
+describe('chunker', () => {
+	it('chunks by symbols when provided', () => {
+		const lines = Array.from({ length: 40 }, (_, i) => `line ${i + 1}`);
+		const text = lines.join('\n');
+		const chunks = chunkFile('Src/Cart.cs', text, [
+			{ name: 'Cart', startLine: 1, endLine: 40 },
+			{ name: 'Total', startLine: 10, endLine: 25, parents: ['Cart'] },
+		]);
+		expect(chunks.length).toBeGreaterThan(0);
+		expect(chunks.some(c => c.symbol === 'Cart.Total' || c.header.includes('Cart.Total'))).toBe(true);
+		expect(chunks[0].text).toContain('Src/Cart.cs');
+	});
+
+	it('falls back to blank-line blocks without symbols', () => {
+		const blockA = Array.from({ length: 25 }, (_, i) => `a${i}`).join('\n');
+		const blockB = Array.from({ length: 25 }, (_, i) => `b${i}`).join('\n');
+		const text = `${blockA}\n\n${blockB}`;
+		const chunks = chunkFile('a.ts', text);
+		expect(chunks.length).toBeGreaterThanOrEqual(1);
+		expect(chunks.every(c => c.endLine >= c.startLine)).toBe(true);
+	});
+});
+
+describe('index incremental', () => {
+	it('skips paths whose hash is unchanged', () => {
+		expect(
+			pathsNeedingReindex(
+				[
+					{ path: 'a.ts', hash: 'aaa' },
+					{ path: 'b.ts', hash: 'bbb' },
+				],
+				[
+					{ path: 'a.ts', hash: 'aaa' },
+					{ path: 'b.ts', hash: 'BBB' },
+					{ path: 'c.ts', hash: 'ccc' },
+				]
+			)
+		).toEqual(['b.ts', 'c.ts']);
+	});
+});
+
+describe('rerank', () => {
+	it('builds a prompt and parses keep indices', () => {
+		const prompt = buildRerankPrompt(
+			'cart total',
+			[
+				{ path: 'a.ts', startLine: 1, endLine: 10, text: 'function total() {}' },
+				{ path: 'b.ts', startLine: 5, endLine: 20, text: 'unrelated' },
+			],
+			2
+		);
+		expect(prompt).toContain('cart total');
+		expect(prompt).toContain('[0]');
+		expect(parseKeepIndices('{"keep":[1,0]}', 2)).toEqual([1, 0]);
+		expect(parseKeepIndices('not json', 2)).toEqual([]);
+		expect(parseKeepIndices('{"keep":[9]}', 2)).toEqual([]);
+	});
+});
+
+describe('outline format', () => {
+	it('formats symbol ranges for read tool', () => {
+		const block = formatOutlineBlock(
+			[
+				{ name: 'Cart', kind: 'Class', startLine: 1, endLine: 80, depth: 0 },
+				{ name: 'Total', kind: 'Method', startLine: 10, endLine: 25, depth: 1 },
+			],
+			40
+		);
+		expect(block).toContain('OUTLINE');
+		expect(block).toContain('Cart (Class) L1-80');
+		expect(block).toContain('Total (Method) L10-25');
+	});
+});
+
+describe('assembleContext items', () => {
+	it('drops low-priority items instead of truncating mid-item', () => {
+		const assembled = assembleContext(
+			[
+				{
+					kind: 'retrieve',
+					priority: 70,
+					content: '### RETRIEVE',
+					items: [
+						{ text: '### RETRIEVE', priority: 200 },
+						{ text: 'HIT_HIGH ' + 'x'.repeat(200), priority: 90 },
+						{ text: 'HIT_LOW ' + 'y'.repeat(200), priority: 10 },
+					],
+				},
+			],
+			{ total: 200, alloc: { retrieve: 0.5 } }
+		);
+		expect(assembled.markdown).toContain('HIT_HIGH');
+		// With a tiny budget, the low-priority hit may be omitted entirely.
+		expect(assembled.included).toContain('retrieve');
+	});
+
+	it('does not truncate status when noTruncate is set', () => {
+		const long = 'STATUS ' + 'z'.repeat(5000);
+		const assembled = assembleContext(
+			[{ kind: 'status', priority: 96, content: long, noTruncate: true }],
+			{ total: 100, alloc: { status: 0.01 } }
+		);
+		expect(assembled.markdown).toBe(long);
+		expect(assembled.markdown).not.toContain('truncated');
+	});
+});
+
+describe('FILES ALREADY READ ledger', () => {
+	it('merges overlapping ranges', () => {
+		const ledger = formatReadLedger(
+			new Map([
+				[
+					'src/a.ts',
+					[
+						{ start: 1, end: 120 },
+						{ start: 100, end: 200 },
+						{ start: 300, end: 380 },
+					],
+				],
+			])
+		);
+		expect(ledger).toContain('src/a.ts: L1-200, L300-380');
+	});
+
+	it('embeds ledger in mid compact digest', () => {
+		const messages: Array<{
+			role: 'system' | 'user' | 'assistant' | 'tool';
+			content: string;
+			tool_call_id?: string;
+			name?: string;
+			tool_calls?: Array<{
+				id: string;
+				type: 'function';
+				function: { name: string; arguments: string };
+			}>;
+		}> = [{ role: 'system', content: 'sys' }];
+		for (let i = 0; i < 10; i++) {
+			const id = `c${i}`;
+			messages.push({
+				role: 'assistant',
+				content: '',
+				tool_calls: [
+					{
+						id,
+						type: 'function',
+						function: { name: 'read', arguments: `{"path":"f${i}.ts"}` },
+					},
+				],
+			});
+			messages.push({
+				role: 'tool',
+				tool_call_id: id,
+				name: 'read',
+				content: `FILE f${i}.ts lines 1-10/10\n1|x`,
+			});
+		}
+		messages.push({ role: 'assistant', content: 'done' });
+		const next = midCompactMessages(messages, 'sys', {
+			readLedger: 'src/a.ts: L1-120',
+		});
+		const user = next.find(m => m.role === 'user');
+		expect(String(user?.content)).toContain('FILES ALREADY READ');
+		expect(String(user?.content)).toContain('src/a.ts: L1-120');
+	});
+});
+
+describe('explore mode', () => {
+	it('registers as a read-oriented mode definition', () => {
+		expect(EXPLORE_MODE.id).toBe('explore');
+		expect(EXPLORE_MODE.systemPrompt).toMatch(/read-only/i);
+		expect(EXPLORE_MODE.systemPrompt).toMatch(/path:startLine-endLine/);
 	});
 });

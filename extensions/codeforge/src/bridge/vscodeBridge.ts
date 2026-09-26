@@ -8,9 +8,11 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
-import { pickSandboxLevel, runSandboxed, type SandboxLevel } from '../sandbox/runtime';
+import { resolveSandboxLevel, runSandboxed, type SandboxLevel } from '../sandbox/runtime';
 import { clipBuildOutput, clipData } from '../agent/clip';
 import { applyEdit, excerptAround } from '../agent/editTool';
+import { documentSymbolRanges, formatOutlineBlock } from '../intelligence/lspBridge';
+import { getEditJournal } from '../agent/editJournal';
 
 export interface BridgeToolCall {
     id: string;
@@ -37,8 +39,17 @@ export class VSCodeAIBridge {
     }
 
     getWorkspaceRoot(): string | undefined {
-        return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+        return (
+            vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? this.fallbackWorkspaceRoot
+        );
     }
+
+    /** Used when the Extension Development Host opens with no folder. */
+    setFallbackWorkspaceRoot(root: string | undefined): void {
+        this.fallbackWorkspaceRoot = root?.trim() || undefined;
+    }
+
+    private fallbackWorkspaceRoot: string | undefined;
 
     /** Open/create the Agent Terminal so the user sees shell streaming before the first command. */
     async prepareAgentTerminal(): Promise<void> {
@@ -142,8 +153,21 @@ export class VSCodeAIBridge {
             vscode.workspace.getConfiguration('codeforge.ai').get<number>('contextBudget') ?? 32768;
 		// Default window ~ Cursor-style: prefer a slice, not the whole file.
 		const defaultLineLimit = 120;
+		const outlineMinLines = 200;
 		const maxChars = Math.min(8000, Math.max(2500, Math.floor(budget * 0.2)));
         try {
+			try {
+				const st = await vscode.workspace.fs.stat(uri);
+				if (st.type === vscode.FileType.Directory) {
+					const listing = await this.listDirectory(filePath, false);
+					return [
+						`DIRECTORY ${filePath} — use list for folders; read is for files.`,
+						listing,
+					].join('\n');
+				}
+			} catch {
+				/* fall through to read / FILE_NOT_FOUND */
+			}
             const bytes = await vscode.workspace.fs.readFile(uri);
             const text = Buffer.from(bytes).toString('utf8');
 			const lines = text.split(/\r?\n/);
@@ -175,7 +199,17 @@ export class VSCodeAIBridge {
 					: hasWindow || totalLines > defaultLineLimit
 						? `\n\n(end of file — ${totalLines} lines)`
 						: '';
-			return `FILE ${filePath} lines ${start}-${shownEnd}/${totalLines}\n${body}${tail}`;
+			let outline = '';
+			if (!hasWindow && totalLines > outlineMinLines) {
+				try {
+					const ranges = await documentSymbolRanges(filePath);
+					outline = formatOutlineBlock(ranges, 40);
+					if (outline) outline = `\n\n${outline}`;
+				} catch {
+					/* LSP unavailable */
+				}
+			}
+			return `FILE ${filePath} lines ${start}-${shownEnd}/${totalLines}\n${body}${tail}${outline}`;
         } catch (err) {
             const message = err instanceof Error ? err.message : String(err);
             if (/ENOENT|FileNotFound|no such file/i.test(message)) {
@@ -205,6 +239,11 @@ export class VSCodeAIBridge {
     }
 
     private async writeFile(filePath: string, content: string): Promise<string> {
+        try {
+            await getEditJournal().recordBeforeWrite(filePath, p => this.readRaw(p));
+        } catch {
+            /* journal is best-effort */
+        }
         const uri = this.resolveUri(filePath);
         const dir = vscode.Uri.joinPath(uri, '..');
         try {
@@ -238,6 +277,11 @@ export class VSCodeAIBridge {
         newString: string,
         replaceAll: boolean
     ): Promise<string> {
+        try {
+            await getEditJournal().recordBeforeWrite(filePath, p => this.readRaw(p));
+        } catch {
+            /* journal is best-effort */
+        }
         const current = await this.readRaw(filePath);
         if (current === undefined) {
             throw new Error(`FILE_NOT_FOUND: ${filePath} — use write to create a new file.`);
@@ -436,16 +480,44 @@ export class VSCodeAIBridge {
     }
 
     private async deleteFile(filePath: string): Promise<string> {
+        try {
+            await getEditJournal().recordBeforeWrite(filePath, p => this.readRaw(p), { deleting: true });
+        } catch {
+            /* journal is best-effort */
+        }
         const uri = this.resolveUri(filePath);
         await vscode.workspace.fs.delete(uri, { useTrash: true });
         return `Deleted ${filePath}`;
     }
 
     private async renameFile(oldPath: string, newPath: string): Promise<string> {
+        try {
+            await getEditJournal().recordBeforeWrite(oldPath, p => this.readRaw(p), { deleting: true });
+            await getEditJournal().recordBeforeWrite(newPath, p => this.readRaw(p));
+        } catch {
+            /* journal is best-effort */
+        }
         const from = this.resolveUri(oldPath);
         const to = this.resolveUri(newPath);
         await vscode.workspace.fs.rename(from, to, { overwrite: false });
         return `Renamed ${oldPath} -> ${newPath}`;
+    }
+
+    /** Write raw bytes without journaling (used by Undo / Restore). */
+    async writeRaw(filePath: string, content: string): Promise<void> {
+        const uri = this.resolveUri(filePath);
+        const dir = vscode.Uri.joinPath(uri, '..');
+        try {
+            await vscode.workspace.fs.createDirectory(dir);
+        } catch {
+            /* parent may exist */
+        }
+        await vscode.workspace.fs.writeFile(uri, Buffer.from(content, 'utf8'));
+    }
+
+    /** Delete without journaling (used by Undo / Restore). */
+    async deleteRaw(filePath: string): Promise<void> {
+        await vscode.workspace.fs.delete(this.resolveUri(filePath), { useTrash: false });
     }
 
     private async openFile(filePath: string): Promise<string> {
@@ -604,7 +676,13 @@ export class VSCodeAIBridge {
         }
 
         const prepared = prepareWindowsCommand(command, cwd);
-        const level = pickSandboxLevel(prepared.command, sandboxHint, 'medium');
+        const cfg = vscode.workspace.getConfiguration('codeforge.ai');
+        const level = resolveSandboxLevel(prepared.command, {
+            requested: sandboxHint,
+            risk: 'medium',
+            configured: cfg.get<string>('shellSandbox'),
+            fullFreedom: cfg.get<boolean>('fullAgentFreedom') === true,
+        });
         this.output.appendLine(`[shell:${level}] $ ${prepared.display}`);
         if (prepared.note) {
             this.output.appendLine(`[shell] ${prepared.note}`);
@@ -651,6 +729,10 @@ export class VSCodeAIBridge {
         const isWin = process.platform === 'win32';
         const shell = isWin ? 'cmd.exe' : '/bin/bash';
         const args = isWin ? ['/d', '/s', '/c', prepared.command] : ['-lc', prepared.command];
+        const childEnv =
+            level === 'unrestricted' || level === 'safe-local'
+                ? { ...process.env }
+                : scrubEnv(process.env);
 
         return new Promise(resolve => {
             const chunks: string[] = [];
@@ -693,7 +775,7 @@ export class VSCodeAIBridge {
 
             const child = spawn(shell, args, {
                 cwd: prepared.cwd,
-                env: scrubEnv(process.env),
+                env: childEnv,
                 windowsHide: true,
             });
             this.activeShellChild = child;

@@ -9,6 +9,8 @@ import { DiffPreview } from '../ui/diffPreview';
 import { getApprovalPolicy } from '../policy/approvalPolicy';
 import { getTrace } from '../trace/traceService';
 import { getMcp } from '../mcp/mcpClient';
+import { approvalLevelForRisk, getToolRegistry, type ToolRisk } from './toolRegistry';
+import { getAgentModeRegistry, toolVisibleInMode, type AgentModeDefinition } from './agentModes';
 import { SessionStore } from '../sessions/sessionStore';
 import { buildPriorAgentTranscript } from './priorContext';
 import {
@@ -19,6 +21,7 @@ import {
 } from './contextOverflow';
 import {
 	filterAnthropicToolResults,
+	formatReadLedger,
 	midCompactMessages,
 	normalizeToolProtocolHistory,
 	softCompactToolResults,
@@ -42,7 +45,8 @@ import {
 } from '../intelligence/workspaceIndex';
 import { getGovernanceStore } from '../governance/governanceStore';
 import { GuardrailSession } from '../governance/guardrailEngine';
-import { getSkillsRules } from '../skills/skillsRulesLoader';
+import { decideGates, enabledGates, getGateRegistry, type GateSession } from '../governance/gateRegistry';
+import { getSkillsRules, skillsMatchingHints } from '../skills/skillsRulesLoader';
 import { runAgentHooks } from '../hooks/hooksRunner';
 import { getSessionWikiStore } from '../memory/sessionWiki';
 import { learnFromShellFailure, isShellNoiseFailure } from '../memory/extendedMemory';
@@ -441,7 +445,7 @@ export const AGENT_TOOLS = [
 					command: { type: 'string', description: 'Command to run' },
 					sandbox: {
 						type: 'string',
-						description: 'safe-local | restricted | isolated | container',
+						description: 'safe-local | restricted | isolated | container | unrestricted',
 					},
 				},
 				required: ['command'],
@@ -716,12 +720,17 @@ export const AGENT_TOOLS = [
 		type: 'function' as const,
 		function: {
 			name: 'delegate_task',
-			description: 'Delegate a focused subtask to a subagent (depth-1)',
+			description:
+				'Delegate a focused subtask to a subagent (depth-1). For broad “where is X” questions when exploreSubagent is on, pass mode: "explore" (read-only).',
 			parameters: {
 				type: 'object',
 				properties: {
 					task: { type: 'string' },
 					context: { type: 'string' },
+					mode: {
+						type: 'string',
+						description: 'Optional: "explore" for read-only codebase survey',
+					},
 				},
 				required: ['task'],
 			},
@@ -745,6 +754,38 @@ export const AGENT_TOOLS = [
 ];
 
 const AGENT_TOOL_NAMES = new Set(AGENT_TOOLS.map(t => t.function.name));
+
+function allAgentToolNames(mode?: AgentModeDefinition): string[] {
+	const registry = getToolRegistry();
+	const ext = registry
+		.list()
+		.filter(t => toolVisibleInMode(t, mode))
+		.map(t => t.name);
+	return [...new Set([...AGENT_TOOL_NAMES, ...ext])];
+}
+
+function toolsForRound(activeToolNames: Set<string>, mode?: AgentModeDefinition): typeof AGENT_TOOLS {
+	const registry = getToolRegistry();
+	const native = AGENT_TOOLS.filter(t => activeToolNames.has(t.function.name));
+	const ext = registry
+		.toOpenAiTools()
+		.filter(t => {
+			if (!activeToolNames.has(t.function.name) || AGENT_TOOL_NAMES.has(t.function.name)) return false;
+			const def = registry.get(t.function.name);
+			return def ? toolVisibleInMode(def, mode) : false;
+		});
+	return [...native, ...(ext as unknown as typeof AGENT_TOOLS)];
+}
+
+function riskForAgentTool(name: string): ToolRisk {
+	const ext = getToolRegistry().get(name);
+	if (ext && !AGENT_TOOL_NAMES.has(name)) return ext.risk;
+	if (READONLY_TOOLS.has(name) || name === 'update_status') return 'read';
+	if (name === 'shell' || name === 'dotnet') return 'shell';
+	if (name === 'mcp_call') return 'remote-write';
+	if (MUTATING.has(name)) return 'local-write';
+	return 'read';
+}
 
 type ContentPart =
 	| { type: 'text'; text: string }
@@ -796,6 +837,10 @@ export interface AgentLoopOptions {
 	onStatus?: (text: string) => void;
 	onActivity?: (event: AgentActivityEvent) => void;
 	onContextBadge?: (badge: { indexed: number; inContext: number }) => void;
+	/** Prompt tokens used vs context window limit (for the composer ring). */
+	onContextUsage?: (usage: { used: number; limit: number }) => void;
+	/** User-turn index for tool traces (0-based). */
+	turnIndex?: number;
 	onTaskUpdate?: (update: {
 		id: string;
 		name: string;
@@ -838,6 +883,8 @@ export interface AgentLoopOptions {
 	isolated?: boolean;
 	/** Phase decided by the caller (orchestrator items) instead of inferred from the task text. */
 	basePhase?: AgentPhase;
+	/** Extension agent mode. When omitted, the registry's active mode is used. */
+	agentModeId?: string;
 }
 
 const PLAN_MODE_TOOLS = new Set([
@@ -877,18 +924,32 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 	const governance = getGovernanceStore();
 	const weakProfile = opts.weakProfile === true;
 	const gates = new GuardrailSession(governance.runtimeConfig({ weakProfile }));
+	const agentMode = opts.agentModeId
+		? getAgentModeRegistry().get(opts.agentModeId)
+		: getAgentModeRegistry().active();
+	const extGateSession: GateSession = {
+		workspaceRoot: opts.workspaceRoot,
+		sessionId: opts.sessionId ?? undefined,
+		task: opts.task,
+		notes: [],
+	};
 
 	const openPaths = collectOpenFilePaths(opts.workspaceRoot);
+	const hintedSkillIds = agentMode?.skillHints?.length
+		? skillsMatchingHints(governance.getState().skills, agentMode.skillHints).map(s => s.id)
+		: [];
 	const forceSkills = [
 		...(weakProfile ? ['skill.harness-weak-models'] : []),
 		...(openPaths.some(p => /\.cshtml$|\.razor$|\/(Pages|Views)\//i.test(p)) ? ['skill.dotnet-razor'] : []),
+		...hintedSkillIds,
 	];
 	const skillSection = [
 		governance.buildPromptSection(opts.task, { forceSkillIds: forceSkills }),
 		getSkillsRules().buildPromptSection(
 			opts.task,
 			openPaths,
-			Math.min(5000, Math.max(2000, Math.floor(getContextBudget(opts.numCtx) * 0.08)))
+			Math.min(5000, Math.max(2000, Math.floor(getContextBudget(opts.numCtx) * 0.08))),
+			agentMode?.skillHints ?? []
 		),
 	]
 		.filter(Boolean)
@@ -924,6 +985,10 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 		'Before the final reply, call update_status (objective, stoppedAt, next) so .CodeForge/memory/status.json stays current for the next turn.',
 		'Typical flow: retrieve/search → read the slice you will change → edit (existing file) or write (new file) → build/test.',
 		'Tool results stay in this chat. A repeated read of a range you already have returns the remembered text, marked as already in context.',
+		'Independent reads/searches can be issued together in one step.',
+		vscode.workspace.getConfiguration('codeforge.ai').get<boolean>('exploreSubagent')
+			? 'For broad “where is X across the repo” questions, you may call delegate_task with mode explore (read-only). Prefer retrieve for focused lookups.'
+			: '',
 		'The IDE runs the project build/test (oracle) after a few writes and when you finish; the task is done when it is green. If you cannot finish, reply with `blocked: <reason>`.',
 		'Final reply: a short summary of what changed and how to run it.',
 		opts.forceJson
@@ -936,6 +1001,15 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 			? 'This turn asks where the work stopped. Answer from PROJECT STATUS only. Do not explore the repo, run shell, or call git. The only tool is update_status, after the answer.'
 			: '',
 		planModeHint,
+		agentMode
+			? [
+					`### Mode: ${agentMode.title}`,
+					agentMode.description ?? '',
+					agentMode.systemPrompt ?? '',
+				]
+					.filter(Boolean)
+					.join('\n')
+			: '',
 		agentsMdSection,
 		skillSection,
 		mcpHint,
@@ -981,6 +1055,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 			.slice(-6)
 			.map(h => `${h.role}: ${String(h.content).slice(0, 500)}`)
 			.join('\n'),
+		rerankFn: depth === 0 ? makeRerankFn(opts) : undefined,
 	});
 	opts.onContextBadge?.(packet.badge);
 	opts.onActivity?.({
@@ -1006,6 +1081,8 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 	const readPathsSeen = new Set<string>();
 	/** Highest end line already returned per path (1-based inclusive). */
 	const readMaxEnd = new Map<string, number>();
+	const readWindows = new Map<string, Array<{ start: number; end: number }>>();
+	const buildReadLedger = () => formatReadLedger(readWindows);
 	const listPathsSeen = new Set<string>();
 	const retrieveQueriesSeen = new Set<string>();
 	const warnedFingerprints = new Set<string>();
@@ -1044,6 +1121,8 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 	/** Finish attempts refused because the oracle was red. */
 	let oracleRejections = 0;
 	const MAX_ORACLE_REJECTIONS = 6;
+	let gateFinishRejections = 0;
+	const MAX_GATE_FINISH_REJECTIONS = 2;
 	const oracleCfg = opts.planMode ? undefined : detectOracle(opts.workspaceRoot, nodeOracleFs);
 	let lastProgressMarker = '';
 	const progressMarker = () =>
@@ -1319,6 +1398,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 							},
 						},
 						boostPaths: [...touchedPaths],
+						rerankFn: makeRerankFn(opts),
 						historyText: [
 							...history.slice(-3).map(h => `${h.role}: ${String(h.content).slice(0, 350)}`),
 							...messages
@@ -1368,7 +1448,8 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					actions,
 					history,
 					facts,
-					gates.compactStickyExtra()
+					gates.compactStickyExtra(),
+					buildReadLedger()
 				);
 				if (messages[0]?.role === 'system') {
 					const sys = messages[0].content;
@@ -1381,7 +1462,8 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 				opts.onActivity?.({ kind: 'compact', label: 'Mid compact (summarize old turns)…' });
 				messages = midCompactMessages(
 					messages as Parameters<typeof midCompactMessages>[0],
-					systemBaseWithPacket
+					systemBaseWithPacket,
+					{ readLedger: buildReadLedger() }
 				) as ChatMessage[];
 				sm.transition('executing');
 			} else if (
@@ -1439,7 +1521,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 				: currentPhase(opts.task, { buildRed: gates.buildRed });
 			activeToolNames = toolNamesFor(phase, opts.task, {
 				weakProfile,
-				allNames: [...AGENT_TOOL_NAMES].filter(n => !opts.planMode || PLAN_MODE_TOOLS.has(n)),
+				allNames: allAgentToolNames(agentMode).filter(n => !opts.planMode || PLAN_MODE_TOOLS.has(n) || !AGENT_TOOL_NAMES.has(n)),
 			});
 			if (phase !== lastPhase) {
 				opts.onActivity?.({ kind: 'context', label: `Phase: ${phase}`, detail: [...activeToolNames].join(', ') });
@@ -1450,7 +1532,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 				url,
 				sanitizeMessages(messages),
 				completionCap,
-				AGENT_TOOLS.filter(t => activeToolNames.has(t.function.name))
+				toolsForRound(activeToolNames, agentMode)
 			);
 			if (!round.ok) {
 				const errText = round.errorText;
@@ -1477,7 +1559,8 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 							aggressive ? 0 : 3,
 							aggressive ? 900 : 1800
 						),
-						systemBaseWithPacket
+						systemBaseWithPacket,
+						{ readLedger: buildReadLedger() }
 					) as ChatMessage[];
 					normalizeToolProtocolHistory(
 						messages as Parameters<typeof normalizeToolProtocolHistory>[0]
@@ -1574,7 +1657,8 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 						actions,
 						history,
 						facts,
-						gates.compactStickyExtra()
+						gates.compactStickyExtra(),
+						buildReadLedger()
 					);
 					normalizeToolProtocolHistory(
 						messages as Parameters<typeof normalizeToolProtocolHistory>[0]
@@ -1627,6 +1711,11 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 			const realIn = Number(data.usage?.prompt_tokens ?? data.usage?.input_tokens ?? 0) || 0;
 			if (realIn > 0) {
 				lastRealPromptTokens = realIn;
+			}
+			const usedTokens = lastRealPromptTokens || calibratedTokens(sentTokenEstimate, tokenCalibration);
+			const limitTokens = opts.numCtx && opts.numCtx > 0 ? opts.numCtx : 0;
+			if (limitTokens > 0 && usedTokens > 0) {
+				opts.onContextUsage?.({ used: usedTokens, limit: limitTokens });
 			}
 
 			trace?.llm({
@@ -1797,6 +1886,47 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					messages.push({ role: 'user', content: STATUS_UPDATE_NOTE });
 					opts.onStatus?.('A gravar o ponto de situação…');
 					continue;
+				}
+
+				if (!blocked) {
+					const finishDecision = await decideGates(
+						enabledGates(getGateRegistry().list(), governance.getState().guardrails),
+						extGateSession
+					);
+					if (finishDecision.action !== 'allow') {
+						let accepted = false;
+						if (finishDecision.action === 'require-approval') {
+							const approval = await ApprovalDialog.show({
+								tool: 'finish',
+								arguments: {},
+								risk: 'medium',
+								reason: finishDecision.reason,
+							});
+							trace?.record({
+								type: 'approval',
+								label: 'finish',
+								detail: approval.approved ? 'gate approved' : 'gate denied',
+							});
+							accepted = approval.approved;
+						}
+						if (!accepted) {
+							if (
+								gateFinishRejections < MAX_GATE_FINISH_REJECTIONS &&
+								step + 1 < stepBudget
+							) {
+								gateFinishRejections += 1;
+								const note = `Not finished: ${finishDecision.reason}`;
+								trace?.info('harness', String(note.length));
+								messages.push({ role: 'assistant', content: summary });
+								messages.push({ role: 'user', content: note });
+								opts.onStatus?.(
+									`Guardrail held the finish (${gateFinishRejections}/${MAX_GATE_FINISH_REJECTIONS})…`
+								);
+								continue;
+							}
+							doneNote += `\n\nGuardrail: ${finishDecision.reason}`;
+						}
+					}
 				}
 
 				opts.onTaskUpdate?.({
@@ -2048,16 +2178,60 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					continue;
 				}
 
+				const extDef = getToolRegistry().get(name);
+				if (extDef && !AGENT_TOOL_NAMES.has(name) && !toolVisibleInMode(extDef, agentMode)) {
+					refuse(
+						`Tool "${name}" is not available in mode ${agentMode?.title ?? 'this mode'}.`,
+						'mode'
+					);
+					continue;
+				}
+
+				const gateDecision = await decideGates(
+					enabledGates(getGateRegistry().list(), governance.getState().guardrails),
+					extGateSession,
+					{ name, args, risk: riskForAgentTool(name) }
+				);
+				if (gateDecision.action === 'block') {
+					refuse(gateDecision.reason || `Blocked by guardrail: ${name}`, 'gate');
+					continue;
+				}
+				let gateApproved = false;
+				if (gateDecision.action === 'require-approval') {
+					const approval = await ApprovalDialog.show({
+						tool: name,
+						arguments: summarizeArgs(name, args),
+						risk: approvalLevelForRisk(riskForAgentTool(name)),
+						reason: gateDecision.reason,
+					});
+					trace?.record({
+						type: 'approval',
+						label: name,
+						detail: approval.approved ? 'gate approved' : 'gate denied',
+					});
+					if (!approval.approved) {
+						messages.push({
+							role: 'tool',
+							tool_call_id: call.id,
+							name,
+							content: `Denied by user: ${name}`,
+						});
+						actions.push(`${name} denied (gate)`);
+						continue;
+					}
+					gateApproved = true;
+				}
+
 				opts.onActivity?.({
 					kind: 'tool',
-					label: `Running ${name}`,
+					label: formatToolActivityLabel(name, args),
 					tool: name,
 					toolCallId: call.id,
 					toolStatus: 'running',
 					detail: JSON.stringify(summarizeArgs(name, args)).slice(0, 200),
 				});
 
-				if (MUTATING.has(name)) {
+				if (MUTATING.has(name) && !gateApproved) {
 					if (opts.sessionId && opts.sessionStore) {
 						await opts.sessionStore.createCheckpoint(
 							opts.sessionId,
@@ -2254,8 +2428,10 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					} else if (success && !gates.buildRed) {
 						facts = mergeStableFacts(facts, { openErrors: [] });
 					}
-					if (!success && name === 'shell') {
-						output = enrichShellFailure(cmdStr, output, opts.workspaceRoot);
+					if (!success && (name === 'shell' || name === 'dotnet')) {
+						if (name === 'shell') {
+							output = enrichShellFailure(cmdStr, output, opts.workspaceRoot);
+						}
 						try {
 							const learned = await learnFromShellFailure(opts.workspaceRoot, cmdStr, output);
 							if (learned) {
@@ -2268,6 +2444,28 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 							}
 						} catch {
 							/* best-effort */
+						}
+					} else if (name === 'shell' && success) {
+						const original = String(args.command ?? '');
+						const stripped = stripUnixPipes(original);
+						if (stripped.note) {
+							try {
+								const learned = await learnFromShellFailure(
+									opts.workspaceRoot,
+									original,
+									stripped.note
+								);
+								if (learned) {
+									output = `${output}\n\n${learned.adviceBlock}`;
+									opts.onActivity?.({
+										kind: 'checkpoint',
+										label: 'Lesson learned',
+										detail: learned.lesson.id,
+									});
+								}
+							} catch {
+								/* best-effort */
+							}
 						}
 					}
 				}
@@ -2315,12 +2513,12 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 
 				opts.onActivity?.({
 					kind: 'tool',
-					label: success ? `${name} ok` : `${name} failed`,
+					label: formatToolActivityLabel(name, args),
 					tool: name,
 					toolCallId: call.id,
 					toolStatus: success ? 'ok' : 'failed',
 					success,
-					detail: output.slice(0, 300),
+					detail: cleanToolDetailForUi(output).slice(0, 400),
 				});
 
 				trace?.tool({ name, durationMs, success, detail: output.slice(0, 120) });
@@ -2332,6 +2530,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 						output: output.slice(0, 8000),
 						success,
 						durationMs,
+						turn: opts.turnIndex,
 					});
 					if (opts.sessionStore.get(opts.sessionId)?.state === 'paused') {
 						await opts.sessionStore.updateState(opts.sessionId, 'running');
@@ -2354,10 +2553,14 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					readsWhileRed = gates.buildRed ? readsWhileRed + 1 : 0;
 					const parsed = parseReadCoverage(output);
 					const endLine = parsed?.end ?? readStart + readLimit - 1;
+					const startLine = parsed?.start ?? readStart;
 					readMaxEnd.set(pathKey, Math.max(readMaxEnd.get(pathKey) ?? 0, endLine));
 					if (parsed?.total && parsed.end >= parsed.total) {
 						readMaxEnd.set(pathKey, Math.max(readMaxEnd.get(pathKey) ?? 0, parsed.total));
 					}
+					const wins = readWindows.get(pathKey) ?? [];
+					wins.push({ start: startLine, end: endLine });
+					readWindows.set(pathKey, wins);
 					if (readWindowKey) {
 						resultCache.set(`readwin:${readWindowKey}`, output);
 					}
@@ -2702,7 +2905,10 @@ async function executeTool(
 				const query = String(args.query ?? '');
 				const k = Number(args.k ?? 6);
 				await ensureWorkspaceIndex();
-				const hits = await retrieveSnippets(query, Math.min(12, Math.max(1, k)));
+				const hits = await retrieveSnippets(query, Math.min(12, Math.max(1, k)), {
+					rerank: true,
+					rerankFn: makeRerankFn(opts),
+				});
 				opts.onActivity?.({
 					kind: 'tool',
 					label: `retrieve ${hits.length} snippets`,
@@ -2717,26 +2923,39 @@ async function executeTool(
 				if (depth >= 1) {
 					return 'Error: max subagent depth reached';
 				}
-				return await runAgentWithTools({
-					...opts,
-					task: String(args.task),
-					history: args.context
-						? [{ role: 'user', content: String(args.context) }]
-						: opts.history,
-					depth: depth + 1,
-					maxSteps: 8,
-					onTaskUpdate: opts.onTaskUpdate
-						? update =>
-								opts.onTaskUpdate?.({
-									...update,
-									id: `${opts.sessionId ?? 'task'}-sub-${update.id}`,
-									name: `[sub] ${update.name}`,
-								})
-						: undefined,
-					onStatus: text => opts.onStatus?.(`[subagent] ${text}`),
-					onActivity: ev =>
-						opts.onActivity?.({ ...ev, label: `[sub] ${ev.label}` }),
-				}).then(r => `Subagent result:\n${r}`);
+				{
+					const exploreOn =
+						vscode.workspace.getConfiguration('codeforge.ai').get<boolean>('exploreSubagent') ===
+						true;
+					const wantExplore =
+						exploreOn &&
+						(/\bexplor/i.test(String(args.mode ?? '')) ||
+							/\b(where is|across the repo|encontrar onde)\b/i.test(String(args.task ?? '')));
+					return await runAgentWithTools({
+						...opts,
+						task: wantExplore
+							? `${String(args.task)}\n\n(Explore mode: read-only. End with findings and path:startLine-endLine cites.)`
+							: String(args.task),
+						history: args.context
+							? [{ role: 'user', content: String(args.context) }]
+							: opts.history,
+						depth: depth + 1,
+						maxSteps: wantExplore ? 10 : 8,
+						planMode: wantExplore ? true : opts.planMode,
+						isolated: wantExplore ? true : opts.isolated,
+						onTaskUpdate: opts.onTaskUpdate
+							? update =>
+									opts.onTaskUpdate?.({
+										...update,
+										id: `${opts.sessionId ?? 'task'}-sub-${update.id}`,
+										name: `[sub] ${update.name}`,
+									})
+							: undefined,
+						onStatus: text => opts.onStatus?.(`[subagent] ${text}`),
+						onActivity: ev =>
+							opts.onActivity?.({ ...ev, label: `[sub] ${ev.label}` }),
+					}).then(r => `Subagent result:\n${r}`);
+				}
 			case 'mcp_call': {
 				const mcp = getMcp();
 				if (!mcp) {
@@ -2747,6 +2966,36 @@ async function executeTool(
 				return await mcp.callTool(toolName, toolArgs);
 			}
 			default: {
+				const registry = getToolRegistry();
+				const def = registry.get(name);
+				if (def) {
+					const result = await registry.execute(name, args, {
+						workspaceRoot: opts.workspaceRoot,
+						sessionId: opts.sessionId ?? undefined,
+						signal: opts.abortSignal ?? new AbortController().signal,
+						trace: {
+							record: partial =>
+								getTrace()?.record({
+									type: (partial.type as 'info' | 'tool' | 'error' | 'approval' | 'compact' | 'llm' | 'state') || 'info',
+									label: partial.label,
+									detail: partial.detail,
+									durationMs: partial.durationMs,
+								}),
+						},
+						approve: async req => {
+							const approval = await ApprovalDialog.show({
+								tool: req.tool,
+								arguments: summarizeArgs(req.tool, req.arguments),
+								risk: req.risk,
+								reason: req.reason,
+							});
+							return approval.approved;
+						},
+						progress: msg => opts.onActivity?.({ kind: 'checkpoint', label: name, detail: msg }),
+						extras: { callId, depth, opts },
+					});
+					return result.isError ? `Error: ${result.content}` : result.content;
+				}
 				const result = await opts.bridge.execute({
 					id: callId,
 					name,
@@ -2798,7 +3047,8 @@ async function compactWithLlm(
 	actions: string[],
 	history: AgentHistoryMessage[],
 	facts: StableFacts,
-	stickyExtra = ''
+	stickyExtra = '',
+	readLedger = ''
 ): Promise<ChatMessage[]> {
 	const trace = getTrace();
 	trace?.record({ type: 'compact', label: 'rolling summary' });
@@ -2842,6 +3092,7 @@ async function compactWithLlm(
 							formatStableFactsBlock(facts),
 							summarizeActionsForLlm(actions),
 							recentTools,
+							readLedger ? `### FILES ALREADY READ\n${readLedger}` : '',
 						]
 							.filter(Boolean)
 							.join('\n'),
@@ -2876,6 +3127,7 @@ async function compactWithLlm(
 		workspaceRoot: opts.workspaceRoot,
 		includeRetrieve: true,
 		retrieveK: 4,
+		rerankFn: makeRerankFn(opts),
 	});
 	opts.onContextBadge?.(packet.badge);
 
@@ -2898,6 +3150,7 @@ async function compactWithLlm(
 				'### Rolling summary + facts',
 				'The conversation was compacted. STABLE FACTS (system message) hold the canonical paths and open errors.',
 				rolling,
+				readLedger ? `### FILES ALREADY READ\n${readLedger}` : '',
 				recentTools ? `\nRecent tool results:\n${recentTools}` : '',
 				stickyExtra,
 			]
@@ -2905,6 +3158,45 @@ async function compactWithLlm(
 				.join('\n'),
 		},
 	];
+}
+
+function makeRerankFn(opts: AgentLoopOptions): (prompt: string) => Promise<string> {
+	return async (prompt: string) => {
+		const base = (opts.baseUrl || defaultBase(opts.provider)).replace(/\/$/, '');
+		const controller = new AbortController();
+		const timer = setTimeout(() => controller.abort(), 4000);
+		const onAbort = () => controller.abort();
+		opts.abortSignal?.addEventListener('abort', onAbort);
+		try {
+			const res = await fetch(`${base}/chat/completions`, {
+				method: 'POST',
+				headers: {
+					'Content-Type': 'application/json',
+					...(opts.apiKey ? { Authorization: `Bearer ${opts.apiKey}` } : {}),
+				},
+				signal: controller.signal,
+				body: JSON.stringify({
+					model: opts.model,
+					temperature: 0,
+					stream: false,
+					max_tokens: 128,
+					messages: [
+						{
+							role: 'system',
+							content: 'You rank code snippets. Reply with JSON only.',
+						},
+						{ role: 'user', content: prompt },
+					],
+				}),
+			});
+			if (!res.ok) return '';
+			const data = await readChatCompletionResponse(res);
+			return data.choices?.[0]?.message?.content?.trim() ?? '';
+		} finally {
+			clearTimeout(timer);
+			opts.abortSignal?.removeEventListener('abort', onAbort);
+		}
+	};
 }
 
 function isNativeAnthropic(opts: AgentLoopOptions): boolean {
@@ -4012,6 +4304,62 @@ function summarizeArgs(name: string, args: Record<string, unknown>): Record<stri
 		};
 	}
 	return args;
+}
+
+/** Short label for the chat timeline (Cursor-like: "Shell npm test", not "shell ok"). */
+function formatToolActivityLabel(name: string, args: Record<string, unknown>): string {
+	const title = name
+		.replace(/_/g, ' ')
+		.replace(/\b\w/g, c => c.toUpperCase())
+		.replace(/^Mcp /, 'MCP ');
+	const primary = String(
+		args.path ??
+			args.oldPath ??
+			args.command ??
+			args.pattern ??
+			args.query ??
+			args.tool ??
+			args.task ??
+			args.id ??
+			''
+	)
+		.replace(/\s+/g, ' ')
+		.trim();
+	if (!primary) return title;
+	const clipped = primary.length > 72 ? primary.slice(0, 69) + '…' : primary;
+	if (name === 'shell' || name === 'dotnet') return `Shell ${clipped}`;
+	if (name === 'read' || name === 'write' || name === 'edit' || name === 'delete' || name === 'open') {
+		return `${title} ${clipped}`;
+	}
+	return `${title} ${clipped}`;
+}
+
+/**
+ * Detail shown under a timeline row — keep the useful error, drop sandbox chrome and lesson footers
+ * (lessons stay in the tool result the model sees).
+ */
+function cleanToolDetailForUi(output: string): string {
+	let text = (output || '').trim();
+	if (!text) return '';
+	text = text.replace(/\n*\(lesson —[\s\S]*$/i, '').trim();
+	const lines = text.split(/\r?\n/).filter(line => {
+		const t = line.trim();
+		if (!t) return false;
+		if (/^cwd:\s/i.test(t)) return false;
+		if (/^sandbox:\s/i.test(t)) return false;
+		if (/^exit\s+\d+\s*$/i.test(t)) return false;
+		if (/^\(no output\)$/i.test(t)) return false;
+		if (/^\(failed — cwd:/i.test(t)) return false;
+		if (/^\[Aborted/i.test(t) || /^\[Timeout\]/i.test(t)) return true;
+		return true;
+	});
+	const body = lines.join('\n').trim();
+	const exit = /^exit\s+(\d+)/im.exec(output);
+	if (exit && Number(exit[1]) !== 0) {
+		const err = body || '(no output)';
+		return `exit ${exit[1]}\n${err}`.slice(0, 400);
+	}
+	return body.slice(0, 400);
 }
 
 /** Shell exit≠0 must not be cached as success / treated as OK progress. */

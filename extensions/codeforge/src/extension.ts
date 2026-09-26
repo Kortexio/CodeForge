@@ -5,6 +5,8 @@
  */
 
 import * as vscode from 'vscode';
+import * as path from 'path';
+import * as fs from 'fs';
 import { ChatViewProvider } from './views/chatView';
 import { SessionsTreeProvider } from './views/sessionsTree';
 import { TasksTreeProvider } from './views/tasksTree';
@@ -16,6 +18,7 @@ import { AiSettingsStore } from './settings/aiSettingsStore';
 import { AiSettingsPanel } from './settings/aiSettingsPanel';
 import { showModelQuickPick } from './settings/modelQuickPick';
 import { initApprovalPolicy, getApprovalPolicy } from './policy/approvalPolicy';
+import { initEditJournal, OriginalContentProvider } from './agent/editJournal';
 import { SessionStore } from './sessions/sessionStore';
 import { initTrace } from './trace/traceService';
 import { initMcp } from './mcp/mcpClient';
@@ -23,9 +26,20 @@ import { getSkillsRules } from './skills/skillsRulesLoader';
 import { initGovernanceStore } from './governance/governanceStore';
 import { ensureHomeLayout } from './storage/paths';
 import { initProjectWiki } from './memory/projectWiki';
+import {
+	NativeWikiMemoryProvider,
+	registerNativeMemoryScopes,
+	setMemoryProvider,
+} from './memory';
 import { setEmbeddingsSettingsStore } from './intelligence/embeddings';
 import { startOutboundMcp, stopOutboundMcp } from './mcp/outbound';
 import { indexEmbeddings } from './intelligence/workspaceIndex';
+import { startWorkspaceIndexWatcher } from './intelligence/indexWatcher';
+import { createCodeForgeApi, setOpenWithPromptHandler, type CodeForgeApi } from './api';
+import { getContextProviderRegistry } from './context/providers';
+import { checkForAppUpdate, scheduleStartupUpdateCheck } from './platform/releaseCheck';
+import { getAgentModeRegistry } from './agent/agentModes';
+import { EXPLORE_MODE } from './agent/exploreMode';
 
 let chatViewProvider: ChatViewProvider;
 let sessionsTreeProvider: SessionsTreeProvider;
@@ -36,7 +50,7 @@ let settingsStore: AiSettingsStore;
 let sessionStore: SessionStore;
 let tabEngine: TabEngine;
 
-export async function activate(context: vscode.ExtensionContext) {
+export async function activate(context: vscode.ExtensionContext): Promise<CodeForgeApi> {
     outputChannel = vscode.window.createOutputChannel('CodeForge AI');
     await ensureHomeLayout();
     await migrateLegacyOpencodeideSettings();
@@ -46,16 +60,43 @@ export async function activate(context: vscode.ExtensionContext) {
     await settingsStore.unifyProfiles(line => outputChannel.appendLine(line));
     sessionStore = new SessionStore(context);
     initApprovalPolicy(context);
+    const editJournal = initEditJournal();
+    const originalProvider = new OriginalContentProvider(editJournal);
+    context.subscriptions.push(
+        vscode.workspace.registerTextDocumentContentProvider(OriginalContentProvider.scheme, originalProvider)
+    );
     const governance = initGovernanceStore(context);
     const trace = initTrace(outputChannel);
     const mcp = initMcp(outputChannel);
 
-    const ws = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    // EDH often starts with no folder — relative read/write/shell then fail.
+    if (!vscode.workspace.workspaceFolders?.length) {
+        const guess = path.resolve(context.extensionPath, '..', '..');
+        if (fs.existsSync(path.join(guess, 'package.json')) || fs.existsSync(path.join(guess, '.git'))) {
+            bridge.setFallbackWorkspaceRoot(guess);
+            try {
+                vscode.workspace.updateWorkspaceFolders(0, 0, {
+                    uri: vscode.Uri.file(guess),
+                    name: path.basename(guess),
+                });
+            } catch (err) {
+                outputChannel.appendLine(
+                    `Workspace auto-open skipped: ${err instanceof Error ? err.message : String(err)}`
+                );
+            }
+        }
+    }
+
+    const ws = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? bridge.getWorkspaceRoot();
     await initProjectWiki(ws);
+    registerNativeMemoryScopes(ws);
+    setMemoryProvider(new NativeWikiMemoryProvider(ws));
     context.subscriptions.push(
         vscode.workspace.onDidChangeWorkspaceFolders(async () => {
             const next = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
             await initProjectWiki(next);
+            registerNativeMemoryScopes(next);
+            setMemoryProvider(new NativeWikiMemoryProvider(next));
         })
     );
 
@@ -71,6 +112,13 @@ export async function activate(context: vscode.ExtensionContext) {
     outputChannel.appendLine('CodeForge AI extension activated (Code-OSS bridge ready)');
     outputChannel.appendLine(`Workspace: ${bridge.getWorkspaceRoot() ?? '(none)'}`);
     outputChannel.appendLine(`Sessions loaded: ${sessionStore.list().length}`);
+
+    startWorkspaceIndexWatcher(context);
+    try {
+        getAgentModeRegistry().register(EXPLORE_MODE);
+    } catch {
+        /* already registered */
+    }
 
     chatViewProvider = new ChatViewProvider(
         context.extensionUri,
@@ -161,6 +209,12 @@ export async function activate(context: vscode.ExtensionContext) {
 
     context.subscriptions.push(
         vscode.commands.registerCommand('codeforge.newChat', () => chatViewProvider.newChat())
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('codeforge.chatHistory', async () => {
+            await chatViewProvider.pickSessionHistory();
+        })
     );
 
     context.subscriptions.push(
@@ -322,7 +376,7 @@ export async function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(
         vscode.commands.registerCommand('codeforge.indexEmbeddings', async () => {
             try {
-                const n = await indexEmbeddings(80);
+                const n = await indexEmbeddings(3000, true);
                 vscode.window.showInformationMessage(
                     n ? `Indexed ${n} embedding chunks` : 'No embeddings indexed (check provider /embeddings)'
                 );
@@ -339,6 +393,13 @@ export async function activate(context: vscode.ExtensionContext) {
             await chatViewProvider.runGenerateInstructions();
         })
     );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('codeforge.checkForUpdates', async () => {
+            await checkForAppUpdate({ context, interactive: true });
+        })
+    );
+    scheduleStartupUpdateCheck(context);
 
     context.subscriptions.push(outputChannel);
     context.subscriptions.push({
@@ -362,6 +423,21 @@ export async function activate(context: vscode.ExtensionContext) {
             }
         },
     });
+
+    setOpenWithPromptHandler(async (prompt, attachments) => {
+        await chatViewProvider.focus();
+        if (attachments?.length) {
+            chatViewProvider.addPendingAttachments(attachments);
+        }
+        await chatViewProvider.runTask(prompt);
+    });
+    context.subscriptions.push({
+        dispose: () => setOpenWithPromptHandler(undefined),
+    });
+
+    const api = createCodeForgeApi();
+    void getContextProviderRegistry();
+    return api;
 }
 
 async function ensureAiSidebarOpen(log?: vscode.OutputChannel): Promise<void> {

@@ -205,7 +205,8 @@ export function softCompactToolResults(
 /** Mid: collapse older turns into one digest user message; keep a safe contiguous tail. */
 export function midCompactMessages(
 	messages: ToolHistoryMessage[],
-	systemContent: string
+	systemContent: string,
+	opts?: { readLedger?: string }
 ): ToolHistoryMessage[] {
 	const system = messages.find(m => m.role === 'system') ?? {
 		role: 'system' as const,
@@ -233,6 +234,10 @@ export function midCompactMessages(
 		})
 		.join('\n');
 
+	const ledger = opts?.readLedger?.trim()
+		? `\n\n### FILES ALREADY READ\n${opts.readLedger.trim()}`
+		: '';
+
 	const next: ToolHistoryMessage[] = [
 		{
 			role: 'system',
@@ -240,12 +245,50 @@ export function midCompactMessages(
 		},
 		{
 			role: 'user',
-			content: `Summary of older turns (tool results abbreviated):\n${clipData(digest, 6000)}`,
+			content: `Summary of older turns (tool results abbreviated):\n${clipData(digest, 6000)}${ledger}`,
 		},
 		...tail,
 	];
 	normalizeToolProtocolHistory(next);
 	return next;
+}
+
+/**
+ * Build a compact ledger of files already read: `path: L1-120, L300-380`.
+ * `windows` maps path → list of inclusive [start, end] line ranges.
+ */
+export function formatReadLedger(
+	windows: Map<string, Array<{ start: number; end: number }>> | Record<string, Array<{ start: number; end: number }>>
+): string {
+	const entries =
+		windows instanceof Map ? [...windows.entries()] : Object.entries(windows);
+	if (!entries.length) return '';
+	return entries
+		.sort(([a], [b]) => a.localeCompare(b))
+		.map(([p, ranges]) => {
+			const merged = mergeRanges(ranges);
+			const parts = merged.map(r => `L${r.start}-${r.end}`).join(', ');
+			return `${p}: ${parts}`;
+		})
+		.join('\n');
+}
+
+function mergeRanges(
+	ranges: Array<{ start: number; end: number }>
+): Array<{ start: number; end: number }> {
+	const sorted = [...ranges]
+		.filter(r => r.end >= r.start)
+		.sort((a, b) => a.start - b.start || a.end - b.end);
+	const out: Array<{ start: number; end: number }> = [];
+	for (const r of sorted) {
+		const last = out[out.length - 1];
+		if (last && r.start <= last.end + 1) {
+			last.end = Math.max(last.end, r.end);
+		} else {
+			out.push({ ...r });
+		}
+	}
+	return out;
 }
 
 /**
