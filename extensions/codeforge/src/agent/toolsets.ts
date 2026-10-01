@@ -1,10 +1,20 @@
 /**
- * Tool surface helpers. Phase labels remain for telemetry; the agent always
- * gets the full tool list (except status questions and Plan mode).
+ * Tool surface helpers + phase detection.
+ * Tool names for the LLM request are filtered via OpenCode-style permissions
+ * (denied tools are omitted from the schemas sent to the model).
  * Pure — no vscode.
  */
 
+import {
+	filterToolsByProfile,
+	type ToolPermissionProfile,
+	type ProfileOptions,
+	PLAN_ALLOWED_TOOLS,
+} from './toolPermissions';
+
 export type AgentPhase = 'explore' | 'implement' | 'fix' | 'review';
+
+export { PLAN_ALLOWED_TOOLS };
 
 /** A question about where the work stopped. Not a request to continue or change code. */
 export function isStatusQuestion(task: string): boolean {
@@ -29,7 +39,7 @@ export function isReviewTask(task: string): boolean {
 	return REVIEW_TASK.test(task) && !/\b(fix|corrig\w*|implement\w*)\b/i.test(task);
 }
 
-/** Phase label for this turn (telemetry / activity feed only). */
+/** Phase label for this turn (telemetry + tool profile). */
 export function currentPhase(task: string, state: { buildRed: boolean }): AgentPhase {
 	if (isReviewTask(task)) return 'review';
 	if (state.buildRed) return 'fix';
@@ -37,20 +47,39 @@ export function currentPhase(task: string, state: { buildRed: boolean }): AgentP
 	return 'explore';
 }
 
+export function profileForTurn(
+	phase: AgentPhase,
+	task: string,
+	opts: { planMode?: boolean }
+): ToolPermissionProfile {
+	if (isStatusQuestion(task)) return 'status';
+	if (opts.planMode) return 'plan';
+	if (phase === 'explore') return 'explore';
+	return 'build';
+}
+
 /**
- * Tool names for this turn.
- * Full surface for every model; only status questions (and Plan mode via caller) restrict tools.
+ * Tool names exposed to the model this round.
+ * Denied tools (OpenCode-style) are omitted from the request schemas.
  */
 export function toolNamesFor(
-	_phase: AgentPhase,
+	phase: AgentPhase,
 	task: string,
-	opts: { weakProfile: boolean; allNames: string[]; planMode?: boolean }
+	opts: {
+		weakProfile: boolean;
+		allNames: string[];
+		planMode?: boolean;
+		mcpAvailable?: boolean;
+		exploreSubagent?: boolean;
+	}
 ): Set<string> {
 	void opts.weakProfile;
-	if (isStatusQuestion(task)) {
-		return new Set(opts.allNames.filter(n => n === 'update_status'));
-	}
-	return new Set(opts.allNames);
+	const profile = profileForTurn(phase, task, { planMode: opts.planMode });
+	const profileOpts: ProfileOptions = {
+		mcpAvailable: opts.mcpAvailable === true,
+		exploreSubagent: opts.exploreSubagent === true,
+	};
+	return filterToolsByProfile(opts.allNames, profile, profileOpts);
 }
 
 /** Existing files above this size are changed with edit, not rewritten (weak profile). */
@@ -138,7 +167,7 @@ export const DOTNET_TOOL = {
 	function: {
 		name: 'dotnet',
 		description:
-			'Run a .NET CLI action from the workspace root. Actions: new (template, name, output), sln_add (solution, project), add_reference (project, reference), add_package (project, package, version?), build (project?), test (project?, filter?). Paths are relative to the workspace root.',
+			'.NET CLI: new | sln_add | add_reference | add_package | build | test.',
 		parameters: {
 			type: 'object',
 			properties: {

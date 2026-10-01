@@ -37,6 +37,7 @@ import {
 	normalizeFacts,
 } from './stableFacts';
 import { buildContextPacket } from './contextPacket';
+import { buildLeanContextPacket } from './leanBootstrap';
 import { loadAgentsMdForPrompt } from './projectInstructions';
 import {
 	retrieveSnippets,
@@ -47,6 +48,11 @@ import { getGovernanceStore } from '../governance/governanceStore';
 import { GuardrailSession } from '../governance/guardrailEngine';
 import { decideGates, enabledGates, getGateRegistry, type GateSession } from '../governance/gateRegistry';
 import { getSkillsRules, skillsMatchingHints } from '../skills/skillsRulesLoader';
+import {
+	buildForcedSkillSection,
+	formatSkillCatalogForTool,
+	resolveSkillBody,
+} from '../skills/skillCatalog';
 import { runAgentHooks } from '../hooks/hooksRunner';
 import { getSessionWikiStore } from '../memory/sessionWiki';
 import { learnFromShellFailure, isShellNoiseFailure } from '../memory/extendedMemory';
@@ -93,6 +99,8 @@ import {
 	isStatusQuestion,
 	LARGE_FILE_LINES,
 	mentionsErrorFile,
+	PLAN_ALLOWED_TOOLS,
+	profileForTurn,
 	toolNamesFor,
 	type AgentPhase,
 } from './toolsets';
@@ -132,6 +140,7 @@ const READONLY_TOOLS = new Set([
 	'wiki_search',
 	'wiki_facts',
 	'browser_snapshot',
+	'skill',
 ]);
 
 function normalizeShellCommand(cmd: string): string {
@@ -219,11 +228,17 @@ function completionMaxTokens(budget: number): number {
 	return 8192;
 }
 
-function toolResultCharCap(budget: number): number {
+function toolResultCharCap(budget: number, leanExplore = false): number {
 	const usable = promptTokenBudget(budget);
 	const soft = Math.floor(usable * 0.16);
-	const ceiling = budget >= 32000 ? 8000 : budget >= 16000 ? 5500 : 3500;
-	return Math.min(ceiling, Math.max(2000, soft));
+	const ceiling = leanExplore
+		? 3500
+		: budget >= 32000
+			? 8000
+			: budget >= 16000
+				? 5500
+				: 3500;
+	return Math.min(ceiling, Math.max(leanExplore ? 1500 : 2000, soft));
 }
 
 function compactTokenThreshold(budget: number): number {
@@ -255,7 +270,7 @@ function priorTranscriptCharBudget(budget: number): number {
 
 /** Soft cap for CONTEXT PACKET assembly (tokens). Full num_ctx is for the live chat, not one dump. */
 function contextPacketTokenBudget(budget: number): number {
-	return Math.min(10_000, Math.max(3500, Math.floor(promptTokenBudget(budget) * 0.28)));
+	return Math.min(4_000, Math.max(2000, Math.floor(promptTokenBudget(budget) * 0.18)));
 }
 
 /** Extra fields for Ollama-compatible gateways (ignored if unsupported). */
@@ -279,8 +294,7 @@ export const AGENT_TOOLS = [
 		type: 'function' as const,
 		function: {
 			name: 'read',
-			description:
-				'Read a slice of a workspace file with line numbers. Default 120 lines from startLine; use startLine+limit for another slice.',
+			description: 'Read a file slice with line numbers (default 120 lines).',
 			parameters: {
 				type: 'object',
 				properties: {
@@ -310,8 +324,7 @@ export const AGENT_TOOLS = [
 		type: 'function' as const,
 		function: {
 			name: 'write',
-			description:
-				'Create a new file, or replace a whole file when most of it changes. To change part of an existing file use edit. content is the complete file body.',
+			description: 'Create or replace a whole file. Prefer edit for partial changes.',
 			parameters: {
 				type: 'object',
 				properties: {
@@ -329,8 +342,7 @@ export const AGENT_TOOLS = [
 		type: 'function' as const,
 		function: {
 			name: 'edit',
-			description:
-				'Replace an exact text span in an existing file. old_string must match the file exactly (including indentation) and be unique unless replace_all is true. Include 2-3 surrounding lines to make it unique.',
+			description: 'Replace an exact unique span in a file (old_string → new_string).',
 			parameters: {
 				type: 'object',
 				properties: {
@@ -385,8 +397,7 @@ export const AGENT_TOOLS = [
 		type: 'function' as const,
 		function: {
 			name: 'retrieve',
-			description:
-				'Retrieve top-k code snippets relevant to a query (hybrid lexical + semantic when embeddings are indexed). Prefer this over dumping full files.',
+			description: 'Top-k code snippets for a query (prefer over dumping full files).',
 			parameters: {
 				type: 'object',
 				properties: {
@@ -440,8 +451,7 @@ export const AGENT_TOOLS = [
 		type: 'function' as const,
 		function: {
 			name: 'shell',
-			description:
-				'Run a shell command in the workspace (cmd.exe on Windows) under the sandbox (restricted by default: secret env scrubbed). Optional args.sandbox: safe-local|restricted|isolated|container. Output streams to the Agent Terminal. Long-running servers hand off after startup — do not re-run them.',
+			description: 'Run a cmd.exe command in the workspace (sandbox optional).',
 			parameters: {
 				type: 'object',
 				properties: {
@@ -459,7 +469,7 @@ export const AGENT_TOOLS = [
 		type: 'function' as const,
 		function: {
 			name: 'diagnostics',
-			description: 'Get language diagnostics (errors/warnings) for a file or the whole workspace',
+			description: 'Language errors/warnings for a file or workspace.',
 			parameters: {
 				type: 'object',
 				properties: { path: { type: 'string' } },
@@ -570,7 +580,7 @@ export const AGENT_TOOLS = [
 		type: 'function' as const,
 		function: {
 			name: 'git_conflicts',
-			description: 'List merge conflicts and conflict markers in the workspace',
+			description: 'List merge conflicts in the workspace.',
 			parameters: {
 				type: 'object',
 				properties: { path: { type: 'string' } },
@@ -581,7 +591,7 @@ export const AGENT_TOOLS = [
 		type: 'function' as const,
 		function: {
 			name: 'wiki_read',
-			description: 'Read a project wiki document by id (or list ids if omitted)',
+			description: 'Read a project wiki doc by id (or list ids).',
 			parameters: {
 				type: 'object',
 				properties: { id: { type: 'string' } },
@@ -592,7 +602,7 @@ export const AGENT_TOOLS = [
 		type: 'function' as const,
 		function: {
 			name: 'wiki_write',
-			description: 'Create/update a project wiki document (persisted across sessions)',
+			description: 'Create/update a project wiki document.',
 			parameters: {
 				type: 'object',
 				properties: {
@@ -621,7 +631,7 @@ export const AGENT_TOOLS = [
 		type: 'function' as const,
 		function: {
 			name: 'wiki_fact',
-			description: 'Add or supersede a temporal project fact (key/value)',
+			description: 'Add/supersede a project fact (key/value).',
 			parameters: {
 				type: 'object',
 				properties: {
@@ -637,7 +647,7 @@ export const AGENT_TOOLS = [
 		type: 'function' as const,
 		function: {
 			name: 'wiki_facts',
-			description: 'List current (non-superseded) temporal facts',
+			description: 'List current project facts.',
 			parameters: { type: 'object', properties: {} },
 		},
 	},
@@ -645,8 +655,7 @@ export const AGENT_TOOLS = [
 		type: 'function' as const,
 		function: {
 			name: 'update_status',
-			description:
-				'Write where the work stopped to .CodeForge/memory/status.json. Call this before the final reply of every turn. The next turn reads this file instead of scanning the repo.',
+			description: 'Save handoff (objective/stoppedAt/next) before the final reply.',
 			parameters: {
 				type: 'object',
 				properties: {
@@ -723,8 +732,7 @@ export const AGENT_TOOLS = [
 		type: 'function' as const,
 		function: {
 			name: 'delegate_task',
-			description:
-				'Delegate a focused subtask to a subagent (depth-1). For broad “where is X” questions when exploreSubagent is on, pass mode: "explore" (read-only).',
+			description: 'Run a focused subagent (optional mode: explore).',
 			parameters: {
 				type: 'object',
 				properties: {
@@ -754,6 +762,24 @@ export const AGENT_TOOLS = [
 			},
 		},
 	},
+	{
+		type: 'function' as const,
+		function: {
+			name: 'skill',
+			description:
+				'Load a playbook/skill by id or title. Call when you need domain conventions or a workflow. Catalog is injected at runtime.',
+			parameters: {
+				type: 'object',
+				properties: {
+					name: {
+						type: 'string',
+						description: 'Skill id or title from the catalog',
+					},
+				},
+				required: ['name'],
+			},
+		},
+	},
 ];
 
 const AGENT_TOOL_NAMES = new Set(AGENT_TOOLS.map(t => t.function.name));
@@ -769,7 +795,31 @@ function allAgentToolNames(mode?: AgentModeDefinition): string[] {
 
 function toolsForRound(activeToolNames: Set<string>, mode?: AgentModeDefinition): typeof AGENT_TOOLS {
 	const registry = getToolRegistry();
-	const native = AGENT_TOOLS.filter(t => activeToolNames.has(t.function.name));
+	const catalog = formatSkillCatalogForTool();
+	const native = AGENT_TOOLS.filter(t => activeToolNames.has(t.function.name)).map(t => {
+		if (t.function.name !== 'skill') return t;
+		return {
+			type: 'function' as const,
+			function: {
+				name: 'skill',
+				description: [
+					'Load a playbook/skill by id or title when you need domain conventions or a workflow.',
+					'Available skills:',
+					catalog,
+				].join('\n'),
+				parameters: {
+					type: 'object',
+					properties: {
+						name: {
+							type: 'string',
+							description: 'Skill id or title from the catalog',
+						},
+					},
+					required: ['name'],
+				},
+			},
+		};
+	}) as typeof AGENT_TOOLS;
 	const ext = registry
 		.toOpenAiTools()
 		.filter(t => {
@@ -898,27 +948,7 @@ export interface AgentLoopOptions {
 	agentModeId?: string;
 }
 
-const PLAN_MODE_TOOLS = new Set([
-	'list',
-	'read',
-	'search',
-	'retrieve',
-	'diagnostics',
-	'symbols',
-	'references',
-	'definition',
-	'git_status',
-	'git_diff',
-	'git_log',
-	'git_blame',
-	'open',
-	'wiki_read',
-	'wiki_search',
-	'wiki_write',
-	'wiki_fact',
-	'wiki_facts',
-	'update_status',
-]);
+const PLAN_MODE_TOOLS = new Set<string>(PLAN_ALLOWED_TOOLS);
 
 export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string> {
 	const checkpointSize = opts.maxSteps ?? 30;
@@ -975,19 +1005,9 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 		...(openPaths.some(p => /\.cshtml$|\.razor$|\/(Pages|Views)\//i.test(p)) ? ['skill.dotnet-razor'] : []),
 		...hintedSkillIds,
 	];
-	const skillSection = [
-		governance.buildPromptSection(opts.task, { forceSkillIds: forceSkills }),
-		getSkillsRules().buildPromptSection(
-			opts.task,
-			openPaths,
-			Math.min(2800, Math.max(1200, Math.floor(getContextBudget(opts.numCtx) * 0.04))),
-			agentMode?.skillHints ?? []
-		),
-	]
-		.filter(Boolean)
-		.join('\n\n');
-	const mcpHint = mcpTools.length && (!weakProfile || /\bmcp\b/i.test(opts.task))
-		? `MCP tools available via mcp_call: ${mcpTools.map(t => t.fullName).join(', ')}`
+	const forcedSkillSection = buildForcedSkillSection(forceSkills);
+	const mcpHint = mcpTools.length
+		? `MCP: ${mcpTools.length} tool(s) available via mcp_call (server__tool).`
 		: '';
 	const agentsMdSection = await loadAgentsMdForPrompt();
 
@@ -1008,20 +1028,16 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 	const systemBase = [
 		'You are CodeForge Agent, a coding agent inside a VS Code-based IDE on Windows.',
 		`Workspace root: ${opts.workspaceRoot ?? '(none — ask user to open a folder)'}`,
-		'Use the tools to read and change files and to run commands. Paths are relative to the workspace root.',
-		'For .NET use the `dotnet` tool (new, sln_add, add_reference, add_package, build, test); it runs from the workspace root with explicit paths.',
-		'Shell runs cmd.exe in the workspace root: `&&` works; PowerShell syntax and Unix pipes (tail/grep/head) do not.',
-		'Shell results include the exit code and output. When a command fails, change the command or the files before running it again.',
-		'Long-running servers (dotnet run, npm start) hand off after startup and keep streaming in the Agent Terminal; one start is enough.',
-		'The CONTEXT PACKET (PROJECT STATUS, IDE STATE, RETRIEVE, STABLE FACTS) is your starting point. PROJECT STATUS is where the work stopped; answer that from the block. STABLE FACTS hold the canonical project roots and open build errors.',
-		'Before the final reply, call update_status (objective, stoppedAt, next) so .CodeForge/memory/status.json stays current for the next turn.',
-		'Typical flow: retrieve/search → read the slice you will change → edit (existing file) or write (new file) → build/test.',
-		'Tool results stay in this chat. A repeated read of a range you already have returns the remembered text, marked as already in context.',
-		'Independent reads/searches can be issued together in one step.',
+		'Use tools to read/change files and run commands. Paths are relative to the workspace root.',
+		'For .NET use the `dotnet` tool; shell is cmd.exe (`&&` works; no PowerShell/Unix pipes).',
+		'Long-running servers hand off to the Agent Terminal after startup.',
+		'Use retrieve/search/read for repo context. Call `skill` for playbooks. Call update_status before the final reply.',
+		'Typical flow: retrieve/search → read the slice → edit or write → build/test.',
+		'Tool results stay in this chat. Independent reads/searches can be issued together.',
 		vscode.workspace.getConfiguration('codeforge.ai').get<boolean>('exploreSubagent')
 			? 'For broad “where is X across the repo” questions, you may call delegate_task with mode explore (read-only). Prefer retrieve for focused lookups.'
 			: '',
-		'The IDE runs the project build/test (oracle) after a few writes and when you finish; the task is done when it is green. If you cannot finish, reply with `blocked: <reason>`.',
+		'The IDE runs build/test (oracle) after writes and when you finish; done when green. If blocked, reply `blocked: <reason>`.',
 		'Final reply: a short summary of what changed and how to run it.',
 		opts.forceJson
 			? 'This server expects JSON responses. Prefer native tool_calls when available; otherwise reply with ONLY JSON like {"tool_calls":[{"id":"call_1","type":"function","function":{"name":"write","arguments":{"path":"...","content":"..."}}}]} — no markdown fences.'
@@ -1030,7 +1046,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 			? 'This model has no native tools: reply with only JSON tool_calls in content (no markdown). Example: {"tool_calls":[{"id":"call_1","type":"function","function":{"name":"retrieve","arguments":{"query":"..."}}}]}'
 			: '',
 		statusQuestion
-			? 'This turn asks where the work stopped. Answer from PROJECT STATUS only. Do not explore the repo, run shell, or call git. The only tool is update_status, after the answer.'
+			? 'This turn asks where the work stopped. Answer from CONTEXT status only. Do not explore the repo, run shell, or call git. The only tool is update_status, after the answer.'
 			: '',
 		planModeHint,
 		agentMode
@@ -1043,7 +1059,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					.join('\n')
 			: '',
 		agentsMdSection,
-		skillSection,
+		forcedSkillSection,
 		mcpHint,
 	]
 		.filter(Boolean)
@@ -1076,27 +1092,19 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 		trace?.setSession?.(opts.sessionId);
 	}
 
-	const packet = await buildContextPacket({
-		task: opts.task,
-		facts,
+	// First round: lean bootstrap (OpenCode-style). Full packet comes on later refresh.
+	const lean = await buildLeanContextPacket({
 		workspaceRoot: opts.workspaceRoot,
-		includeRetrieve: depth === 0,
-		sessionId: opts.sessionId ?? undefined,
-		budget: { ...DEFAULT_BUDGET, total: contextPacketTokenBudget(getContextBudget(opts.numCtx)) },
-		historyText: history
-			.slice(-4)
-			.map(h => `${h.role}: ${String(h.content).slice(0, 280)}`)
-			.join('\n'),
-		rerankFn: depth === 0 ? makeRerankFn(opts) : undefined,
+		model: opts.model,
 	});
-	opts.onContextBadge?.(packet.badge);
+	opts.onContextBadge?.(lean.badge);
 	opts.onActivity?.({
 		kind: 'context',
-		label: `${packet.badge.indexed} indexed · ${packet.badge.inContext} in context`,
-		detail: packet.markdown.slice(0, 400),
+		label: 'Lean context (step 1)',
+		detail: lean.markdown.slice(0, 400),
 	});
 
-	const system = `${systemBase}\n\n${packet.markdown}`;
+	const system = `${systemBase}\n\n${lean.markdown}`;
 
 	let messages: ChatMessage[] = [
 		{ role: 'system', content: system },
@@ -1315,7 +1323,10 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 	let systemBaseWithPacket =
 		typeof messages[0]?.content === 'string' ? messages[0].content : system;
 	const contextBudget = getContextBudget(opts.numCtx);
-	const toolCap = toolResultCharCap(contextBudget);
+	let toolCap = toolResultCharCap(contextBudget);
+	const exploreSubagentOn =
+		vscode.workspace.getConfiguration('codeforge.ai').get<boolean>('exploreSubagent') === true;
+	const mcpAvailable = mcpTools.length > 0;
 	const compactEvery = compactEveryNSteps(contextBudget);
 	const softCompactAt = softCompactTokenThreshold(contextBudget);
 	const midCompactAt = midCompactTokenThreshold(contextBudget);
@@ -1403,18 +1414,20 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 				lastRealPromptTokens
 			);
 
-			// Refresh context packet periodically so IDE/retrieve stay current.
+			// Refresh context packet periodically so IDE/status stay current.
 			if (step > 0 && step % packetEvery === 0 && depth === 0) {
 				try {
+					const wantRetrieve = step >= 2 || retrieveQueriesSeen.size > 0;
 					const fresh = await buildContextPacket({
 						task: opts.task,
 						facts,
 						workspaceRoot: opts.workspaceRoot,
-						includeRetrieve: true,
+						includeRetrieve: wantRetrieve,
+						includePrefetch: step >= 2,
 						retrieveK: 4,
 						sessionId: opts.sessionId ?? undefined,
 						budget: {
-							total: contextBudget,
+							total: contextPacketTokenBudget(contextBudget),
 							alloc: {
 								system: 0.1,
 								status: 0.05,
@@ -1430,7 +1443,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 							},
 						},
 						boostPaths: [...touchedPaths],
-						rerankFn: makeRerankFn(opts),
+						rerankFn: wantRetrieve ? makeRerankFn(opts) : undefined,
 						historyText: [
 							...history.slice(-3).map(h => `${h.role}: ${String(h.content).slice(0, 350)}`),
 							...messages
@@ -1551,12 +1564,21 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					? 'fix'
 					: opts.basePhase
 				: currentPhase(opts.task, { buildRed: gates.buildRed });
+			const toolProfile = profileForTurn(phase, opts.task, { planMode: opts.planMode });
+			toolCap = toolResultCharCap(contextBudget, toolProfile === 'explore');
 			activeToolNames = toolNamesFor(phase, opts.task, {
 				weakProfile,
-				allNames: allAgentToolNames(agentMode).filter(n => !opts.planMode || PLAN_MODE_TOOLS.has(n) || !AGENT_TOOL_NAMES.has(n)),
+				allNames: allAgentToolNames(agentMode),
+				planMode: opts.planMode,
+				mcpAvailable,
+				exploreSubagent: exploreSubagentOn,
 			});
 			if (phase !== lastPhase) {
-				opts.onActivity?.({ kind: 'context', label: `Phase: ${phase}`, detail: [...activeToolNames].join(', ') });
+				opts.onActivity?.({
+					kind: 'context',
+					label: `Phase: ${phase} (${toolProfile})`,
+					detail: [...activeToolNames].join(', '),
+				});
 				lastPhase = phase;
 			}
 			const round = await postAgentRound(
@@ -2060,7 +2082,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					continue;
 				}
 
-				if (weakProfile && !activeToolNames.has(name) && AGENT_TOOL_NAMES.has(name)) {
+				if (!activeToolNames.has(name) && AGENT_TOOL_NAMES.has(name)) {
 					refuse(
 						`Tool "${name}" is not available in the ${phase} phase. Available now: ${[...activeToolNames].join(', ')}.`,
 						'phase'
@@ -3008,6 +3030,17 @@ async function executeTool(
 				const toolArgs = (args.arguments as Record<string, unknown>) ?? {};
 				return await mcp.callTool(toolName, toolArgs);
 			}
+			case 'skill': {
+				const nameArg = String(args.name ?? '').trim();
+				if (!nameArg) {
+					return `Error: skill name required. Catalog:\n${formatSkillCatalogForTool()}`;
+				}
+				const resolved = resolveSkillBody(nameArg);
+				if (!resolved) {
+					return `Error: unknown skill "${nameArg}". Catalog:\n${formatSkillCatalogForTool()}`;
+				}
+				return `# Skill: ${resolved.title}\n\n${clipData(resolved.body, 6000)}`;
+			}
 			default: {
 				const registry = getToolRegistry();
 				const def = registry.get(name);
@@ -3168,9 +3201,11 @@ async function compactWithLlm(
 		task: opts.task,
 		facts,
 		workspaceRoot: opts.workspaceRoot,
-		includeRetrieve: true,
+		includeRetrieve: false,
+		includePrefetch: false,
 		retrieveK: 4,
 		rerankFn: makeRerankFn(opts),
+		budget: { ...DEFAULT_BUDGET, total: contextPacketTokenBudget(getContextBudget(opts.numCtx)) },
 	});
 	opts.onContextBadge?.(packet.badge);
 

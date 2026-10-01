@@ -45,7 +45,10 @@ export async function buildContextPacket(opts: {
 	task: string;
 	facts?: StableFacts;
 	workspaceRoot?: string;
+	/** Opt-in RETRIEVE snippets (default false — lean prefill). */
 	includeRetrieve?: boolean;
+	/** Opt-in workspace prefetch listing (default false). */
+	includePrefetch?: boolean;
 	retrieveK?: number;
 	sessionId?: string;
 	budget?: ContextBudget;
@@ -61,11 +64,13 @@ export async function buildContextPacket(opts: {
 	const facts = normalizeFacts(opts.facts);
 	const ide = await gatherIdeState();
 	const capabilities = await gatherToolCapabilities(opts.workspaceRoot, ide.gitAvailable);
-	const prefetch = await gatherWorkspacePrefetch(opts.workspaceRoot);
+	const prefetch = opts.includePrefetch
+		? await gatherWorkspacePrefetch(opts.workspaceRoot)
+		: '';
 	const lspOutline = await gatherActiveLspOutline();
 	let retrieved: RetrieveHit[] = [];
 	let retrieveNote = '';
-	if (opts.includeRetrieve !== false) {
+	if (opts.includeRetrieve === true) {
 		try {
 			retrieved = await retrieveSnippets(opts.task, opts.retrieveK ?? 6, {
 				rerank: true,
