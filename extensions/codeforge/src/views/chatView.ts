@@ -5,12 +5,16 @@
  */
 
 import * as vscode from 'vscode';
+import { spawn, type ChildProcessWithoutNullStreams } from 'child_process';
+import * as fs from 'fs/promises';
+import * as os from 'os';
+import * as path from 'path';
 import { VSCodeAIBridge } from '../bridge/vscodeBridge';
 import { AiSettingsStore } from '../settings/aiSettingsStore';
 import { runAgentWithTools, AgentActivityEvent, type AgentLoopOptions } from '../agent/agentLoop';
 import { runOrchestrated } from '../agent/orchestratorRun';
 import { runReviewPipeline } from '../agent/reviewPipeline';
-import { SessionStore } from '../sessions/sessionStore';
+import { SessionStore, type MessageTimings } from '../sessions/sessionStore';
 import { getApprovalPolicy, PermissionLevel } from '../policy/approvalPolicy';
 import { ensureWorkspaceIndex, getIndexedCount } from '../intelligence/workspaceIndex';
 import {
@@ -44,6 +48,8 @@ import {
 
 import { getChatViewHtml } from './chatViewHtml';
 
+const OPEN_TABS_KEY = 'codeforge.ai.openSessionIds';
+
 type AgentMode = 'ask' | 'plan' | 'agent';
 type Permissions = PermissionLevel;
 
@@ -59,6 +65,16 @@ interface TimelineItem {
 	/** User-turn index (0-based). */
 	turn?: number;
 	ts: number;
+}
+
+interface ChatMessage {
+	role: 'user' | 'assistant';
+	content: string;
+	status?: string;
+	timestamp: Date;
+	reasoning?: string;
+	timings?: MessageTimings;
+	model?: string;
 }
 
 export class ChatViewProvider implements vscode.WebviewViewProvider {
@@ -86,18 +102,26 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 	/** Set by /cards, /plan-run and /review for the next run only. */
 	private _runKind?: 'cards' | 'plan-run' | 'review';
 	private _currentTurn = 0;
+	private _openSessionIds: string[] = [];
+	private _turnReasoning = '';
+	private _turnTimings: MessageTimings | undefined;
+	private _pythonProc: ChildProcessWithoutNullStreams | undefined;
+	private _context?: vscode.ExtensionContext;
 
 	constructor(
 		extensionUri: vscode.Uri,
 		bridge: VSCodeAIBridge,
 		_output: vscode.OutputChannel,
 		store: AiSettingsStore,
-		sessions: SessionStore
+		sessions: SessionStore,
+		context?: vscode.ExtensionContext
 	) {
 		this._extensionUri = extensionUri;
 		this._bridge = bridge;
 		this._store = store;
 		this._sessions = sessions;
+		this._context = context;
+		this._openSessionIds = this.readOpenTabs();
 		const cfg = vscode.workspace.getConfiguration('codeforge.ai');
 		const rawMode = cfg.get<string>('mode');
 		// Migrate legacy "auto" mode → agent + allowAll permissions.
@@ -148,13 +172,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 	}
 
 	async loadSession(sessionId: string): Promise<void> {
+		if (this._running && this._currentSessionId && this._currentSessionId !== sessionId) {
+			vscode.window.showWarningMessage('Stop the agent before switching chats.');
+			return;
+		}
 		const session = this._sessions.get(sessionId);
 		if (!session) {
 			vscode.window.showWarningMessage('Session not found');
 			return;
 		}
+		this.stopPython();
 		this._currentSessionId = session.id;
 		await this._sessions.setActiveId(session.id);
+		this.ensureOpenTab(session.id);
 		try {
 			getApprovalPolicy().clearSession();
 		} catch {
@@ -206,12 +236,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			role: m.role,
 			content: m.content,
 			timestamp: new Date(m.timestamp),
+			reasoning: m.reasoning,
+			timings: m.timings,
+			model: session.model,
 		}));
 		this._currentTurn = lastTurn;
 		this._queue = [];
 		this.pushQueue();
 		await this.focus();
 		this.updateView();
+		this.pushTabs();
 		if (this._view) {
 			this._view.title = session.title.slice(0, 40);
 		}
@@ -250,7 +284,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
 		webviewView.webview.options = {
 			enableScripts: true,
-			localResourceRoots: [this._extensionUri],
+			localResourceRoots: [
+				this._extensionUri,
+				vscode.Uri.joinPath(this._extensionUri, 'resources', 'webview'),
+			],
 		};
 
 		webviewView.webview.html = this._getHtmlContent();
@@ -260,8 +297,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 				case 'ready':
 					this.pushConfig();
 					this.pushQueue();
+					this.pushTabs();
 					await this.restoreActiveSessionIfNeeded();
 					this.updateView();
+					this.pushTabs();
 					break;
 				case 'sendMessage':
 					await this.handleUserMessage(
@@ -346,11 +385,34 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 				case 'restoreCheckpoint':
 					await this.restoreCheckpoint(Number(message.messageIndex ?? -1));
 					break;
+				case 'switchTab':
+					await this.switchTab(String(message.id ?? ''));
+					break;
+				case 'closeTab':
+					await this.closeTab(String(message.id ?? ''));
+					break;
+				case 'branchAt':
+					await this.branchAt(Number(message.messageIndex ?? -1));
+					break;
+				case 'regenerate':
+					await this.regenerateAt(Number(message.messageIndex ?? -1));
+					break;
+				case 'runPython':
+					await this.runPython(String(message.code ?? ''));
+					break;
+				case 'stopPython':
+					this.stopPython();
+					break;
 			}
 		});
 	}
 
 	newChat() {
+		if (this._running) {
+			vscode.window.showWarningMessage('Stop the agent before opening a new chat.');
+			return;
+		}
+		this.stopPython();
 		this._messages = [];
 		this._timeline = [];
 		this._queue = [];
@@ -363,6 +425,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		this._contextUsage = null;
 		this._editSummary = null;
 		this._pendingAttachments = [];
+		this._turnReasoning = '';
+		this._turnTimings = undefined;
 		void this._sessions.setActiveId(null);
 		getEditJournal().clearSession();
 		try {
@@ -379,6 +443,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		this.updateView();
 		this.pushQueue();
 		this.pushConfig();
+		this.pushTabs();
 	}
 
 	private async restoreActiveSessionIfNeeded(): Promise<void> {
@@ -386,15 +451,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		const activeId = this._sessions.getActiveId();
 		const session = (activeId && this._sessions.get(activeId)) || this._sessions.latest();
 		if (session?.messages.length) {
-			this._currentSessionId = session.id;
-			this._messages = session.messages.map(m => ({
-				role: m.role,
-				content: m.content,
-				timestamp: new Date(m.timestamp),
-			}));
-			if (this._view) {
-				this._view.title = session.title.slice(0, 40);
-			}
+			await this.loadSession(session.id);
 		}
 	}
 
@@ -403,17 +460,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		if (!looksLikeContinue(task)) return;
 		const latest = this._sessions.latest();
 		if (!latest?.messages.length) return;
-		this._currentSessionId = latest.id;
-		await this._sessions.setActiveId(latest.id);
-		this._messages = latest.messages.map(m => ({
-			role: m.role,
-			content: m.content,
-			timestamp: new Date(m.timestamp),
-		}));
-		if (this._view) {
-			this._view.title = latest.title.slice(0, 40);
-		}
-		this.updateView();
+		await this.loadSession(latest.id);
 	}
 
 	async focus() {
@@ -472,11 +519,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 				serverName: server?.name,
 			});
 			this._currentSessionId = session.id;
+			this.ensureOpenTab(session.id);
 			if (this._view) {
 				this._view.title = session.title.slice(0, 40);
 			}
+			this.pushTabs();
 		} else {
 			await this._sessions.setActiveId(this._currentSessionId);
+			this.ensureOpenTab(this._currentSessionId);
+			this.pushTabs();
 		}
 
 		if (this._permissions === 'allowAll' || vscode.workspace.getConfiguration('codeforge.ai').get<boolean>('fullAgentFreedom') === true) {
@@ -521,14 +572,25 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			this._mode === 'ask' ? 'Thinking...' : 'Working...',
 			'pending'
 		);
+		this._turnReasoning = '';
+		this._turnTimings = undefined;
 		this.updateView();
 		this.pushQueue();
 
 		try {
 			const reply = await this.executeLocalAgent(fullTask, images);
 			if (!this._cancelled) {
-				this.updateLastMessage('assistant', reply);
-				await this._sessions.appendMessage(this._currentSessionId, 'assistant', reply);
+				const extra = {
+					reasoning: this._turnReasoning || undefined,
+					timings: this._turnTimings,
+				};
+				this.updateLastMessage('assistant', reply, undefined, extra);
+				await this._sessions.appendMessage(
+					this._currentSessionId,
+					'assistant',
+					reply,
+					extra
+				);
 				await this._sessions.updateState(this._currentSessionId, 'completed');
 			} else {
 				await this._sessions.updateState(this._currentSessionId, 'cancelled');
@@ -783,6 +845,37 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 	}
 
 	private pushActivity(event: AgentActivityEvent) {
+		// Thoughts are shown in the Reasoning accordion on the assistant message.
+		if (event.kind === 'thought') {
+			if (event.detail) {
+				this._turnReasoning = this._turnReasoning
+					? `${this._turnReasoning}\n\n${event.detail}`
+					: event.detail;
+				const last = this._messages[this._messages.length - 1];
+				if (last?.role === 'assistant') {
+					last.reasoning = this._turnReasoning;
+					this.updateView();
+				}
+			}
+			return;
+		}
+		// Harness noise — never show in the user-facing tool timeline.
+		if (event.kind === 'context' || event.kind === 'thinking' || event.kind === 'compact') {
+			return;
+		}
+		if (event.kind === 'checkpoint') {
+			const label = String(event.label || '');
+			if (
+				/^(hook|Lesson|Oracle|LLM |Repaired|Retry|Nuked|Switched|Parsed|Truncated|Build-fix|context |Phase:|Prior context|Turn summary|Stopped)/i.test(
+					label
+				) ||
+				/\bindexed\b/i.test(label) ||
+				/^contextBudget\b/i.test(label) ||
+				/^Thinking/i.test(label)
+			) {
+				return;
+			}
+		}
 		if (event.kind === 'tool' && event.toolCallId) {
 			const existing = this._timeline.find(
 				t => t.kind === 'tool' && t.toolCallId === event.toolCallId
@@ -994,7 +1087,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 				numCtx: server.numCtx,
 				forceJson: server.forceJson === true,
 				onStatus: text => {
+					// Tool progress uses tool cards — keep pending bubble quiet (no step spam).
 					if (/^Running\s/i.test(text)) {
+						return;
+					}
+					if (/^Thinking/i.test(text) || /^Oracle:/i.test(text) || /compacting|retrying|continuing/i.test(text)) {
 						return;
 					}
 					this.updateLastMessage('assistant', text, 'pending');
@@ -1008,6 +1105,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 					this._contextUsage = usage;
 					this.pushConfig();
 				},
+				onTurnMetrics: metrics => this.applyTurnMetrics(metrics),
 				onTaskUpdate: this._onTaskUpdate,
 				sessionStore: this._sessions,
 				sessionId: this._currentSessionId,
@@ -1086,6 +1184,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 				if (/^Running\s/i.test(text)) {
 					return;
 				}
+				if (/^Thinking/i.test(text) || /^Oracle:/i.test(text) || /compacting|retrying|continuing/i.test(text)) {
+					return;
+				}
 				this.updateLastMessage('assistant', text, 'pending');
 			},
 			onActivity: ev => this.pushActivity(ev),
@@ -1097,6 +1198,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 				this._contextUsage = usage;
 				this.pushConfig();
 			},
+			onTurnMetrics: metrics => this.applyTurnMetrics(metrics),
 			onTaskUpdate: this._onTaskUpdate,
 			sessionStore: this._sessions,
 			sessionId: this._currentSessionId,
@@ -1182,25 +1284,77 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			method: 'POST',
 			headers: {
 				'Content-Type': 'application/json',
-				Accept: 'application/json',
+				Accept: 'text/event-stream, application/json',
 				...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
 			},
 			signal: this._abort?.signal,
 			body: JSON.stringify({
 				model: provider === 'ollama' ? model || 'llama3.2' : model,
 				messages: [
-					{ role: 'system', content: system },
+					{ role: 'system', content: system.length > 6000 ? system.slice(0, 6000) + '\n…' : system },
 					...history,
 					{ role: 'user', content: userContent },
 				],
 				temperature: 0.2,
-				stream: false,
+				stream: true,
+				stream_options: { include_usage: true },
 				max_tokens: 2048,
 			}),
 		});
 
 		if (!response.ok) {
 			throw new Error(`LLM error ${response.status}: ${await response.text()}`);
+		}
+
+		const ctype = (response.headers.get('content-type') || '').toLowerCase();
+		const { server: askServer } = this._store.getActiveSelection();
+		const limit = askServer?.numCtx && askServer.numCtx > 0 ? askServer.numCtx : 0;
+
+		if (response.body && (ctype.includes('event-stream') || ctype.includes('octet-stream') || !ctype.includes('json'))) {
+			const reader = response.body.getReader();
+			const decoder = new TextDecoder();
+			let buffer = '';
+			let content = '';
+			let lastUi = 0;
+			let usage: { prompt_tokens?: number; input_tokens?: number } | undefined;
+			while (true) {
+				const { done, value } = await reader.read();
+				if (done) break;
+				buffer += decoder.decode(value, { stream: true });
+				const parts = buffer.split(/\r?\n/);
+				buffer = parts.pop() ?? '';
+				for (const line of parts) {
+					const t = line.trim();
+					if (!t.startsWith('data:')) continue;
+					const payload = t.slice(5).trim();
+					if (!payload || payload === '[DONE]') continue;
+					try {
+						const chunk = JSON.parse(payload) as {
+							usage?: { prompt_tokens?: number; input_tokens?: number };
+							choices?: Array<{ delta?: { content?: string }; message?: { content?: string } }>;
+						};
+						if (chunk.usage) usage = chunk.usage;
+						const piece =
+							chunk.choices?.[0]?.delta?.content ?? chunk.choices?.[0]?.message?.content ?? '';
+						if (piece) {
+							content += piece;
+							const now = Date.now();
+							if (now - lastUi >= 50) {
+								lastUi = now;
+								this.updateLastMessage('assistant', content, 'pending');
+							}
+						}
+					} catch {
+						/* skip */
+					}
+				}
+			}
+			const used = Number(usage?.prompt_tokens ?? usage?.input_tokens ?? 0) || 0;
+			if (used > 0 && limit > 0) {
+				this._contextUsage = { used, limit };
+				this.pushConfig();
+			}
+			return content || '(empty response)';
 		}
 
 		const raw = await response.text();
@@ -1228,8 +1382,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			usage?: { prompt_tokens?: number; input_tokens?: number };
 		};
 		const used = Number(data.usage?.prompt_tokens ?? data.usage?.input_tokens ?? 0) || 0;
-		const { server: askServer } = this._store.getActiveSelection();
-		const limit = askServer?.numCtx && askServer.numCtx > 0 ? askServer.numCtx : 0;
 		if (used > 0 && limit > 0) {
 			this._contextUsage = { used, limit };
 			this.pushConfig();
@@ -1384,17 +1536,65 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 	}
 
 	private addMessage(role: 'user' | 'assistant', content: string, status?: string) {
-		this._messages.push({ role, content, status, timestamp: new Date() });
+		const { model } = this._store.getActiveSelection();
+		this._messages.push({
+			role,
+			content,
+			status,
+			timestamp: new Date(),
+			model: role === 'assistant' ? model : undefined,
+		});
 		this.updateView();
 	}
 
-	private updateLastMessage(role: 'user' | 'assistant', content: string, status?: string) {
+	private updateLastMessage(
+		role: 'user' | 'assistant',
+		content: string,
+		status?: string,
+		extra?: { reasoning?: string; timings?: MessageTimings }
+	) {
 		const lastIndex = this._messages.length - 1;
 		if (lastIndex >= 0 && this._messages[lastIndex].role === role) {
 			this._messages[lastIndex].content = content;
 			this._messages[lastIndex].status = status;
+			if (extra?.reasoning !== undefined) {
+				this._messages[lastIndex].reasoning = extra.reasoning;
+			}
+			if (extra?.timings !== undefined) {
+				this._messages[lastIndex].timings = extra.timings;
+			}
 		}
 		this.updateView();
+	}
+
+	private applyTurnMetrics(metrics: {
+		promptTokens?: number;
+		completionTokens?: number;
+		durationMs?: number;
+		tokensPerSecond?: number;
+		reasoning?: string;
+	}): void {
+		if (metrics.reasoning) {
+			this._turnReasoning = metrics.reasoning;
+		}
+		if (
+			metrics.promptTokens !== undefined ||
+			metrics.completionTokens !== undefined ||
+			metrics.durationMs !== undefined
+		) {
+			this._turnTimings = {
+				promptTokens: metrics.promptTokens,
+				completionTokens: metrics.completionTokens,
+				durationMs: metrics.durationMs,
+				tokensPerSecond: metrics.tokensPerSecond,
+			};
+		}
+		const last = this._messages[this._messages.length - 1];
+		if (last?.role === 'assistant') {
+			if (this._turnReasoning) last.reasoning = this._turnReasoning;
+			if (this._turnTimings) last.timings = this._turnTimings;
+			this.updateView();
+		}
 	}
 
 	private updateView() {
@@ -1407,20 +1607,252 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 				messages: this._messages,
 				timeline: this._timeline,
 				collapseToolCards,
+				busy: this._running,
+			});
+		}
+	}
+
+	private readOpenTabs(): string[] {
+		const raw = this._context?.workspaceState.get<string[]>(OPEN_TABS_KEY) ?? [];
+		return raw.filter(id => !!this._sessions.get(id));
+	}
+
+	private persistOpenTabs(): void {
+		void this._context?.workspaceState.update(OPEN_TABS_KEY, this._openSessionIds);
+	}
+
+	private ensureOpenTab(id: string): void {
+		if (!id) return;
+		if (!this._openSessionIds.includes(id)) {
+			this._openSessionIds.push(id);
+			this.persistOpenTabs();
+		}
+	}
+
+	private pushTabs(): void {
+		if (!this._view) return;
+		const open = this._openSessionIds
+			.map(id => {
+				const s = this._sessions.get(id);
+				if (!s) return null;
+				return { id: s.id, title: s.title || 'Chat' };
+			})
+			.filter((t): t is { id: string; title: string } => !!t);
+		this._openSessionIds = open.map(t => t.id);
+		this.persistOpenTabs();
+		this._view.webview.postMessage({
+			type: 'tabs',
+			open,
+			active: this._currentSessionId,
+			busy: this._running,
+		});
+	}
+
+	private async switchTab(id: string): Promise<void> {
+		if (!id || id === this._currentSessionId) return;
+		if (this._running) {
+			vscode.window.showWarningMessage('Stop the agent before switching chats.');
+			this.pushTabs();
+			return;
+		}
+		await this.loadSession(id);
+	}
+
+	private async closeTab(id: string): Promise<void> {
+		if (!id) return;
+		if (this._running && id === this._currentSessionId) {
+			vscode.window.showWarningMessage('Stop the agent before closing this chat.');
+			return;
+		}
+		const idx = this._openSessionIds.indexOf(id);
+		if (idx < 0) return;
+		this._openSessionIds.splice(idx, 1);
+		this.persistOpenTabs();
+		if (id === this._currentSessionId) {
+			const next = this._openSessionIds[idx] ?? this._openSessionIds[idx - 1];
+			if (next) {
+				await this.loadSession(next);
+			} else {
+				this.newChat();
+			}
+		} else {
+			this.pushTabs();
+		}
+	}
+
+	private async branchAt(messageIndex: number): Promise<void> {
+		if (this._running) {
+			vscode.window.showWarningMessage('Stop the agent before branching.');
+			return;
+		}
+		if (!this._currentSessionId) {
+			vscode.window.showWarningMessage('Nothing to branch yet.');
+			return;
+		}
+		const forked = await this._sessions.forkFrom(this._currentSessionId, messageIndex);
+		if (!forked) {
+			vscode.window.showWarningMessage('Could not branch at that message.');
+			return;
+		}
+		this.ensureOpenTab(forked.id);
+		await this.loadSession(forked.id);
+		vscode.window.showInformationMessage(`Opened branch: ${forked.title}`);
+	}
+
+	private async regenerateAt(messageIndex: number): Promise<void> {
+		if (this._running) {
+			vscode.window.showWarningMessage('Stop the agent before regenerating.');
+			return;
+		}
+		if (
+			!Number.isFinite(messageIndex) ||
+			messageIndex < 0 ||
+			messageIndex >= this._messages.length
+		) {
+			return;
+		}
+		const msg = this._messages[messageIndex];
+		if (msg.role !== 'assistant') return;
+
+		let userIndex = -1;
+		for (let i = messageIndex - 1; i >= 0; i--) {
+			if (this._messages[i].role === 'user') {
+				userIndex = i;
+				break;
+			}
+		}
+		if (userIndex < 0) return;
+
+		const promptText =
+			this._messages[userIndex].content.split(/\n\n(?:Attached |Images:|---)/)[0]?.trim() ||
+			this._messages[userIndex].content;
+		const userTurn =
+			this._messages.slice(0, userIndex + 1).filter(m => m.role === 'user').length - 1;
+
+		if (this._currentSessionId) {
+			await this._sessions.truncateFrom(this._currentSessionId, userIndex);
+		}
+		this._messages = this._messages.slice(0, userIndex);
+		this._timeline = this._timeline.filter(
+			t => t.turn !== undefined && t.turn !== null && t.turn < userTurn
+		);
+		this._currentTurn = Math.max(0, userTurn - 1);
+		this.updateView();
+		await this.runTask(promptText);
+	}
+
+	private async runPython(code: string): Promise<void> {
+		this.stopPython();
+		const trimmed = code.trim();
+		if (!trimmed) {
+			this._view?.webview.postMessage({
+				type: 'pythonResult',
+				ok: false,
+				output: 'No code to run.',
+			});
+			return;
+		}
+		const tmp = path.join(os.tmpdir(), `codeforge-py-${Date.now()}.py`);
+		try {
+			await fs.writeFile(tmp, trimmed, 'utf8');
+		} catch (err) {
+			this._view?.webview.postMessage({
+				type: 'pythonResult',
+				ok: false,
+				output: err instanceof Error ? err.message : String(err),
+			});
+			return;
+		}
+
+		const cmd = process.platform === 'win32' ? 'py' : 'python3';
+		const args = process.platform === 'win32' ? ['-3', tmp] : [tmp];
+		let proc: ChildProcessWithoutNullStreams;
+		try {
+			proc = spawn(cmd, args, {
+				cwd: this._bridge.getWorkspaceRoot() || os.tmpdir(),
+				env: process.env,
+			});
+		} catch {
+			try {
+				proc = spawn('python', [tmp], {
+					cwd: this._bridge.getWorkspaceRoot() || os.tmpdir(),
+					env: process.env,
+				});
+			} catch (err) {
+				this._view?.webview.postMessage({
+					type: 'pythonResult',
+					ok: false,
+					output: err instanceof Error ? err.message : String(err),
+				});
+				void fs.unlink(tmp).catch(() => undefined);
+				return;
+			}
+		}
+
+		this._pythonProc = proc;
+		this._view?.webview.postMessage({ type: 'pythonStatus', running: true });
+		let output = '';
+		proc.stdout.on('data', (chunk: Buffer) => {
+			output += chunk.toString();
+			this._view?.webview.postMessage({ type: 'pythonChunk', text: chunk.toString() });
+		});
+		proc.stderr.on('data', (chunk: Buffer) => {
+			output += chunk.toString();
+			this._view?.webview.postMessage({ type: 'pythonChunk', text: chunk.toString() });
+		});
+		proc.on('close', code => {
+			this._pythonProc = undefined;
+			void fs.unlink(tmp).catch(() => undefined);
+			this._view?.webview.postMessage({
+				type: 'pythonResult',
+				ok: code === 0,
+				output: output || `(exit ${code ?? '?'})`,
+				exitCode: code,
+			});
+		});
+		proc.on('error', err => {
+			this._pythonProc = undefined;
+			void fs.unlink(tmp).catch(() => undefined);
+			this._view?.webview.postMessage({
+				type: 'pythonResult',
+				ok: false,
+				output: err.message,
+			});
+		});
+	}
+
+	private stopPython(): void {
+		if (this._pythonProc) {
+			try {
+				this._pythonProc.kill();
+			} catch {
+				/* ignore */
+			}
+			this._pythonProc = undefined;
+			this._view?.webview.postMessage({
+				type: 'pythonResult',
+				ok: false,
+				output: 'Stopped.',
 			});
 		}
 	}
 
 	private _getHtmlContent(): string {
-		return getChatViewHtml();
+		const webview = this._view!.webview;
+		const asUri = (...parts: string[]) =>
+			webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, ...parts)).toString();
+		const base = ['resources', 'webview'] as const;
+		return getChatViewHtml({
+			cspSource: webview.cspSource,
+			markedJs: asUri(...base, 'marked.umd.js'),
+			hljsJs: asUri(...base, 'highlight.min.js'),
+			hljsCss: asUri(...base, 'github-dark.min.css'),
+			katexJs: asUri(...base, 'katex.min.js'),
+			katexCss: asUri(...base, 'katex.min.css'),
+			katexAutoRenderJs: asUri(...base, 'katex-auto-render.min.js'),
+			mermaidJs: asUri(...base, 'mermaid.min.js'),
+		});
 	}
-}
-
-interface ChatMessage {
-	role: 'user' | 'assistant';
-	content: string;
-	status?: string;
-	timestamp: Date;
 }
 
 /** Strip operational footers / checkpoint dumps before sending chat history to the LLM. */

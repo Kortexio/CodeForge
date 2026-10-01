@@ -1,15 +1,29 @@
 /**
- * Webview HTML/CSS/JS for the Agent chat panel (Cursor-like composer).
+ * Webview HTML/CSS/JS for the Agent chat panel (Llama-UI inspired).
  * All user-facing strings are English.
  */
 
-export function getChatViewHtml(): string {
+export interface ChatViewAssets {
+	cspSource: string;
+	markedJs: string;
+	hljsJs: string;
+	hljsCss: string;
+	katexJs: string;
+	katexCss: string;
+	katexAutoRenderJs: string;
+	mermaidJs: string;
+}
+
+export function getChatViewHtml(assets: ChatViewAssets): string {
 	return `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${assets.cspSource} https: data:; style-src ${assets.cspSource} 'unsafe-inline'; script-src ${assets.cspSource} 'unsafe-inline'; font-src ${assets.cspSource} data:;">
 <title>CodeForge AI</title>
+<link rel="stylesheet" href="${assets.hljsCss}" />
+<link rel="stylesheet" href="${assets.katexCss}" />
 <style>
   :root { --gap: 8px; --radius: 8px; }
   * { box-sizing: border-box; }
@@ -21,10 +35,38 @@ export function getChatViewHtml(): string {
     background: var(--vscode-sideBar-background);
   }
   body { display: flex; flex-direction: column; padding: 0; }
+  .tab-strip {
+    flex-shrink: 0; display: flex; align-items: stretch; gap: 2px;
+    padding: 4px 6px 0; border-bottom: 1px solid var(--vscode-panel-border);
+    overflow-x: auto; background: var(--vscode-sideBar-background);
+  }
+  .tab {
+    display: inline-flex; align-items: center; gap: 4px; max-width: 140px;
+    padding: 5px 8px; border: 1px solid transparent; border-bottom: 0;
+    border-radius: 6px 6px 0 0; background: transparent; color: var(--vscode-descriptionForeground);
+    font: inherit; font-size: 0.78em; cursor: pointer; white-space: nowrap;
+  }
+  .tab.active {
+    color: var(--vscode-foreground);
+    background: var(--vscode-editor-background, var(--vscode-input-background));
+    border-color: var(--vscode-panel-border);
+  }
+  .tab .title { overflow: hidden; text-overflow: ellipsis; }
+  .tab .close {
+    border: 0; background: transparent; color: inherit; cursor: pointer;
+    padding: 0 2px; line-height: 1; opacity: 0.6; font: inherit;
+  }
+  .tab .close:hover { opacity: 1; color: var(--vscode-errorForeground, #f48771); }
+  .tab-add {
+    border: 0; background: transparent; color: var(--vscode-descriptionForeground);
+    cursor: pointer; padding: 4px 8px; font: inherit; font-size: 1em;
+  }
+  .tab-add:hover { color: var(--vscode-foreground); }
   .messages {
     flex: 1; overflow-y: auto; padding: 12px 10px 8px;
     display: flex; flex-direction: column; gap: 8px;
   }
+  .messages.hidden { display: none; }
   .empty {
     margin: auto; text-align: center; color: var(--vscode-descriptionForeground);
     max-width: 300px; line-height: 1.45;
@@ -74,6 +116,8 @@ export function getChatViewHtml(): string {
     margin-bottom: 4px; letter-spacing: 0.02em;
   }
   .msg.user .role { display: none; }
+  .msg-meta { font-size: 0.72em; color: var(--vscode-descriptionForeground); margin-bottom: 4px; }
+  .msg-meta .model { font-weight: 600; color: var(--vscode-foreground); margin-right: 6px; }
   .msg-body { word-wrap: break-word; overflow-wrap: anywhere; }
   .msg.user .msg-body { white-space: pre-wrap; }
   .md > :first-child { margin-top: 0; }
@@ -102,13 +146,76 @@ export function getChatViewHtml(): string {
     border: 1px solid var(--vscode-panel-border);
     border-radius: 4px; padding: 0.05em 0.35em;
   }
-  .md pre {
-    margin: 0.55em 0; padding: 8px 10px; overflow: auto; max-height: 280px;
-    background: var(--vscode-textCodeBlock-background, var(--vscode-input-background));
-    border: 1px solid var(--vscode-panel-border); border-radius: 6px;
-  }
-  .md pre code { border: 0; background: transparent; padding: 0; font-size: 0.85em; white-space: pre; }
   .md strong { font-weight: 600; }
+  .md table { border-collapse: collapse; width: 100%; font-size: 0.9em; }
+  .md th, .md td { border: 1px solid var(--vscode-panel-border); padding: 4px 8px; }
+  .md .table-wrap { overflow-x: auto; margin: 0.55em 0; }
+  .code-block {
+    margin: 0.55em 0; border: 1px solid var(--vscode-panel-border); border-radius: 6px;
+    background: var(--vscode-textCodeBlock-background, var(--vscode-input-background));
+    overflow: hidden;
+  }
+  .code-toolbar {
+    display: flex; align-items: center; gap: 6px; padding: 4px 8px;
+    border-bottom: 1px solid var(--vscode-panel-border); font-size: 0.72em;
+    color: var(--vscode-descriptionForeground);
+  }
+  .code-toolbar .lang { flex: 1; text-transform: lowercase; }
+  .code-toolbar button {
+    border: 0; background: transparent; color: inherit; cursor: pointer;
+    font: inherit; padding: 2px 6px; border-radius: 4px;
+  }
+  .code-toolbar button:hover { background: var(--vscode-list-hoverBackground); color: var(--vscode-foreground); }
+  .code-block pre {
+    margin: 0; padding: 8px 10px; overflow: auto; max-height: 320px;
+  }
+  .code-block pre code { border: 0; background: transparent; padding: 0; font-size: 0.85em; white-space: pre; }
+  .mermaid-wrap {
+    margin: 0.55em 0; padding: 8px; overflow: auto;
+    border: 1px solid var(--vscode-panel-border); border-radius: 6px;
+    background: var(--vscode-editor-background, var(--vscode-input-background));
+  }
+  .thinking {
+    margin: 0 0 8px; border-radius: 8px; overflow: hidden;
+  }
+  .thinking > summary {
+    list-style: none; cursor: pointer; display: inline-flex; align-items: center; gap: 6px;
+    padding: 6px 10px; border-radius: 8px; font-size: 0.85em;
+    background: var(--vscode-input-background); border: 1px solid var(--vscode-panel-border);
+    color: var(--vscode-foreground);
+  }
+  .thinking > summary::-webkit-details-marker { display: none; }
+  .thinking .spin { display: inline-block; animation: spin 1s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .thinking .body {
+    margin: 6px 0 4px; padding: 2px 0 2px 12px;
+    border-left: 2px solid color-mix(in srgb, var(--vscode-foreground) 20%, transparent);
+    color: var(--vscode-descriptionForeground); font-size: 0.9em;
+  }
+  .msg-actions {
+    display: flex; align-items: center; gap: 2px; margin-top: 4px; opacity: 0.55;
+  }
+  .msg.assistant:hover .msg-actions, .msg-actions:focus-within { opacity: 1; }
+  .msg-actions button {
+    border: 0; background: transparent; color: var(--vscode-descriptionForeground);
+    cursor: pointer; width: 26px; height: 26px; border-radius: 4px;
+    display: grid; place-items: center; font: inherit; font-size: 0.85em; padding: 0;
+    position: relative;
+  }
+  .msg-actions button:hover {
+    background: var(--vscode-list-hoverBackground); color: var(--vscode-foreground);
+  }
+  .gauge-pop {
+    display: none; position: absolute; bottom: 110%; left: 0; z-index: 8;
+    min-width: 160px; padding: 8px 10px; text-align: left;
+    background: var(--vscode-editorWidget-background, var(--vscode-input-background));
+    border: 1px solid var(--vscode-panel-border); border-radius: 8px;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.3); font-size: 0.78em; color: var(--vscode-foreground);
+    white-space: normal;
+  }
+  .msg-actions button:hover .gauge-pop, .msg-actions button:focus .gauge-pop { display: block; }
+  .gauge-pop b { display: block; margin-bottom: 2px; }
+  .gauge-pop ul { margin: 0 0 6px; padding-left: 1.1em; color: var(--vscode-descriptionForeground); }
 
   .turn-tools { display: flex; flex-direction: column; gap: 1px; margin: 2px 0 8px; align-self: stretch; }
   .step-row {
@@ -128,6 +235,29 @@ export function getChatViewHtml(): string {
   .step-row.failed .chev { color: var(--vscode-testing-iconFailed, #f14c4c); }
   .step-row.running { color: var(--vscode-foreground); }
   .step-row.running .chev { color: var(--vscode-charts-blue, #3794ff); }
+
+  .canvas-panel {
+    display: none; flex: 1; flex-direction: column; min-height: 0;
+    padding: 8px 10px; gap: 8px;
+  }
+  .canvas-panel.visible { display: flex; }
+  .canvas-head {
+    display: flex; align-items: center; gap: 6px; flex-shrink: 0;
+  }
+  .canvas-head strong { flex: 1; font-size: 0.9em; }
+  .canvas-head button {
+    border: 1px solid var(--vscode-panel-border); background: var(--vscode-input-background);
+    color: var(--vscode-foreground); border-radius: 6px; padding: 3px 10px;
+    font: inherit; font-size: 0.8em; cursor: pointer;
+  }
+  .canvas-code, .canvas-out {
+    width: 100%; border: 1px solid var(--vscode-panel-border); border-radius: 6px;
+    background: var(--vscode-input-background); color: var(--vscode-input-foreground);
+    font-family: var(--vscode-editor-font-family); font-size: 0.85em; padding: 8px;
+    resize: vertical;
+  }
+  .canvas-code { flex: 1; min-height: 120px; }
+  .canvas-out { flex: 1; min-height: 80px; white-space: pre-wrap; overflow: auto; }
 
   .changes-bar {
     display: none; flex-shrink: 0; align-items: center; gap: 8px;
@@ -168,7 +298,7 @@ export function getChatViewHtml(): string {
     color: var(--vscode-foreground); pointer-events: none; z-index: 2;
   }
   .composer-box.drag-over .drop-hint { display: flex; }
-  textarea {
+  textarea#messageInput {
     width: 100%; min-height: 56px; max-height: 160px; resize: vertical; border: 0;
     outline: none; background: transparent; color: var(--vscode-input-foreground);
     font: inherit; line-height: 1.4;
@@ -276,9 +406,17 @@ export function getChatViewHtml(): string {
     cursor: pointer; font: inherit; line-height: 1; padding: 0 2px; flex-shrink: 0;
   }
   .queue-item button:hover { color: var(--vscode-errorForeground, #f48771); }
+  .toast-busy {
+    display: none; margin: 4px 10px 0; padding: 4px 8px; font-size: 0.75em;
+    color: var(--vscode-descriptionForeground);
+  }
+  .toast-busy.visible { display: block; }
 </style>
 </head>
 <body>
+  <div class="tab-strip" id="tabStrip" role="tablist"></div>
+  <div class="toast-busy" id="busyToast">Agent is running — stop it before switching or branching.</div>
+
   <div class="messages" id="messages">
     <div class="empty" id="emptyState">
       <div class="sparkle">✦</div>
@@ -290,6 +428,17 @@ export function getChatViewHtml(): string {
       </div>
       <p class="disclaimer">AI responses may be inaccurate. Press <kbd>Ctrl</kbd>+<kbd>L</kbd> to focus.</p>
     </div>
+  </div>
+
+  <div class="canvas-panel" id="canvasPanel">
+    <div class="canvas-head">
+      <strong>Python</strong>
+      <button type="button" id="canvasRunBtn">Run</button>
+      <button type="button" id="canvasStopBtn">Stop</button>
+      <button type="button" id="canvasCloseBtn">Close</button>
+    </div>
+    <textarea class="canvas-code" id="canvasCode" spellcheck="false"></textarea>
+    <pre class="canvas-out" id="canvasOut"></pre>
   </div>
 
   <div class="changes-bar" id="changesBar" title="Tracks write/edit/delete tools only — shell edits are not recorded">
@@ -349,6 +498,11 @@ export function getChatViewHtml(): string {
     </div>
   </div>
 
+<script src="${assets.markedJs}"></script>
+<script src="${assets.hljsJs}"></script>
+<script src="${assets.katexJs}"></script>
+<script src="${assets.katexAutoRenderJs}"></script>
+<script src="${assets.mermaidJs}"></script>
 <script>
   const vscode = acquireVsCodeApi();
   let mode = 'agent';
@@ -366,6 +520,12 @@ export function getChatViewHtml(): string {
   let contextUsage = null;
   let contextBadge = { indexed: 0, inContext: 0 };
   let editSummary = null;
+  let openTabs = [];
+  let activeTabId = null;
+  let canvasOpen = false;
+  let pythonRunning = false;
+  let ttsUtterance = null;
+  const ttsSupported = typeof speechSynthesis !== 'undefined';
 
   const MODES = [
     { id: 'agent', label: 'Agent', desc: 'Edits and runs tools' },
@@ -374,6 +534,11 @@ export function getChatViewHtml(): string {
   ];
 
   const messagesEl = document.getElementById('messages');
+  const tabStrip = document.getElementById('tabStrip');
+  const busyToast = document.getElementById('busyToast');
+  const canvasPanel = document.getElementById('canvasPanel');
+  const canvasCode = document.getElementById('canvasCode');
+  const canvasOut = document.getElementById('canvasOut');
   const input = document.getElementById('messageInput');
   const sendButton = document.getElementById('sendButton');
   const modelChip = document.getElementById('modelChip');
@@ -392,39 +557,36 @@ export function getChatViewHtml(): string {
   const ctxArc = document.getElementById('ctxArc');
   const ctxPct = document.getElementById('ctxPct');
 
+  if (window.mermaid) {
+    try { mermaid.initialize({ startOnLoad: false, theme: 'dark', securityLevel: 'strict' }); } catch (e) {}
+  }
+
   function syncSendButton() {
     sendButton.disabled = false;
     if (busy) {
       sendButton.className = 'stop';
       sendButton.textContent = '■';
       sendButton.title = 'Stop';
-      input.placeholder = 'Add to queue… Enter queues while Agent is working';
     } else {
       sendButton.className = 'send';
       sendButton.textContent = '↑';
       sendButton.title = 'Send';
-      input.placeholder = mode === 'ask'
-        ? 'Ask about the codebase… Type / for commands'
-        : 'Plan, @ for context, / for commands';
     }
+    busyToast.classList.toggle('visible', !!busy);
   }
 
   function renderQueue(items) {
-    queuedItems = Array.isArray(items) ? items : [];
-    queueCount.textContent = String(queuedItems.length);
+    queuedItems = items || [];
     queuePanel.classList.toggle('visible', queuedItems.length > 0);
+    queueCount.textContent = String(queuedItems.length);
     queueList.innerHTML = queuedItems.map(function (item, i) {
-      return '<div class="queue-item" data-id="' + escapeHtml(item.id) + '">' +
-        '<span class="idx">' + (i + 1) + '</span>' +
+      return '<div class="queue-item"><span class="idx">' + (i + 1) + '</span>' +
         '<span class="qtext">' + escapeHtml(item.text) + '</span>' +
-        '<button type="button" title="Remove from queue">×</button>' +
-        '</div>';
+        '<button type="button" data-id="' + escapeHtml(item.id) + '" title="Remove">×</button></div>';
     }).join('');
     queueList.querySelectorAll('.queue-item button').forEach(function (btn) {
       btn.addEventListener('click', function () {
-        const row = btn.closest('.queue-item');
-        const id = row && row.getAttribute('data-id');
-        if (id) vscode.postMessage({ type: 'removeQueued', id: id });
+        vscode.postMessage({ type: 'removeQueued', id: btn.getAttribute('data-id') });
       });
     });
   }
@@ -432,11 +594,7 @@ export function getChatViewHtml(): string {
   function permLabel(p) {
     return p === 'allowAll' ? 'Allow all' : p === 'assisted' ? 'Assisted' : 'Default';
   }
-
-  function syncPermChip() {
-    permChip.textContent = permLabel(permissions);
-  }
-
+  function syncPermChip() { permChip.textContent = permLabel(permissions); }
   function syncModeChip() {
     const m = MODES.find(function (x) { return x.id === mode; }) || MODES[0];
     modeChip.textContent = m.label + ' ▾';
@@ -444,151 +602,137 @@ export function getChatViewHtml(): string {
       const id = el.getAttribute('data-mode');
       const active = id === mode;
       el.classList.toggle('active', active);
-      const name = el.querySelector('.name');
-      if (name) {
-        const base = MODES.find(function (x) { return x.id === id; });
-        name.textContent = (active ? '✓ ' : '') + (base ? base.label : id);
+      const base = MODES.find(function (x) { return x.id === id; });
+      if (base) {
+        el.querySelector('.name').textContent = (active ? '✓ ' : '') + base.label;
       }
     });
   }
-
   function setMode(next) {
-    mode = next === 'ask' ? 'ask' : next === 'plan' ? 'plan' : 'agent';
+    mode = next;
     syncModeChip();
-    syncSendButton();
+    vscode.postMessage({ type: 'setMode', mode: next });
     closeModeMenu();
-    vscode.postMessage({ type: 'setMode', mode: mode });
   }
-
   function cycleMode() {
     const order = ['agent', 'plan', 'ask'];
-    const i = order.indexOf(mode);
-    setMode(order[(i + 1) % order.length]);
+    setMode(order[(order.indexOf(mode) + 1) % order.length]);
   }
-
-  function openModeMenu() {
-    modeMenuOpen = true;
-    modeMenu.classList.add('open');
-    hideSlash();
-  }
-
-  function closeModeMenu() {
-    modeMenuOpen = false;
-    modeMenu.classList.remove('open');
-  }
+  function openModeMenu() { modeMenuOpen = true; modeMenu.classList.add('open'); }
+  function closeModeMenu() { modeMenuOpen = false; modeMenu.classList.remove('open'); }
 
   function syncCtxRing() {
-    if (!contextUsage || !contextUsage.limit) {
+    const used = contextUsage && contextUsage.used ? contextUsage.used : 0;
+    const limit = contextUsage && contextUsage.limit ? contextUsage.limit : 0;
+    if (!limit || used <= 0) {
       ctxRing.classList.remove('visible');
       return;
     }
-    const pct = Math.min(100, Math.round((contextUsage.used / contextUsage.limit) * 100));
-    const circ = 2 * Math.PI * 11;
-    ctxArc.setAttribute('stroke-dasharray', String(circ));
-    ctxArc.setAttribute('stroke-dashoffset', String(circ * (1 - pct / 100)));
+    const pct = Math.min(100, Math.round((used / limit) * 100));
+    const circ = 69.1;
+    ctxArc.setAttribute('stroke-dashoffset', String(circ - (circ * pct) / 100));
     ctxPct.textContent = pct + '%';
-    ctxRing.title = contextUsage.used + ' / ' + contextUsage.limit + ' tokens · ' +
-      (contextBadge.indexed || 0) + ' indexed · ' + (contextBadge.inContext || 0) + ' in context';
+    ctxRing.title = used + ' / ' + limit + ' tokens';
     ctxRing.classList.add('visible');
   }
 
   function syncChangesBar() {
-    if (!editSummary || !editSummary.files) {
+    if (!editSummary || !editSummary.fileCount) {
       changesBar.classList.remove('visible');
       return;
     }
-    changesSummary.innerHTML =
-      editSummary.files + ' file' + (editSummary.files === 1 ? '' : 's') + ' changed ' +
-      '<span class="plus">+' + editSummary.added + '</span> ' +
-      '<span class="minus">−' + editSummary.removed + '</span>';
     changesBar.classList.add('visible');
+    changesSummary.innerHTML =
+      editSummary.fileCount + ' file' + (editSummary.fileCount === 1 ? '' : 's') + ' · ' +
+      '<span class="plus">+' + (editSummary.added || 0) + '</span> ' +
+      '<span class="minus">−' + (editSummary.removed || 0) + '</span>';
   }
 
   function sendOrStop() {
-    if (busy) {
-      vscode.postMessage({ type: 'cancel' });
-      return;
-    }
+    if (busy) { vscode.postMessage({ type: 'cancel' }); return; }
     sendMessage();
   }
-
   function sendMessage() {
     const text = input.value.trim();
     if (!text && attachmentCount === 0) return;
+    vscode.postMessage({ type: 'sendMessage', text: text, mode: mode });
     input.value = '';
     hideSlash();
-    closeModeMenu();
-    vscode.postMessage({ type: 'sendMessage', text: text || 'Analyze the attached items.', mode: mode });
   }
 
   function filterSlash(prefix) {
-    const q = prefix.replace(/^\\//, '').toLowerCase();
-    if (!q) return slashCommands.slice();
+    const p = (prefix || '').toLowerCase();
     return slashCommands.filter(function (c) {
-      return c.name.startsWith(q) || c.name.indexOf(q) >= 0;
-    });
+      return !p || c.name.toLowerCase().indexOf(p) === 0 || (c.description || '').toLowerCase().indexOf(p) >= 0;
+    }).slice(0, 12);
   }
-
   function renderSlash() {
-    if (!slashOpen || !slashFiltered.length) {
-      slashMenu.classList.remove('open');
-      return;
-    }
+    if (!slashFiltered.length) { hideSlash(); return; }
+    slashOpen = true;
+    slashMenu.classList.add('open');
     slashMenu.innerHTML = slashFiltered.map(function (c, i) {
       return '<div class="slash-item' + (i === slashIndex ? ' active' : '') + '" data-i="' + i + '">' +
         '<span class="name">/' + escapeHtml(c.name) + '</span>' +
         '<span class="desc">' + escapeHtml(c.description || '') + '</span></div>';
     }).join('');
-    slashMenu.classList.add('open');
     slashMenu.querySelectorAll('.slash-item').forEach(function (el) {
-      el.addEventListener('click', function () {
-        applySlash(Number(el.getAttribute('data-i')));
-      });
+      el.addEventListener('click', function () { applySlash(Number(el.getAttribute('data-i'))); });
     });
   }
-
   function applySlash(i) {
     const c = slashFiltered[i];
     if (!c) return;
-    input.value = '/' + c.name + (c.name === 'help' || c.name === 'clear' ? '' : ' ');
+    input.value = '/' + c.name + (c.insertSpace === false ? '' : ' ');
     hideSlash();
     input.focus();
   }
-
-  function hideSlash() {
-    slashOpen = false;
-    slashMenu.classList.remove('open');
-  }
-
+  function hideSlash() { slashOpen = false; slashMenu.classList.remove('open'); }
   function updateSlashFromInput() {
     const v = input.value;
-    const m = /^\\/([a-zA-Z0-9_-]*)$/.exec(v);
+    const m = /^\\/([\\w-]*)$/.exec(v);
     if (!m) { hideSlash(); return; }
     slashFiltered = filterSlash(m[1]);
     slashIndex = 0;
-    slashOpen = slashFiltered.length > 0;
     renderSlash();
   }
 
-  function collectUriList(dt) {
-    return dt.getData('text/uri-list') || '';
+  function renderTabs() {
+    var html = openTabs.map(function (t) {
+      var active = t.id === activeTabId;
+      return '<button type="button" class="tab' + (active ? ' active' : '') + '" data-id="' + escapeHtml(t.id) + '" role="tab" aria-selected="' + active + '">' +
+        '<span class="title">' + escapeHtml(t.title || 'Chat') + '</span>' +
+        '<span class="close" data-close="' + escapeHtml(t.id) + '" title="Close">×</span></button>';
+    }).join('');
+    html += '<button type="button" class="tab-add" id="tabAdd" title="New chat">+</button>';
+    tabStrip.innerHTML = html;
+    tabStrip.querySelectorAll('.tab').forEach(function (el) {
+      el.addEventListener('click', function (e) {
+        if (e.target && e.target.getAttribute && e.target.getAttribute('data-close')) return;
+        vscode.postMessage({ type: 'switchTab', id: el.getAttribute('data-id') });
+      });
+    });
+    tabStrip.querySelectorAll('[data-close]').forEach(function (el) {
+      el.addEventListener('click', function (e) {
+        e.stopPropagation();
+        vscode.postMessage({ type: 'closeTab', id: el.getAttribute('data-close') });
+      });
+    });
+    var add = document.getElementById('tabAdd');
+    if (add) add.addEventListener('click', function () { vscode.postMessage({ type: 'newChat' }); });
   }
 
-  function readFilesAsBlobs(fileList) {
-    const files = Array.from(fileList || []).slice(0, 8);
-    return Promise.all(files.map(function (f) {
-      return new Promise(function (resolve) {
-        const reader = new FileReader();
-        reader.onload = function () {
-          const result = String(reader.result || '');
-          const comma = result.indexOf(',');
-          const base64 = comma >= 0 ? result.slice(comma + 1) : result;
-          resolve({ name: f.name, mime: f.type || 'application/octet-stream', base64: base64 });
-        };
-        reader.onerror = function () { resolve(null); };
-        reader.readAsDataURL(f);
-      });
-    })).then(function (rows) { return rows.filter(Boolean); });
+  function showCanvas(code) {
+    canvasOpen = true;
+    canvasPanel.classList.add('visible');
+    messagesEl.classList.add('hidden');
+    canvasCode.value = code || '';
+    canvasOut.textContent = '';
+  }
+  function hideCanvas() {
+    canvasOpen = false;
+    canvasPanel.classList.remove('visible');
+    messagesEl.classList.remove('hidden');
+    if (pythonRunning) vscode.postMessage({ type: 'stopPython' });
   }
 
   modeChip.addEventListener('click', function (e) {
@@ -596,25 +740,18 @@ export function getChatViewHtml(): string {
     if (modeMenuOpen) closeModeMenu(); else openModeMenu();
   });
   modeMenu.querySelectorAll('.mode-item').forEach(function (el) {
-    el.addEventListener('click', function () {
-      setMode(el.getAttribute('data-mode'));
-    });
+    el.addEventListener('click', function () { setMode(el.getAttribute('data-mode')); });
   });
   document.addEventListener('click', function (e) {
-    if (!modeMenu.contains(e.target) && e.target !== modeChip) closeModeMenu();
+    if (!composerBox.contains(e.target)) closeModeMenu();
   });
-
-  modelChip.addEventListener('click', function () {
-    vscode.postMessage({ type: 'configure' });
-  });
+  modelChip.addEventListener('click', function () { vscode.postMessage({ type: 'configure' }); });
   document.getElementById('attachBtn').addEventListener('click', function () {
     vscode.postMessage({ type: 'attachFiles' });
   });
-  sendButton.addEventListener('click', sendOrStop);
   permChip.addEventListener('click', function () {
-    const order = ['default', 'assisted', 'allowAll'];
-    const i = order.indexOf(permissions);
-    const next = order[(i + 1) % order.length];
+    var order = ['default', 'assisted', 'allowAll'];
+    var next = order[(order.indexOf(permissions) + 1) % order.length];
     vscode.postMessage({ type: 'setPermissions', level: next });
   });
   document.getElementById('undoAllBtn').addEventListener('click', function () {
@@ -629,54 +766,73 @@ export function getChatViewHtml(): string {
   document.getElementById('ctaInstructions').addEventListener('click', function () {
     vscode.postMessage({ type: 'emptyCta', action: 'instructions' });
   });
+  document.getElementById('canvasRunBtn').addEventListener('click', function () {
+    canvasOut.textContent = '';
+    vscode.postMessage({ type: 'runPython', code: canvasCode.value });
+  });
+  document.getElementById('canvasStopBtn').addEventListener('click', function () {
+    vscode.postMessage({ type: 'stopPython' });
+  });
+  document.getElementById('canvasCloseBtn').addEventListener('click', hideCanvas);
 
   input.addEventListener('keydown', function (e) {
-    if (e.key === 'Tab' && e.shiftKey) {
-      e.preventDefault();
-      cycleMode();
-      return;
-    }
+    if (e.key === 'Tab' && e.shiftKey) { e.preventDefault(); cycleMode(); return; }
     if (slashOpen) {
       if (e.key === 'ArrowDown') { e.preventDefault(); slashIndex = Math.min(slashIndex + 1, slashFiltered.length - 1); renderSlash(); return; }
       if (e.key === 'ArrowUp') { e.preventDefault(); slashIndex = Math.max(slashIndex - 1, 0); renderSlash(); return; }
-      if (e.key === 'Enter' || e.key === 'Tab') { e.preventDefault(); applySlash(slashIndex); return; }
+      if (e.key === 'Enter') { e.preventDefault(); applySlash(slashIndex); return; }
       if (e.key === 'Escape') { hideSlash(); return; }
     }
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
-      sendMessage();
+      sendOrStop();
     }
   });
   input.addEventListener('input', updateSlashFromInput);
+  sendButton.addEventListener('click', sendOrStop);
 
   ['dragenter', 'dragover'].forEach(function (ev) {
     composerBox.addEventListener(ev, function (e) {
-      e.preventDefault();
-      composerBox.classList.add('drag-over');
+      e.preventDefault(); e.stopPropagation(); composerBox.classList.add('drag-over');
     });
   });
   ['dragleave', 'drop'].forEach(function (ev) {
     composerBox.addEventListener(ev, function (e) {
-      e.preventDefault();
-      composerBox.classList.remove('drag-over');
+      e.preventDefault(); e.stopPropagation();
+      if (ev === 'dragleave') composerBox.classList.remove('drag-over');
     });
   });
   composerBox.addEventListener('drop', function (e) {
-    e.preventDefault();
-    const dt = e.dataTransfer;
+    composerBox.classList.remove('drag-over');
+    var dt = e.dataTransfer;
     if (!dt) return;
-    const uriList = collectUriList(dt);
+    var uriList = collectUriList(dt);
     if (uriList) vscode.postMessage({ type: 'attachUris', uriList: uriList });
     if (dt.files && dt.files.length) {
       readFilesAsBlobs(dt.files).then(function (blobs) {
         if (blobs.length) vscode.postMessage({ type: 'attachBlobs', blobs: blobs });
       });
     }
-    const text = dt.getData('text/plain');
-    if (text && /^https?:\\/\\//i.test(text.trim())) {
-      vscode.postMessage({ type: 'attachUrl', url: text.trim() });
-    }
   });
+
+  function collectUriList(dt) {
+    try { return dt.getData('text/uri-list') || dt.getData('text/plain') || ''; } catch (e) { return ''; }
+  }
+  function readFilesAsBlobs(fileList) {
+    var files = Array.prototype.slice.call(fileList || []);
+    return Promise.all(files.map(function (f) {
+      return new Promise(function (resolve) {
+        var reader = new FileReader();
+        reader.onload = function () {
+          var result = String(reader.result || '');
+          var base64 = result.indexOf(',') >= 0 ? result.split(',')[1] : result;
+          resolve({ name: f.name, mime: f.type || 'application/octet-stream', base64: base64 });
+        };
+        reader.onerror = function () { resolve(null); };
+        reader.readAsDataURL(f);
+      });
+    })).then(function (rows) { return rows.filter(Boolean); });
+  }
 
   window.addEventListener('message', function (event) {
     const msg = event.data;
@@ -716,16 +872,34 @@ export function getChatViewHtml(): string {
       renderQueue(msg.items);
       syncSendButton();
     }
+    if (msg.type === 'tabs') {
+      openTabs = msg.open || [];
+      activeTabId = msg.active || null;
+      if (typeof msg.busy === 'boolean') busy = msg.busy;
+      renderTabs();
+      syncSendButton();
+    }
     if (msg.type === 'updateMessages') {
       if (msg.timeline) timeline = msg.timeline;
+      if (typeof msg.busy === 'boolean') busy = msg.busy;
       renderMessages(msg.messages || []);
+      syncSendButton();
     }
-    if (msg.type === 'focusInput') {
-      input.focus();
-    }
+    if (msg.type === 'focusInput') { input.focus(); }
     if (msg.type === 'restorePrompt') {
       input.value = msg.text || '';
       input.focus();
+    }
+    if (msg.type === 'pythonStatus') {
+      pythonRunning = !!msg.running;
+    }
+    if (msg.type === 'pythonChunk') {
+      canvasOut.textContent += msg.text || '';
+      canvasOut.scrollTop = canvasOut.scrollHeight;
+    }
+    if (msg.type === 'pythonResult') {
+      pythonRunning = false;
+      if (msg.output != null) canvasOut.textContent = msg.output;
     }
   });
 
@@ -828,13 +1002,10 @@ export function getChatViewHtml(): string {
       shellOkBuf = [];
     }
     items.forEach(function (t) {
-      var st = t.toolStatus || (t.success === false ? 'failed' : t.success ? 'ok' : 'running');
-      if (t.kind === 'thought') {
-        flushExplore();
-        flushShellOk();
-        rows.push({ kind: 'thought', label: 'Thought', detail: t.detail, open: false, status: 'ok' });
+      if (t.kind === 'thought' || t.kind === 'context' || t.kind === 'thinking' || t.kind === 'compact') {
         return;
       }
+      var st = t.toolStatus || (t.success === false ? 'failed' : t.success ? 'ok' : 'running');
       if (t.kind === 'tool' && st === 'ok' && (t.tool === 'read' || t.tool === 'list' || t.tool === 'search' || t.tool === 'retrieve' || t.tool === 'outline')) {
         flushShellOk();
         exploreBuf.push(t);
@@ -848,22 +1019,21 @@ export function getChatViewHtml(): string {
       flushExplore();
       flushShellOk();
       if (t.kind === 'tool') {
-        var detail = cleanDetail(t.detail);
-        var label = prettyToolLabel(t);
-        // Failures stay collapsed: one quiet line; expand for the short error.
         rows.push({
           kind: 'tool',
-          label: label,
-          detail: detail,
+          label: prettyToolLabel(t),
+          detail: cleanDetail(t.detail),
           open: st === 'running',
           status: st,
           failed: st === 'failed',
         });
         return;
       }
-      if (t.kind === 'checkpoint' || t.kind === 'compact' || t.kind === 'context' || t.kind === 'thinking') {
-        // Hide noisy harness/log checkpoints from the user-facing stream.
-        if (/^(hook|Lesson|Oracle|LLM |Repaired|Retry|Nuked|Switched|Parsed|Truncated|Build-fix|context )/i.test(String(t.label || ''))) {
+      if (t.kind === 'checkpoint') {
+        if (/^(hook|Lesson|Oracle|LLM |Repaired|Retry|Nuked|Switched|Parsed|Truncated|Build-fix|context |Phase:|Prior context|Turn summary|Stopped)/i.test(String(t.label || '')) ||
+            /\\bindexed\\b/i.test(String(t.label || '')) ||
+            /^contextBudget\\b/i.test(String(t.label || '')) ||
+            /^Thinking/i.test(String(t.label || ''))) {
           return;
         }
         rows.push({ kind: 'activity', label: t.label, detail: cleanDetail(t.detail), open: false, status: 'ok' });
@@ -883,7 +1053,6 @@ export function getChatViewHtml(): string {
       var detail = r.detail
         ? '<div class="body">' + escapeHtml(r.detail) + '</div>'
         : '';
-      // No body → plain row (not a disclosure)
       if (!r.detail && r.status !== 'running') {
         return '<div class="' + cls + '"><span class="chev">' + mark + '</span><span>' +
           escapeHtml(r.label) + '</span></div>';
@@ -894,7 +1063,78 @@ export function getChatViewHtml(): string {
     }).join('') + '</div>';
   }
 
+  function splitThink(content) {
+    var text = String(content || '');
+    var openRe = /<think>|<\\|channel\\|>analysis<\\|message\\|>/;
+    var closeRe = /<\\/think>|<\\|start\\|>assistant<\\|channel\\|>final<\\|message\\|>/;
+    if (!openRe.test(text)) return { content: text, reasoning: '' };
+    var actual = '';
+    var thought = '';
+    var parts = text.split(openRe);
+    actual += parts[0] || '';
+    for (var i = 1; i < parts.length; i++) {
+      var chunk = parts[i].split(closeRe);
+      thought += chunk[0] || '';
+      actual += chunk.slice(1).join('') || '';
+    }
+    return { content: actual.trim(), reasoning: thought.trim() };
+  }
+
+  function formatTime(ts) {
+    try {
+      var d = ts instanceof Date ? ts : new Date(ts);
+      if (isNaN(d.getTime())) return '';
+      return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    } catch (e) { return ''; }
+  }
+
+  function renderThinking(reasoning, isPending) {
+    if (!reasoning) return '';
+    var label = isPending ? '<span class="spin">⚛</span> Thinking' : '🤖 Reasoning';
+    return '<details class="thinking"' + (isPending ? ' open' : '') + '>' +
+      '<summary>' + label + '</summary>' +
+      '<div class="body md">' + renderMarkdown(reasoning) + '</div></details>';
+  }
+
+  function renderGauge(timings) {
+    if (!timings) return '';
+    var has =
+      timings.promptTokens || timings.completionTokens || timings.durationMs || timings.tokensPerSecond;
+    if (!has) return '';
+    var html = '<button type="button" class="gauge-btn" title="Performance" aria-label="Performance">⏱' +
+      '<div class="gauge-pop">';
+    if (timings.promptTokens) {
+      html += '<b>Prompt</b><ul><li>Tokens: ' + Math.round(timings.promptTokens) + '</li></ul>';
+    }
+    if (timings.completionTokens || timings.durationMs || timings.tokensPerSecond) {
+      html += '<b>Generation</b><ul>';
+      if (timings.completionTokens) html += '<li>Tokens: ' + Math.round(timings.completionTokens) + '</li>';
+      if (timings.durationMs) html += '<li>Time: ' + Math.round(timings.durationMs) + ' ms</li>';
+      if (timings.tokensPerSecond) html += '<li>Speed: ' + Number(timings.tokensPerSecond).toFixed(1) + ' t/s</li>';
+      html += '</ul>';
+    }
+    html += '</div></button>';
+    return html;
+  }
+
+  function renderActions(m, idx, isPending) {
+    if (isPending || m.role !== 'assistant') return '';
+    var html = '<div class="msg-actions">';
+    html += '<button type="button" data-act="copy" data-idx="' + idx + '" title="Copy">⧉</button>';
+    html += renderGauge(m.timings);
+    if (ttsSupported) {
+      html += '<button type="button" data-act="tts" data-idx="' + idx + '" title="Play">🔊</button>';
+    }
+    if (!busy) {
+      html += '<button type="button" data-act="regen" data-idx="' + idx + '" title="Regenerate">↻</button>';
+      html += '<button type="button" data-act="branch" data-idx="' + idx + '" title="Branch chat">⑂</button>';
+    }
+    html += '</div>';
+    return html;
+  }
+
   function renderMessages(messages) {
+    if (canvasOpen) return;
     if (!messages.length) {
       messagesEl.innerHTML = emptyHtml();
       bindEmptyCtas();
@@ -916,17 +1156,23 @@ export function getChatViewHtml(): string {
             ? '<div class="restore-row"><button type="button" class="restore-btn" data-idx="' + idx + '">Restore checkpoint</button></div>'
             : '') +
           '</div>';
-        var turnItems = timeline.filter(function (t) {
-          var tt = t.turn;
-          if (tt === undefined || tt === null) return turn === lastTurn;
-          return tt === turn;
-        });
-        html += renderStepRows(turnItems);
+        // Tool/harness activity stays off the chat surface (Llama-style replies only).
         return;
       }
-      var inner = renderAssistantBody(m.content);
-      html += '<div class="msg assistant ' + (m.status || '') + '">' +
-        '<div class="role">' + roleLabel + '</div>' + inner + '</div>';
+      var split = splitThink(m.content);
+      var reasoning = m.reasoning || split.reasoning;
+      var body = split.content;
+      var isPending = m.status === 'pending';
+      var time = formatTime(m.timestamp);
+      html += '<div class="msg assistant ' + (m.status || '') + '" data-idx="' + idx + '">' +
+        '<div class="msg-meta">' +
+          (m.model ? '<span class="model">' + escapeHtml(m.model) + '</span>' : '<span class="model">' + roleLabel + '</span>') +
+          (time ? '<span>' + escapeHtml(time) + '</span>' : '') +
+        '</div>' +
+        renderThinking(reasoning, isPending && !body) +
+        '<div class="msg-body md">' + renderMarkdown(normalizeAssistantContent(body)) + '</div>' +
+        renderActions(m, idx, isPending) +
+        '</div>';
     });
     messagesEl.innerHTML = html;
     messagesEl.querySelectorAll('.restore-btn').forEach(function (btn) {
@@ -938,7 +1184,77 @@ export function getChatViewHtml(): string {
         vscode.postMessage({ type: 'restoreCheckpoint', messageIndex: idx });
       });
     });
+    messagesEl.querySelectorAll('.msg-actions button[data-act]').forEach(function (btn) {
+      btn.addEventListener('click', function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+        var act = btn.getAttribute('data-act');
+        var idx = Number(btn.getAttribute('data-idx'));
+        var m = messages[idx];
+        if (!m) return;
+        if (act === 'copy') {
+          copyText(m.content || '');
+          return;
+        }
+        if (act === 'tts') {
+          toggleTts(m.content || '', btn);
+          return;
+        }
+        if (act === 'regen') {
+          vscode.postMessage({ type: 'regenerate', messageIndex: idx });
+          return;
+        }
+        if (act === 'branch') {
+          vscode.postMessage({ type: 'branchAt', messageIndex: idx });
+        }
+      });
+    });
+    messagesEl.querySelectorAll('button[data-copy-code]').forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        copyText(btn.getAttribute('data-copy-code') || '');
+      });
+    });
+    messagesEl.querySelectorAll('button[data-run-python]').forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        showCanvas(btn.getAttribute('data-run-python') || '');
+      });
+    });
+    enhanceMathAndMermaid(messagesEl);
     messagesEl.scrollTop = messagesEl.scrollHeight;
+  }
+
+  function copyText(text) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).catch(function () { fallbackCopy(text); });
+    } else {
+      fallbackCopy(text);
+    }
+  }
+  function fallbackCopy(text) {
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand('copy'); } catch (e) {}
+    document.body.removeChild(ta);
+  }
+
+  function toggleTts(text, btn) {
+    if (!ttsSupported) return;
+    if (speechSynthesis.speaking) {
+      speechSynthesis.cancel();
+      btn.textContent = '🔊';
+      btn.title = 'Play';
+      return;
+    }
+    var plain = String(text || '').replace(/[#*_\\\`\\[\\]()]/g, ' ').replace(/\\s+/g, ' ').trim();
+    if (!plain) return;
+    ttsUtterance = new SpeechSynthesisUtterance(plain);
+    ttsUtterance.rate = 1;
+    ttsUtterance.onend = function () { btn.textContent = '🔊'; btn.title = 'Play'; };
+    btn.textContent = '⏹';
+    btn.title = 'Stop';
+    speechSynthesis.speak(ttsUtterance);
   }
 
   function escapeHtml(text) {
@@ -955,11 +1271,150 @@ export function getChatViewHtml(): string {
     return text;
   }
 
-  function renderAssistantBody(raw) {
-    return '<div class="msg-body md">' + renderMarkdown(normalizeAssistantContent(raw)) + '</div>';
+  function preprocessLatex(content) {
+    var codeBlocks = [];
+    var text = String(content || '').replace(/(\`\`\`[\\s\\S]*?\`\`\`|\`[^\`\\n]*\`)/g, function (m) {
+      var i = codeBlocks.length;
+      codeBlocks.push(m);
+      return '<<CODE_BLOCK_' + i + '>>';
+    });
+    text = text.replace(/\\\\\\[([\\s\\S]*?)\\\\\\]/g, function (_m, inner) {
+      return '\\n$$' + inner + '$$\\n';
+    });
+    text = text.replace(/\\\\\\(([\\s\\S]*?)\\\\\\)/g, function (_m, inner) {
+      return '$' + inner + '$';
+    });
+    text = text.replace(/<<CODE_BLOCK_(\\d+)>>/g, function (_m, i) { return codeBlocks[Number(i)] || ''; });
+    return text;
   }
 
   function renderMarkdown(src) {
+    var text = preprocessLatex(src);
+    if (window.marked) {
+      try {
+        marked.setOptions({
+          gfm: true,
+          breaks: true,
+          highlight: function (code, lang) {
+            if (window.hljs) {
+              try {
+                if (lang && hljs.getLanguage(lang)) {
+                  return hljs.highlight(code, { language: lang }).value;
+                }
+                return hljs.highlightAuto(code).value;
+              } catch (e) {}
+            }
+            return escapeHtml(code);
+          },
+        });
+        var rendered = marked.parse(text);
+        return postProcessMarkdownHtml(rendered);
+      } catch (e) {
+        /* fall through */
+      }
+    }
+    return legacyMarkdown(text);
+  }
+
+  function postProcessMarkdownHtml(html) {
+    var div = document.createElement('div');
+    div.innerHTML = html;
+    div.querySelectorAll('pre').forEach(function (pre) {
+      var code = pre.querySelector('code');
+      var cls = (code && code.className) || '';
+      var langMatch = /language-([\\w-]+)/.exec(cls);
+      var lang = langMatch ? langMatch[1] : '';
+      var raw = code ? code.textContent || '' : pre.textContent || '';
+      if (lang.toLowerCase() === 'mermaid') {
+        var wrap = document.createElement('div');
+        wrap.className = 'mermaid-wrap';
+        wrap.setAttribute('data-mermaid', raw);
+        wrap.textContent = 'Rendering diagram…';
+        pre.parentNode.replaceChild(wrap, pre);
+        return;
+      }
+      var block = document.createElement('div');
+      block.className = 'code-block';
+      var toolbar = document.createElement('div');
+      toolbar.className = 'code-toolbar';
+      toolbar.innerHTML = '<span class="lang">' + escapeHtml(lang || 'code') + '</span>' +
+        (lang.toLowerCase() === 'python'
+          ? '<button type="button" data-run-python="' + escapeHtml(raw).replace(/"/g, '&quot;') + '">Run</button>'
+          : '') +
+        '<button type="button" data-copy-code="' + escapeHtml(raw).replace(/"/g, '&quot;') + '">Copy</button>';
+      // data attributes with full code can break on quotes — set after
+      block.appendChild(toolbar);
+      block.appendChild(pre.cloneNode(true));
+      pre.parentNode.replaceChild(block, pre);
+      var copyBtn = toolbar.querySelector('[data-copy-code]');
+      if (copyBtn) {
+        copyBtn.removeAttribute('data-copy-code');
+        copyBtn.setAttribute('data-copy-code', '1');
+        copyBtn._code = raw;
+      }
+      var runBtn = toolbar.querySelector('[data-run-python]');
+      if (runBtn) {
+        runBtn.removeAttribute('data-run-python');
+        runBtn.setAttribute('data-run-python', '1');
+        runBtn._code = raw;
+      }
+    });
+    div.querySelectorAll('table').forEach(function (table) {
+      var wrap = document.createElement('div');
+      wrap.className = 'table-wrap';
+      table.parentNode.insertBefore(wrap, table);
+      wrap.appendChild(table);
+    });
+    // Fix buttons: use stored _code via query after insert — handled in renderMessages via rebind
+    // Rebuild toolbar buttons properly without broken attributes
+    div.querySelectorAll('.code-toolbar').forEach(function (toolbar) {
+      var block = toolbar.parentElement;
+      var pre = block && block.querySelector('pre');
+      var codeEl = pre && pre.querySelector('code');
+      var raw = codeEl ? codeEl.textContent || '' : '';
+      var langEl = toolbar.querySelector('.lang');
+      var lang = langEl ? langEl.textContent : '';
+      toolbar.innerHTML = '<span class="lang">' + escapeHtml(lang || 'code') + '</span>' +
+        (String(lang).toLowerCase() === 'python'
+          ? '<button type="button" class="run-py">Run</button>' : '') +
+        '<button type="button" class="copy-code">Copy</button>';
+      var copy = toolbar.querySelector('.copy-code');
+      if (copy) copy.addEventListener('click', function () { copyText(raw); });
+      var run = toolbar.querySelector('.run-py');
+      if (run) run.addEventListener('click', function () { showCanvas(raw); });
+    });
+    return div.innerHTML;
+  }
+
+  function enhanceMathAndMermaid(root) {
+    if (window.renderMathInElement) {
+      try {
+        renderMathInElement(root, {
+          delimiters: [
+            { left: '$$$$', right: '$$$$', display: true },
+            { left: '$$', right: '$$', display: true },
+            { left: '$', right: '$', display: false },
+            { left: '\\\\(', right: '\\\\)', display: false },
+            { left: '\\\\[', right: '\\\\]', display: true },
+          ],
+          throwOnError: false,
+        });
+      } catch (e) {}
+    }
+    if (window.mermaid) {
+      root.querySelectorAll('[data-mermaid]').forEach(function (el, i) {
+        var code = el.getAttribute('data-mermaid') || '';
+        var id = 'mmd-' + Date.now() + '-' + i;
+        mermaid.render(id, code).then(function (res) {
+          el.innerHTML = res.svg;
+        }).catch(function () {
+          el.innerHTML = '<pre><code>' + escapeHtml(code) + '</code></pre>';
+        });
+      });
+    }
+  }
+
+  function legacyMarkdown(src) {
     var text = escapeHtml(src);
     text = text.replace(/\`\`\`([\\w-]*)\\n([\\s\\S]*?)\`\`\`/g, function (_m, lang, code) {
       return '<pre><code class="lang-' + escapeHtml(lang) + '">' + code + '</code></pre>';
@@ -976,12 +1431,6 @@ export function getChatViewHtml(): string {
     text = text.replace(/\\n\\n/g, '</p><p>');
     text = '<p>' + text + '</p>';
     text = text.replace(/<p><\\/p>/g, '');
-    text = text.replace(/<p>(<h[1-4]>)/g, '$1');
-    text = text.replace(/(<\\/h[1-4]>)<\\/p>/g, '$1');
-    text = text.replace(/<p>(<ul>)/g, '$1');
-    text = text.replace(/(<\\/ul>)<\\/p>/g, '$1');
-    text = text.replace(/<p>(<pre>)/g, '$1');
-    text = text.replace(/(<\\/pre>)<\\/p>/g, '$1');
     return text;
   }
 
@@ -1004,6 +1453,7 @@ export function getChatViewHtml(): string {
   syncModeChip();
   syncPermChip();
   syncSendButton();
+  renderTabs();
   vscode.postMessage({ type: 'ready' });
 </script>
 </body>

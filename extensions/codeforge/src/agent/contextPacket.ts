@@ -208,7 +208,7 @@ export async function buildContextPacket(opts: {
 		sources.push({
 			kind: 'history',
 			priority: 40,
-			content: `### RECENT CHAT\n${clipData(opts.historyText.trim(), 6000)}`,
+			content: `### RECENT CHAT\n${clipData(opts.historyText.trim(), 2200)}`,
 		});
 	}
 
@@ -258,7 +258,7 @@ async function gatherIdeState(): Promise<{
 		lines.push(`- Open: ${rel} (${editor.document.languageId})`);
 		const sel = editor.document.getText(editor.selection);
 		if (sel.trim()) {
-			lines.push(`- Selection:\n\`\`\`\n${sel.slice(0, 2000)}\n\`\`\``);
+			lines.push(`- Selection:\n\`\`\`\n${sel.slice(0, 800)}\n\`\`\``);
 		}
 	} else {
 		lines.push('- Open: (none)');

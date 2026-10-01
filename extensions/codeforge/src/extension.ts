@@ -69,8 +69,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<CodeFo
     const trace = initTrace(outputChannel);
     const mcp = initMcp(outputChannel);
 
-    // EDH often starts with no folder — relative read/write/shell then fail.
-    if (!vscode.workspace.workspaceFolders?.length) {
+    // Extension Development Host often starts with no folder — relative tools then fail.
+    // Never auto-open a folder in packaged installs (that would open resources/app or the install root).
+    if (
+        context.extensionMode === vscode.ExtensionMode.Development &&
+        !vscode.workspace.workspaceFolders?.length
+    ) {
         const guess = path.resolve(context.extensionPath, '..', '..');
         if (fs.existsSync(path.join(guess, 'package.json')) || fs.existsSync(path.join(guess, '.git'))) {
             bridge.setFallbackWorkspaceRoot(guess);
@@ -125,7 +129,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<CodeFo
         bridge,
         outputChannel,
         settingsStore,
-        sessionStore
+        sessionStore,
+        context
     );
     sessionsTreeProvider = new SessionsTreeProvider(sessionStore);
     tasksTreeProvider = new TasksTreeProvider();

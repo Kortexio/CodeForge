@@ -80,3 +80,44 @@ console.log(`  applicationName: ${product.applicationName}`);
 console.log(`  dataFolderName: ${product.dataFolderName}`);
 console.log(`  chat.disableAIFeatures: ${product.configurationDefaults['chat.disableAIFeatures']}`);
 console.log(`  extensions.verifySignature: ${product.configurationDefaults['extensions.verifySignature']}`);
+
+// Windows window / installer / taskbar icons (gulp embeds resources/win32/code.ico into the .exe)
+const win32Dir = path.join(root, 'vscode', 'resources', 'win32');
+const iconsWin = path.join(root, 'resources', 'icons', 'win');
+const icon150 = path.join(iconsWin, 'code_150x150.png');
+const icon70 = path.join(iconsWin, 'code_70x70.png');
+const brandIconIco = path.join(iconsWin, 'code.ico');
+if (fs.existsSync(win32Dir)) {
+	if (fs.existsSync(icon150)) {
+		fs.copyFileSync(icon150, path.join(win32Dir, 'code_150x150.png'));
+		console.log('  win32 code_150x150.png: updated (dev window / taskbar icon)');
+	}
+	if (fs.existsSync(icon70)) {
+		fs.copyFileSync(icon70, path.join(win32Dir, 'code_70x70.png'));
+		console.log('  win32 code_70x70.png: updated');
+	}
+	if (fs.existsSync(brandIconIco)) {
+		fs.copyFileSync(brandIconIco, path.join(win32Dir, 'code.ico'));
+		console.log('  win32 code.ico: copied from resources/icons/win/code.ico');
+	}
+}
+
+// Title-bar / banner app icon (custom chrome)
+const titlebarSvgCandidates = [
+	path.join(root, 'resources', 'icons', 'src', 'codeforge-icon.svg'),
+];
+const titlebarSvgSrc = titlebarSvgCandidates.find((p) => fs.existsSync(p));
+if (titlebarSvgSrc) {
+	const titlebarTargets = [
+		path.join(root, 'vscode', 'src', 'vs', 'workbench', 'browser', 'media', 'code-icon.svg'),
+		path.join(root, 'vscode', 'out', 'vs', 'workbench', 'browser', 'media', 'code-icon.svg'),
+		path.join(root, 'vscode', 'out-vscode', 'vs', 'workbench', 'browser', 'media', 'code-icon.svg'),
+		path.join(root, 'vscode', 'out-vscode', 'media', 'code-icon.svg'),
+	];
+	for (const dest of titlebarTargets) {
+		if (fs.existsSync(path.dirname(dest))) {
+			fs.copyFileSync(titlebarSvgSrc, dest);
+		}
+	}
+	console.log(`  titlebar code-icon.svg: copied from ${path.relative(root, titlebarSvgSrc)}`);
+}

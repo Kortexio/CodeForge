@@ -220,11 +220,10 @@ function completionMaxTokens(budget: number): number {
 }
 
 function toolResultCharCap(budget: number): number {
-	// Use a real slice of the window — 32k should keep substantial tool bodies (Cursor-style).
 	const usable = promptTokenBudget(budget);
-	const soft = Math.floor(usable * 0.28);
-	const ceiling = budget >= 32000 ? 18000 : budget >= 16000 ? 12000 : 8000;
-	return Math.min(ceiling, Math.max(3500, soft));
+	const soft = Math.floor(usable * 0.16);
+	const ceiling = budget >= 32000 ? 8000 : budget >= 16000 ? 5500 : 3500;
+	return Math.min(ceiling, Math.max(2000, soft));
 }
 
 function compactTokenThreshold(budget: number): number {
@@ -249,10 +248,14 @@ function compactEveryNSteps(budget: number): number {
 
 /** Chars for prior-turn continuity — keep light (Cursor-style), not a second repo dump. */
 function priorTranscriptCharBudget(budget: number): number {
-	// ~10–12% of the token window in characters; hard caps so 110 old tools cannot dominate.
-	const target = Math.floor(budget * 0.45);
-	const ceiling = budget >= 32000 ? 10000 : budget >= 16000 ? 6000 : 3500;
-	return Math.min(ceiling, Math.max(2500, target));
+	const target = Math.floor(budget * 0.2);
+	const ceiling = budget >= 32000 ? 4500 : budget >= 16000 ? 3200 : 2000;
+	return Math.min(ceiling, Math.max(1200, target));
+}
+
+/** Soft cap for CONTEXT PACKET assembly (tokens). Full num_ctx is for the live chat, not one dump. */
+function contextPacketTokenBudget(budget: number): number {
+	return Math.min(10_000, Math.max(3500, Math.floor(promptTokenBudget(budget) * 0.28)));
 }
 
 /** Extra fields for Ollama-compatible gateways (ignored if unsupported). */
@@ -839,6 +842,14 @@ export interface AgentLoopOptions {
 	onContextBadge?: (badge: { indexed: number; inContext: number }) => void;
 	/** Prompt tokens used vs context window limit (for the composer ring). */
 	onContextUsage?: (usage: { used: number; limit: number }) => void;
+	/** Aggregated LLM timings for the turn (prompt of last call + sum of completion/duration). */
+	onTurnMetrics?: (metrics: {
+		promptTokens?: number;
+		completionTokens?: number;
+		durationMs?: number;
+		tokensPerSecond?: number;
+		reasoning?: string;
+	}) => void;
 	/** User-turn index for tool traces (0-based). */
 	turnIndex?: number;
 	onTaskUpdate?: (update: {
@@ -917,6 +928,27 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 	let stepBudget = adaptive ? checkpointSize : Math.min(opts.maxSteps ?? 8, 8);
 	let nextCheckpoint = stepBudget;
 	const base = (opts.baseUrl || defaultBase(opts.provider)).replace(/\/$/, '');
+	let turnPromptTokens: number | undefined;
+	let turnCompletionTokens = 0;
+	let turnDurationMs = 0;
+	let turnReasoningParts: string[] = [];
+	const emitTurnMetrics = () => {
+		const hasTokens =
+			turnPromptTokens !== undefined || turnCompletionTokens > 0 || turnDurationMs > 0;
+		const reasoning = turnReasoningParts.join('\n\n').trim() || undefined;
+		if (!hasTokens && !reasoning) return;
+		const tokensPerSecond =
+			turnCompletionTokens > 0 && turnDurationMs > 0
+				? turnCompletionTokens / (turnDurationMs / 1000)
+				: undefined;
+		opts.onTurnMetrics?.({
+			promptTokens: turnPromptTokens,
+			completionTokens: turnCompletionTokens > 0 ? turnCompletionTokens : undefined,
+			durationMs: turnDurationMs > 0 ? turnDurationMs : undefined,
+			tokensPerSecond,
+			reasoning,
+		});
+	};
 	const url = `${base}/chat/completions`;
 	const trace = getTrace();
 	const mcp = getMcp();
@@ -948,7 +980,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 		getSkillsRules().buildPromptSection(
 			opts.task,
 			openPaths,
-			Math.min(5000, Math.max(2000, Math.floor(getContextBudget(opts.numCtx) * 0.08))),
+			Math.min(2800, Math.max(1200, Math.floor(getContextBudget(opts.numCtx) * 0.04))),
 			agentMode?.skillHints ?? []
 		),
 	]
@@ -1050,10 +1082,10 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 		workspaceRoot: opts.workspaceRoot,
 		includeRetrieve: depth === 0,
 		sessionId: opts.sessionId ?? undefined,
-		budget: { ...DEFAULT_BUDGET, total: getContextBudget(opts.numCtx) },
+		budget: { ...DEFAULT_BUDGET, total: contextPacketTokenBudget(getContextBudget(opts.numCtx)) },
 		historyText: history
-			.slice(-6)
-			.map(h => `${h.role}: ${String(h.content).slice(0, 500)}`)
+			.slice(-4)
+			.map(h => `${h.role}: ${String(h.content).slice(0, 280)}`)
 			.join('\n'),
 		rerankFn: depth === 0 ? makeRerankFn(opts) : undefined,
 	});
@@ -1725,6 +1757,14 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 				tokensOut: data.usage?.completion_tokens ?? data.usage?.output_tokens,
 			});
 
+			const callDuration = Date.now() - llmStart;
+			turnDurationMs += callDuration;
+			const tokensInCall = Number(data.usage?.prompt_tokens ?? data.usage?.input_tokens ?? 0) || 0;
+			const tokensOutCall =
+				Number(data.usage?.completion_tokens ?? data.usage?.output_tokens ?? 0) || 0;
+			if (tokensInCall > 0) turnPromptTokens = tokensInCall;
+			if (tokensOutCall > 0) turnCompletionTokens += tokensOutCall;
+
 			const msg = data.choices?.[0]?.message;
 			if (!msg) {
 				throw new Error('Empty LLM response');
@@ -1749,12 +1789,14 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 				(typeof alt.thinking === 'string' && alt.thinking) ||
 				'';
 			if (thoughtRaw && thoughtRaw !== content) {
+				turnReasoningParts.push(String(thoughtRaw));
 				opts.onActivity?.({
 					kind: 'thought',
 					label: 'Thought briefly',
-					detail: String(thoughtRaw).slice(0, 1500),
+					detail: String(thoughtRaw).slice(0, 12000),
 				});
 			} else if (content && toolCalls.length) {
+				turnReasoningParts.push(content.slice(0, 4000));
 				opts.onActivity?.({
 					kind: 'thought',
 					label: 'Thought briefly',
@@ -1943,6 +1985,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 				});
 				turnOutcome = blocked ? 'blocked' : 'done';
 				turnBlockedReason = blocked ?? '';
+				emitTurnMetrics();
 				return summary + doneNote;
 			}
 
@@ -3229,7 +3272,7 @@ async function postAgentRound(
 		method: 'POST',
 		headers: {
 			'Content-Type': 'application/json',
-			Accept: 'application/json',
+			Accept: 'text/event-stream, application/json',
 			...(opts.apiKey ? { Authorization: `Bearer ${opts.apiKey}` } : {}),
 		},
 		signal: opts.abortSignal,
@@ -3238,7 +3281,8 @@ async function postAgentRound(
 			messages,
 			temperature: 0.2,
 			max_tokens: maxTokens,
-			stream: false,
+			stream: true,
+			stream_options: { include_usage: true },
 			...(opts.proseToolsOnly
 				? {}
 				: { tools, tool_choice: 'auto' as const }),
@@ -3250,7 +3294,15 @@ async function postAgentRound(
 		return { ok: false, status: response.status, errorText: await response.text(), data: {} };
 	}
 	try {
-		const data = await readChatCompletionResponse(response);
+		let lastUi = 0;
+		const data = await readChatCompletionResponse(response, partial => {
+			// Stream visible prose into the pending bubble; skip tool-JSON spam.
+			if (!partial || looksLikeToolJson(partial)) return;
+			const now = Date.now();
+			if (now - lastUi < 60 && partial.length < 40) return;
+			lastUi = now;
+			opts.onStatus?.(partial);
+		});
 		return { ok: true, status: 200, errorText: '', data };
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
@@ -3273,23 +3325,188 @@ type ChatCompletionData = {
 };
 
 /**
+ * Read a chat completion — prefers true SSE streaming with live deltas.
+ * Falls back to buffered JSON / full SSE body when the server does not stream.
+ */
+async function readChatCompletionResponse(
+	response: Response,
+	onDelta?: (contentSoFar: string) => void
+): Promise<ChatCompletionData> {
+	const ctype = (response.headers.get('content-type') || '').toLowerCase();
+	const canStream =
+		!!response.body &&
+		typeof (response.body as { getReader?: unknown }).getReader === 'function' &&
+		(ctype.includes('text/event-stream') ||
+			ctype.includes('event-stream') ||
+			ctype.includes('octet-stream') ||
+			!ctype.includes('application/json'));
+
+	if (canStream && response.body) {
+		try {
+			return await streamSseChatCompletion(response.body, onDelta);
+		} catch (err) {
+			// Fall through to buffered read when streaming fails mid-flight.
+			if (err instanceof Error && /abort/i.test(err.message)) throw err;
+		}
+	}
+
+	const text = await response.text();
+	const trimmed = text.trim();
+	if (trimmed.startsWith('data:') || trimmed.startsWith(':')) {
+		const data = aggregateSseChatCompletion(trimmed);
+		if (data.choices?.[0]?.message?.content) {
+			onDelta?.(String(data.choices[0].message.content));
+		}
+		return data;
+	}
+	return liftProseToolsFromCompletion(JSON.parse(text) as ChatCompletionData);
+}
+
+async function streamSseChatCompletion(
+	body: ReadableStream<Uint8Array>,
+	onDelta?: (contentSoFar: string) => void
+): Promise<ChatCompletionData> {
+	const reader = body.getReader();
+	const decoder = new TextDecoder();
+	let buffer = '';
+	let content = '';
+	const toolMap = new Map<
+		number,
+		{ id: string; type: 'function'; function: { name: string; arguments: string } }
+	>();
+	let usage: ChatCompletionData['usage'];
+	let finishReason: string | null | undefined;
+	let stopReason: string | null | undefined;
+	let sawToolDelta = false;
+
+	const applyChunk = (payload: string) => {
+		if (!payload || payload === '[DONE]') return;
+		let chunk: {
+			usage?: ChatCompletionData['usage'];
+			choices?: Array<{
+				finish_reason?: string | null;
+				stop_reason?: string | null;
+				delta?: {
+					content?: string | null;
+					tool_calls?: Array<{
+						index?: number;
+						id?: string;
+						type?: string;
+						function?: { name?: string; arguments?: string };
+					}>;
+				};
+				message?: { content?: string | null; tool_calls?: ToolCall[] };
+			}>;
+		};
+		try {
+			chunk = JSON.parse(payload);
+		} catch {
+			return;
+		}
+		if (chunk.usage) usage = chunk.usage;
+		const choice = chunk.choices?.[0];
+		if (!choice) return;
+		if (choice.finish_reason) finishReason = choice.finish_reason;
+		if (choice.stop_reason) stopReason = choice.stop_reason;
+		if (choice.message) {
+			if (choice.message.content) {
+				content += choice.message.content;
+				if (!sawToolDelta) onDelta?.(content);
+			}
+			if (choice.message.tool_calls?.length) {
+				sawToolDelta = true;
+				for (let i = 0; i < choice.message.tool_calls.length; i++) {
+					const tc = choice.message.tool_calls[i];
+					toolMap.set(i, {
+						id: tc.id,
+						type: 'function',
+						function: {
+							name: tc.function.name,
+							arguments: tc.function.arguments || '',
+						},
+					});
+				}
+			}
+			return;
+		}
+		const delta = choice.delta;
+		if (!delta) return;
+		if (typeof delta.content === 'string' && delta.content) {
+			content += delta.content;
+			if (!sawToolDelta) onDelta?.(content);
+		}
+		for (const tc of delta.tool_calls ?? []) {
+			sawToolDelta = true;
+			const idx = tc.index ?? 0;
+			const prev = toolMap.get(idx) ?? {
+				id: tc.id || `call_${idx}`,
+				type: 'function' as const,
+				function: { name: '', arguments: '' },
+			};
+			if (tc.id) prev.id = tc.id;
+			if (tc.function?.name) prev.function.name += tc.function.name;
+			if (tc.function?.arguments) prev.function.arguments += tc.function.arguments;
+			toolMap.set(idx, prev);
+		}
+	};
+
+	while (true) {
+		const { done, value } = await reader.read();
+		if (done) break;
+		buffer += decoder.decode(value, { stream: true });
+		const parts = buffer.split(/\r?\n/);
+		buffer = parts.pop() ?? '';
+		for (const line of parts) {
+			const trimmed = line.trim();
+			if (!trimmed.startsWith('data:')) continue;
+			applyChunk(trimmed.slice(5).trim());
+		}
+	}
+	if (buffer.trim()) {
+		const trimmed = buffer.trim();
+		if (trimmed.startsWith('data:')) applyChunk(trimmed.slice(5).trim());
+	}
+
+	const tool_calls = [...toolMap.entries()]
+		.sort((a, b) => a[0] - b[0])
+		.map(([, v]) => v)
+		.filter(t => t.function.name);
+
+	if (!tool_calls.length && content.trim()) {
+		const lifted = parseProseToolCalls(content);
+		if (lifted.length) {
+			return {
+				choices: [
+					{
+						message: { content: null, tool_calls: lifted },
+						finish_reason: finishReason,
+						stop_reason: stopReason,
+					},
+				],
+				usage,
+			};
+		}
+	}
+
+	return liftProseToolsFromCompletion({
+		choices: [
+			{
+				message: {
+					content: content || null,
+					tool_calls: tool_calls.length ? tool_calls : undefined,
+				},
+				finish_reason: finishReason,
+				stop_reason: stopReason,
+			},
+		],
+		usage,
+	});
+}
+
+/**
  * TabbyAPI / some OpenAI-compat servers ignore stream:false and return SSE
  * (text/event-stream). Aggregate chunks into a single chat.completion shape.
  */
-async function readChatCompletionResponse(response: Response): Promise<ChatCompletionData> {
-	const ctype = (response.headers.get('content-type') || '').toLowerCase();
-	if (!ctype.includes('text/event-stream') && !ctype.includes('event-stream')) {
-		// Still peek: some servers mis-label but send SSE body.
-		const text = await response.text();
-		const trimmed = text.trim();
-		if (trimmed.startsWith('data:') || trimmed.startsWith(':')) {
-			return aggregateSseChatCompletion(trimmed);
-		}
-		return liftProseToolsFromCompletion(JSON.parse(text) as ChatCompletionData);
-	}
-	const text = await response.text();
-	return aggregateSseChatCompletion(text);
-}
 
 /** Normalize message.content (string | parts[] | object) into plain text. */
 function coerceMessageContent(raw: unknown): string {

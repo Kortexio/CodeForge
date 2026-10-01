@@ -323,13 +323,21 @@
         "codeforge.ai.contextBudget": {
           "type": "number",
           "default": 32768,
-          "enum": [8192, 16384, 32768, 65536],
+          "enum": [
+            8192,
+            16384,
+            32768,
+            65536
+          ],
           "description": "Fallback context window (tokens) when the active server has no num_ctx. Prefer setting num_ctx per server in CodeForge AI Settings."
         },
         "codeforge.ai.semanticIndex": {
           "type": "string",
           "default": "auto",
-          "enum": ["auto", "off"],
+          "enum": [
+            "auto",
+            "off"
+          ],
           "description": "Build and refresh the code index (lexical + embeddings when the provider supports /embeddings). auto = on activation and on file changes; off = metadata index only."
         },
         "codeforge.ai.retrieveRerank": {
@@ -510,5 +518,12 @@
   "devDependencies": {
     "@types/vscode": "^1.136.0",
     "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "@highlightjs/cdn-assets": "^11.12.0",
+    "highlight.js": "^11.12.0",
+    "katex": "^0.19.0",
+    "marked": "^18.0.14",
+    "mermaid": "^12.0.0"
   }
 }

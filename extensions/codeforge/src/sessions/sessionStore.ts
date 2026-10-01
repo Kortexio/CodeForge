@@ -13,10 +13,21 @@ import { salvageSessionProgress } from '../agent/projectStatus';
 
 export type SessionState = 'running' | 'completed' | 'failed' | 'paused' | 'cancelled';
 
+export interface MessageTimings {
+	promptTokens?: number;
+	completionTokens?: number;
+	durationMs?: number;
+	tokensPerSecond?: number;
+}
+
 export interface SessionMessage {
 	role: 'user' | 'assistant';
 	content: string;
 	timestamp: string;
+	/** Model reasoning / chain-of-thought (assistant only). */
+	reasoning?: string;
+	/** Aggregated LLM timings for this reply (assistant only). */
+	timings?: MessageTimings;
 }
 
 export interface ToolTraceEntry {
@@ -149,18 +160,22 @@ export class SessionStore {
 	async appendMessage(
 		id: string,
 		role: 'user' | 'assistant',
-		content: string
+		content: string,
+		extra?: { reasoning?: string; timings?: MessageTimings }
 	): Promise<ChatSession | undefined> {
 		await this.ensureReady();
 		const all = this.list();
 		const idx = all.findIndex(s => s.id === id);
 		if (idx < 0) return undefined;
 		const session = all[idx];
-		session.messages.push({
+		const message: SessionMessage = {
 			role,
 			content,
 			timestamp: new Date().toISOString(),
-		});
+		};
+		if (extra?.reasoning) message.reasoning = extra.reasoning;
+		if (extra?.timings) message.timings = extra.timings;
+		session.messages.push(message);
 		session.updatedAt = new Date().toISOString();
 		if (role === 'user' && session.messages.filter(m => m.role === 'user').length === 1) {
 			session.title = truncate(content, 80);
@@ -169,6 +184,57 @@ export class SessionStore {
 		all.splice(idx, 1);
 		all.unshift(session);
 		await this.persist(all);
+		return session;
+	}
+
+	/**
+	 * Clone a session up to (and including) `messageIndex` into a new session.
+	 * Does not mutate the source. Used by Branch → new tab.
+	 */
+	async forkFrom(sourceId: string, messageIndex: number): Promise<ChatSession | undefined> {
+		await this.ensureReady();
+		const source = this.get(sourceId);
+		if (!source) return undefined;
+		if (
+			!Number.isFinite(messageIndex) ||
+			messageIndex < 0 ||
+			messageIndex >= source.messages.length
+		) {
+			return undefined;
+		}
+
+		const messages = source.messages
+			.slice(0, messageIndex + 1)
+			.map(m => ({ ...m, timings: m.timings ? { ...m.timings } : undefined }));
+		const userTurns = messages.filter(m => m.role === 'user').length;
+		const toolTraces = (source.toolTraces ?? [])
+			.filter(t => t.turn === undefined || t.turn < userTurns)
+			.map(t => ({ ...t, id: randomUUID() }));
+
+		const lastUser = [...messages].reverse().find(m => m.role === 'user');
+		const now = new Date().toISOString();
+		const session: ChatSession = {
+			id: randomUUID(),
+			title: truncate(`Branch: ${source.title}`, 80),
+			task: lastUser?.content ?? source.task,
+			state: 'completed',
+			messages,
+			toolTraces,
+			checkpoints: [],
+			rollingSummary: source.rollingSummary,
+			stableFacts: source.stableFacts ? normalizeFacts(source.stableFacts) : undefined,
+			workspaceFolder: source.workspaceFolder,
+			createdAt: now,
+			updatedAt: now,
+			model: source.model,
+			serverName: source.serverName,
+		};
+
+		const all = this.list();
+		all.unshift(session);
+		await this.persist(all.slice(0, MAX_SESSIONS));
+		await this.setActiveId(session.id);
+		await getSessionWikiStore().ensure(session.id, session.task);
 		return session;
 	}
 
