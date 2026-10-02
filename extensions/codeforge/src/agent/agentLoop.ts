@@ -2032,418 +2032,64 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 			/** User nudges deferred until all tool_results for this turn are present (all providers). */
 			const pendingNudges: string[] = [];
 
-			for (const call of toolCalls) {
-				if (opts.cancelled() || opts.abortSignal?.aborted) {
-					ensureToolResultsForCalls(messages, toolCalls, 'Cancelled by user');
-					turnOutcome = 'cancelled';
-					return 'Cancelled.';
-				}
+			/** Read-only tools from one model step. I/O overlaps; results commit in call order. */
+			interface ParallelIoJob {
+				call: (typeof toolCalls)[number];
+				name: string;
+				args: Record<string, unknown>;
+				fingerprint: string;
+				priorFails: number;
+				pathKey: string;
+				toolAdvice: string[];
+				readStart: number;
+				readLimit: number;
+				readWindowKey: string;
+				readAliases: string[];
+				/** A successful read that counts toward the red-build cap. */
+				incrementsRedRead: boolean;
+			}
+			const lane: ParallelIoJob[] = [];
 
-				let args: Record<string, unknown> = {};
-				try {
-					args = parseToolArguments(call.function.arguments || '{}');
-				} catch (parseErr) {
-					const detail =
-						parseErr instanceof Error ? parseErr.message : String(parseErr);
-					messages.push({
-						role: 'tool',
-						tool_call_id: call.id,
-						name: call.function.name,
-						content:
-							`Invalid tool arguments JSON (${detail}). ` +
-							`Call ${call.function.name} again with COMPLETE valid JSON. ` +
-							`For write: keep content short and fully closed (no truncated strings).`,
-					});
-					actions.push(`${call.function.name} bad-args`);
-					continue;
-				}
-
-				const name = call.function.name;
-				const toolAdvice: string[] = [];
-				const refuse = (content: string, label: string) => {
-					trace?.info('harness', String(content.length));
-					messages.push({ role: 'tool', tool_call_id: call.id, name, content });
-					actions.push(`${name} blocked (${label})`);
-				};
-
-				if (name === 'write' && typeof args.content === 'string' && args.content.length > 14000) {
-					refuse(
-						'Not written: content is larger than one tool call can carry reliably (14k chars). Write the file in parts (write the first part, then add the rest with edit).',
-						'too large'
-					);
-					continue;
-				}
-
-				if (statusQuestion && !activeToolNames.has(name)) {
-					refuse(
-						`Tool "${name}" is not available on a status question. Answer from PROJECT STATUS. The only tool is update_status.`,
-						'status'
-					);
-					continue;
-				}
-
-				if (!activeToolNames.has(name) && AGENT_TOOL_NAMES.has(name)) {
-					refuse(
-						`Tool "${name}" is not available in the ${phase} phase. Available now: ${[...activeToolNames].join(', ')}.`,
-						'phase'
-					);
-					continue;
-				}
-
-				// Weak profile: a full rewrite of a large existing file loses code; edit is the tool for that.
-				if (weakProfile && name === 'write' && gates.cfg.blockMassRewrite && typeof args.path === 'string') {
-					const existing = await opts.bridge.readRaw(String(args.path));
-					const existingLines = existing?.split(/\r?\n/).length ?? 0;
-					if (existing !== undefined && existingLines > LARGE_FILE_LINES && isPartialRewrite(existing, String(args.content ?? ''))) {
-						refuse(
-							`Not written: ${args.path} already has ${existingLines} lines and most of them would stay the same. Change the parts that differ with edit (old_string → new_string).`,
-							'large rewrite'
-						);
-						continue;
-					}
-				}
-
-				// Weak profile: with the build red, three reads are enough to locate the error; broad exploration waits.
-				if (
-					weakProfile &&
-					gates.buildRed &&
-					readsWhileRed >= 3 &&
-					(name === 'list' || name === 'retrieve' || name === 'search' || (name === 'read' && !mentionsErrorFile(String(args.path ?? ''), gates.lastBuildErrors)))
-				) {
-					refuse(
-						[
-							'Not run: the build is red and three reads have happened since. Edit the files named in the errors, or run the build again.',
-							'Open errors:',
-							...gates.lastBuildErrors.slice(0, 8).map(e => `- ${e}`),
-						].join('\n'),
-						'red build'
-					);
-					continue;
-				}
-
-				if (name === 'list') {
-					const listPath = String(args.path ?? '.')
-						.replace(/\\/g, '/')
-						.replace(/^\.\//, '')
-						.trim();
-					const isRoot = !listPath || listPath === '.' || listPath === '/';
-					if (Boolean(args.recursive) && isRoot) {
-						args.recursive = false;
-						toolAdvice.push('(recursive listing of the workspace root is shallow — list a subfolder for more)');
-					}
-				}
-
-				const fingerprint = toolFingerprint(name, args);
-				const priorCount = recentFingerprints.filter(f => f === fingerprint).length;
-				recentFingerprints.push(fingerprint);
-				if (recentFingerprints.length > 40) {
-					recentFingerprints.shift();
-				}
-
-				const pathKey =
-					typeof args.path === 'string'
-						? canonicalizePathKey(args.path)
-						: typeof args.oldPath === 'string'
-							? canonicalizePathKey(String(args.oldPath))
-							: '';
-				const cached = resultCache.get(fingerprint);
-				const isReadonly = READONLY_TOOLS.has(name);
-				const priorFails = failedFingerprints.get(fingerprint) ?? 0;
-
-				if (name === 'list' && pathKey && listPathsSeen.has(pathKey) && resultCache.has(`list:${pathKey}`)) {
-					const prior = resultCache.get(`list:${pathKey}`) ?? '';
-					const content = `(already in context — earlier listing of ${args.path})\n${clipData(prior, toolCap)}`;
-					messages.push({
-						role: 'tool',
-						tool_call_id: call.id,
-						name,
-						content,
-					});
-					actions.push(`list ${args.path} cached`.trim());
-					opts.onActivity?.({
-						kind: 'tool',
-						label: `list cached ${args.path}`,
-						tool: name,
-						toolCallId: call.id,
-						toolStatus: 'ok',
-						success: true,
-						detail: content.slice(0, 200),
-					});
-					continue;
-				}
-
-				// Same path + covered window: return remembered content; new startLine past coverage still runs.
-				const readStart = Math.max(
-					1,
-					Number(args.startLine ?? args.offset ?? 1) || 1
-				);
-				const readLimit = Math.max(1, Math.min(400, Number(args.limit ?? 120) || 120));
-				const readAliases = readAliasesFor(pathKey);
-				const coveredEnd = Math.max(
-					0,
-					...readAliases.map(k => readMaxEnd.get(k) ?? 0)
-				);
-				const alreadyRead = readAliases.some(k => readPathsSeen.has(k));
-				const readWindowKey =
-					name === 'read' && pathKey ? `${pathKey}@${readStart}@${readLimit}` : '';
-				const cachedWindow =
-					name === 'read' && pathKey && alreadyRead
-						? rememberedReadWindow(resultCache, readAliases, readStart, readLimit)
-						: undefined;
-				if (name === 'read' && cachedWindow !== undefined && readStart <= coveredEnd) {
-					const hits = (softReadHits.get(pathKey) ?? 0) + 1;
-					softReadHits.set(pathKey, hits);
-					const content = `(already in context up to L${coveredEnd})\n${clipData(cachedWindow, toolCap)}`;
-					messages.push({
-						role: 'tool',
-						tool_call_id: call.id,
-						name,
-						content,
-					});
-					actions.push(`read ${args.path} cached`.trim());
-					opts.onActivity?.({
-						kind: 'tool',
-						label: `read cached ${args.path}`,
-						tool: name,
-						toolCallId: call.id,
-						toolStatus: 'ok',
-						success: true,
-						detail: content.slice(0, 200),
-					});
-					continue;
-				}
-
-				// Identical failed command: not re-run (same input, same failure) unless files changed since.
-				if (
-					priorFails >= 1 &&
-					(name === 'shell' || name === 'dotnet') &&
-					failedAtWriteCount.get(fingerprint) === successfulWriteCount
-				) {
-					const refusal = [
-						'Not run: this exact command already failed in this run and no file changed since.',
-						'Change the command, or fix the files named in its output first.',
-					].join('\n');
-					messages.push({ role: 'tool', tool_call_id: call.id, name, content: refusal });
-					actions.push(`${name} advised (failed-repeat)`);
-					consecutiveToolFails += 1;
-					continue;
-				}
-
-				if (cached && priorCount >= 1 && isReadonly) {
-					messages.push({
-						role: 'tool',
-						tool_call_id: call.id,
-						name,
-						content: `(already in context — same ${name} result for the same arguments)\n${clipToolOutput(name, cached, toolCap)}`,
-					});
-					if (!warnedFingerprints.has(fingerprint)) {
-						warnedFingerprints.add(fingerprint);
-						actions.push(`${name} cached`);
-					}
-					continue;
-				}
-
-				const extDef = getToolRegistry().get(name);
-				if (extDef && !AGENT_TOOL_NAMES.has(name) && !toolVisibleInMode(extDef, agentMode)) {
-					refuse(
-						`Tool "${name}" is not available in mode ${agentMode?.title ?? 'this mode'}.`,
-						'mode'
-					);
-					continue;
-				}
-
-				const gateDecision = await decideGates(
-					enabledGates(getGateRegistry().list(), governance.getState().guardrails),
-					extGateSession,
-					{ name, args, risk: riskForAgentTool(name) }
-				);
-				if (gateDecision.action === 'block') {
-					refuse(gateDecision.reason || `Blocked by guardrail: ${name}`, 'gate');
-					continue;
-				}
-				let gateApproved = false;
-				if (gateDecision.action === 'require-approval') {
-					const approval = await ApprovalDialog.show({
-						tool: name,
-						arguments: summarizeArgs(name, args),
-						risk: approvalLevelForRisk(riskForAgentTool(name)),
-						reason: gateDecision.reason,
-					});
-					trace?.record({
-						type: 'approval',
-						label: name,
-						detail: approval.approved ? 'gate approved' : 'gate denied',
-					});
-					if (!approval.approved) {
-						messages.push({
-							role: 'tool',
-							tool_call_id: call.id,
-							name,
-							content: `Denied by user: ${name}`,
-						});
-						actions.push(`${name} denied (gate)`);
-						continue;
-					}
-					gateApproved = true;
-				}
-
-				opts.onActivity?.({
-					kind: 'tool',
-					label: formatToolActivityLabel(name, args),
-					tool: name,
-					toolCallId: call.id,
-					toolStatus: 'running',
-					detail: JSON.stringify(summarizeArgs(name, args)).slice(0, 200),
-				});
-
-				if (MUTATING.has(name) && !gateApproved) {
-					if (opts.sessionId && opts.sessionStore) {
-						await opts.sessionStore.createCheckpoint(
-							opts.sessionId,
-							`approval:${name}`,
-							{ name, arguments: args },
-							{ pause: false }
-						);
-					}
-					const approval = await ApprovalDialog.show({
-						tool: name,
-						arguments: summarizeArgs(name, args),
-						risk: name === 'shell' || name === 'delete' ? 'high' : 'medium',
-						reason: describeMutation(name, args),
-					});
-					trace?.record({
-						type: 'approval',
-						label: name,
-						detail: approval.approved ? 'approved' : 'denied',
-					});
-					if (!approval.approved) {
-						messages.push({
-							role: 'tool',
-							tool_call_id: call.id,
-							name,
-							content: `Denied by user: ${name}`,
-						});
-						actions.push(`${name} denied`);
-						continue;
-					}
-				}
-
-				if (opts.cancelled() || opts.abortSignal?.aborted) {
-					ensureToolResultsForCalls(messages, toolCalls, 'Cancelled by user');
-					turnOutcome = 'cancelled';
-					return 'Cancelled.';
-				}
-
-				const guardAdvice = gates.adviceFor(name, args);
-				if (guardAdvice) {
-					toolAdvice.push(guardAdvice);
-				}
-
-				if (opts.planMode && !PLAN_MODE_TOOLS.has(name)) {
-					const planBlock = opts.isolated
-						? `Not run: "${name}" is not available in this run (exploration tools only).`
-						: `Not run: "${name}" is not available in Plan mode (explore and wiki tools only; the plan goes to wiki_write id=task-plan).`;
-					messages.push({
-						role: 'tool',
-						tool_call_id: call.id,
-						name,
-						content: planBlock,
-					});
-					actions.push(`${name} blocked (plan mode)`);
-					continue;
-				}
-
-				if (name === 'write' || name === 'delete' || name === 'rename') {
-					gates.markMutatingWriteAllowed();
-				}
-
-				const hookPre = await runAgentHooks(
-					'preToolUse',
-					{ tool: name, args, workspaceRoot: opts.workspaceRoot },
-					line => opts.onActivity?.({ kind: 'checkpoint', label: 'hook', detail: line })
-				);
-				if (hookPre.permission === 'deny') {
-					const msg = hookPre.userMessage || `Blocked by preToolUse hook: ${name}`;
-					messages.push({
-						role: 'tool',
-						tool_call_id: call.id,
-						name,
-						content: msg,
-					});
-					actions.push(`${name} blocked (hook)`);
-					continue;
-				}
-				if (name === 'shell') {
-					const hookShell = await runAgentHooks(
-						'beforeShellExecution',
-						{
-							tool: name,
-							args,
-							command: String(args.command ?? ''),
-							workspaceRoot: opts.workspaceRoot,
-						},
-						line => opts.onActivity?.({ kind: 'checkpoint', label: 'hook', detail: line })
-					);
-					if (hookShell.permission === 'deny') {
-						const msg =
-							hookShell.userMessage ||
-							`Blocked by beforeShellExecution hook: ${String(args.command ?? '')}`;
-						messages.push({
-							role: 'tool',
-							tool_call_id: call.id,
-							name,
-							content: msg,
-						});
-						actions.push('shell blocked (hook)');
-						continue;
-					}
-				}
-
-				if (name === 'write' || name === 'edit') {
-					const policy = getApprovalPolicy();
-					const previewEdits =
-						vscode.workspace.getConfiguration('codeforge.ai').get<boolean>('previewEdits') ===
-						true;
-					// Cursor-like: if edits are auto-approved (or user already accepted), skip DiffPreview
-					// unless previewEdits is explicitly enabled.
-					let previewArgs: Record<string, unknown> | undefined = args;
-					if (name === 'edit') {
-						const current = await opts.bridge.readRaw(String(args.path ?? ''));
-						const applied =
-							current === undefined
-								? undefined
-								: applyEdit(current, String(args.old_string ?? ''), String(args.new_string ?? ''), args.replace_all === true);
-						previewArgs = applied?.ok ? { path: args.path, content: applied.text } : undefined;
-					}
-					if (previewArgs && previewEdits && !policy.isAutoApproved('write')) {
-						const ok = await maybeShowWriteDiff(opts.bridge, previewArgs);
-						if (!ok) {
-							messages.push({
-								role: 'tool',
-								tool_call_id: call.id,
-								name,
-								content: 'Write rejected in diff preview',
-							});
-							actions.push('write rejected (diff)');
-							continue;
-						}
-					}
-				}
-
+			const runIoJob = async (
+				job: ParallelIoJob
+			): Promise<{ output: string; durationMs: number; threw: boolean }> => {
 				const toolStart = Date.now();
-				let output: string;
-				let durationMs: number;
-				let success: boolean;
 				try {
-					output = await executeTool(opts, name, args, call.id, depth, { gitAvailable });
-					durationMs = Date.now() - toolStart;
-					success = isToolSuccess(name, output);
+					const output = await executeTool(opts, job.name, job.args, job.call.id, depth, { gitAvailable });
+					return { output, durationMs: Date.now() - toolStart, threw: false };
 				} catch (toolErr) {
-					durationMs = Date.now() - toolStart;
+					return {
+						output:
+							`Tool "${job.name}" threw: ` +
+							(toolErr instanceof Error ? toolErr.message : String(toolErr)),
+						durationMs: Date.now() - toolStart,
+						threw: true,
+					};
+				}
+			};
+
+			const commitExecuted = async (
+				job: ParallelIoJob,
+				ran: { output: string; durationMs: number; threw: boolean }
+			): Promise<void> => {
+				const {
+					call,
+					name,
+					args,
+					fingerprint,
+					priorFails,
+					pathKey,
+					toolAdvice,
+					readStart,
+					readLimit,
+					readWindowKey,
+					readAliases,
+				} = job;
+				let output = ran.output;
+				const durationMs = ran.durationMs;
+				let success: boolean;
+				if (ran.threw) {
 					success = false;
-					output =
-						`Tool "${name}" threw: ` +
-						(toolErr instanceof Error ? toolErr.message : String(toolErr));
 					failedFingerprints.set(fingerprint, priorFails + 1);
 					consecutiveToolFails += 1;
 					messages.push({
@@ -2463,8 +2109,9 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 						detail: output.slice(0, 300),
 					});
 					trace?.tool({ name, durationMs, success: false, detail: output.slice(0, 120) });
-					continue;
+					return;
 				}
+				success = isToolSuccess(name, output);
 				if (success) {
 					resultCache.set(fingerprint, output);
 					consecutiveToolFails = 0;
@@ -2649,7 +2296,6 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					}
 					invalidatePaths(resultCache, readPathsSeen, readMaxEnd, keys);
 					for (const k of keys) softReadHits.delete(k);
-					// Directory listings may now be stale too.
 					for (const cacheKey of [...resultCache.keys()]) {
 						if (cacheKey.startsWith('list:')) resultCache.delete(cacheKey);
 					}
@@ -2666,7 +2312,454 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					name,
 					content: clipToolOutput(name, output, toolCap + 400),
 				});
+			};
+
+			const flushLane = async (): Promise<void> => {
+				if (!lane.length) return;
+				const jobs = lane.splice(0, lane.length);
+				const rans = await Promise.all(jobs.map(job => runIoJob(job)));
+				for (let i = 0; i < jobs.length; i++) {
+					await commitExecuted(jobs[i], rans[i]);
+				}
+			};
+
+			for (const call of toolCalls) {
+				if (opts.cancelled() || opts.abortSignal?.aborted) {
+					lane.length = 0;
+					ensureToolResultsForCalls(messages, toolCalls, 'Cancelled by user');
+					turnOutcome = 'cancelled';
+					return 'Cancelled.';
+				}
+				if (!exploreTools.has(call.function.name)) {
+					await flushLane();
+				}
+
+				let args: Record<string, unknown> = {};
+				try {
+					args = parseToolArguments(call.function.arguments || '{}');
+				} catch (parseErr) {
+					const detail =
+						parseErr instanceof Error ? parseErr.message : String(parseErr);
+					await flushLane();
+					messages.push({
+						role: 'tool',
+						tool_call_id: call.id,
+						name: call.function.name,
+						content:
+							`Invalid tool arguments JSON (${detail}). ` +
+							`Call ${call.function.name} again with COMPLETE valid JSON. ` +
+							`For write: keep content short and fully closed (no truncated strings).`,
+					});
+					actions.push(`${call.function.name} bad-args`);
+					continue;
+				}
+
+				const name = call.function.name;
+				const toolAdvice: string[] = [];
+				const refuse = async (content: string, label: string) => {
+					await flushLane();
+					trace?.info('harness', String(content.length));
+					messages.push({ role: 'tool', tool_call_id: call.id, name, content });
+					actions.push(`${name} blocked (${label})`);
+				};
+
+				if (name === 'write' && typeof args.content === 'string' && args.content.length > 14000) {
+					await refuse(
+						'Not written: content is larger than one tool call can carry reliably (14k chars). Write the file in parts (write the first part, then add the rest with edit).',
+						'too large'
+					);
+					continue;
+				}
+
+				if (statusQuestion && !activeToolNames.has(name)) {
+					await refuse(
+						`Tool "${name}" is not available on a status question. Answer from PROJECT STATUS. The only tool is update_status.`,
+						'status'
+					);
+					continue;
+				}
+
+				if (!activeToolNames.has(name) && AGENT_TOOL_NAMES.has(name)) {
+					await refuse(
+						`Tool "${name}" is not available in the ${phase} phase. Available now: ${[...activeToolNames].join(', ')}.`,
+						'phase'
+					);
+					continue;
+				}
+
+				// Weak profile: a full rewrite of a large existing file loses code; edit is the tool for that.
+				if (weakProfile && name === 'write' && gates.cfg.blockMassRewrite && typeof args.path === 'string') {
+					const existing = await opts.bridge.readRaw(String(args.path));
+					const existingLines = existing?.split(/\r?\n/).length ?? 0;
+					if (existing !== undefined && existingLines > LARGE_FILE_LINES && isPartialRewrite(existing, String(args.content ?? ''))) {
+						await refuse(
+							`Not written: ${args.path} already has ${existingLines} lines and most of them would stay the same. Change the parts that differ with edit (old_string → new_string).`,
+							'large rewrite'
+						);
+						continue;
+					}
+				}
+
+				// Weak profile: with the build red, three reads are enough to locate the error; broad exploration waits.
+				const pendingRedReads = lane.reduce((n, job) => n + (job.incrementsRedRead ? 1 : 0), 0);
+				if (
+					weakProfile &&
+					gates.buildRed &&
+					readsWhileRed + pendingRedReads >= 3 &&
+					(name === 'list' || name === 'retrieve' || name === 'search' || (name === 'read' && !mentionsErrorFile(String(args.path ?? ''), gates.lastBuildErrors)))
+				) {
+					await refuse(
+						[
+							'Not run: the build is red and three reads have happened since. Edit the files named in the errors, or run the build again.',
+							'Open errors:',
+							...gates.lastBuildErrors.slice(0, 8).map(e => `- ${e}`),
+						].join('\n'),
+						'red build'
+					);
+					continue;
+				}
+
+				if (name === 'list') {
+					const listPath = String(args.path ?? '.')
+						.replace(/\\/g, '/')
+						.replace(/^\.\//, '')
+						.trim();
+					const isRoot = !listPath || listPath === '.' || listPath === '/';
+					if (Boolean(args.recursive) && isRoot) {
+						args.recursive = false;
+						toolAdvice.push('(recursive listing of the workspace root is shallow — list a subfolder for more)');
+					}
+				}
+
+				const fingerprint = toolFingerprint(name, args);
+				const priorCount = recentFingerprints.filter(f => f === fingerprint).length;
+				recentFingerprints.push(fingerprint);
+				if (recentFingerprints.length > 40) {
+					recentFingerprints.shift();
+				}
+
+				const pathKey =
+					typeof args.path === 'string'
+						? canonicalizePathKey(args.path)
+						: typeof args.oldPath === 'string'
+							? canonicalizePathKey(String(args.oldPath))
+							: '';
+				const cached = resultCache.get(fingerprint);
+				const isReadonly = READONLY_TOOLS.has(name);
+				const priorFails = failedFingerprints.get(fingerprint) ?? 0;
+
+				if (name === 'list' && pathKey && listPathsSeen.has(pathKey) && resultCache.has(`list:${pathKey}`)) {
+					const prior = resultCache.get(`list:${pathKey}`) ?? '';
+					const content = `(already in context — earlier listing of ${args.path})\n${clipData(prior, toolCap)}`;
+					await flushLane();
+					messages.push({
+						role: 'tool',
+						tool_call_id: call.id,
+						name,
+						content,
+					});
+					actions.push(`list ${args.path} cached`.trim());
+					opts.onActivity?.({
+						kind: 'tool',
+						label: `list cached ${args.path}`,
+						tool: name,
+						toolCallId: call.id,
+						toolStatus: 'ok',
+						success: true,
+						detail: content.slice(0, 200),
+					});
+					continue;
+				}
+
+				// Same path + covered window: return remembered content; new startLine past coverage still runs.
+				const readStart = Math.max(
+					1,
+					Number(args.startLine ?? args.offset ?? 1) || 1
+				);
+				const readLimit = Math.max(1, Math.min(400, Number(args.limit ?? 120) || 120));
+				const readAliases = readAliasesFor(pathKey);
+				const coveredEnd = Math.max(
+					0,
+					...readAliases.map(k => readMaxEnd.get(k) ?? 0)
+				);
+				const alreadyRead = readAliases.some(k => readPathsSeen.has(k));
+				const readWindowKey =
+					name === 'read' && pathKey ? `${pathKey}@${readStart}@${readLimit}` : '';
+				const cachedWindow =
+					name === 'read' && pathKey && alreadyRead
+						? rememberedReadWindow(resultCache, readAliases, readStart, readLimit)
+						: undefined;
+				if (name === 'read' && cachedWindow !== undefined && readStart <= coveredEnd) {
+					const hits = (softReadHits.get(pathKey) ?? 0) + 1;
+					softReadHits.set(pathKey, hits);
+					const content = `(already in context up to L${coveredEnd})\n${clipData(cachedWindow, toolCap)}`;
+					await flushLane();
+					messages.push({
+						role: 'tool',
+						tool_call_id: call.id,
+						name,
+						content,
+					});
+					actions.push(`read ${args.path} cached`.trim());
+					opts.onActivity?.({
+						kind: 'tool',
+						label: `read cached ${args.path}`,
+						tool: name,
+						toolCallId: call.id,
+						toolStatus: 'ok',
+						success: true,
+						detail: content.slice(0, 200),
+					});
+					continue;
+				}
+
+				// Identical failed command: not re-run (same input, same failure) unless files changed since.
+				if (
+					priorFails >= 1 &&
+					(name === 'shell' || name === 'dotnet') &&
+					failedAtWriteCount.get(fingerprint) === successfulWriteCount
+				) {
+					const refusal = [
+						'Not run: this exact command already failed in this run and no file changed since.',
+						'Change the command, or fix the files named in its output first.',
+					].join('\n');
+					messages.push({ role: 'tool', tool_call_id: call.id, name, content: refusal });
+					actions.push(`${name} advised (failed-repeat)`);
+					consecutiveToolFails += 1;
+					continue;
+				}
+
+				if (cached && priorCount >= 1 && isReadonly) {
+					await flushLane();
+					messages.push({
+						role: 'tool',
+						tool_call_id: call.id,
+						name,
+						content: `(already in context — same ${name} result for the same arguments)\n${clipToolOutput(name, cached, toolCap)}`,
+					});
+					if (!warnedFingerprints.has(fingerprint)) {
+						warnedFingerprints.add(fingerprint);
+						actions.push(`${name} cached`);
+					}
+					continue;
+				}
+
+				const extDef = getToolRegistry().get(name);
+				if (extDef && !AGENT_TOOL_NAMES.has(name) && !toolVisibleInMode(extDef, agentMode)) {
+					await refuse(
+						`Tool "${name}" is not available in mode ${agentMode?.title ?? 'this mode'}.`,
+						'mode'
+					);
+					continue;
+				}
+
+				const gateDecision = await decideGates(
+					enabledGates(getGateRegistry().list(), governance.getState().guardrails),
+					extGateSession,
+					{ name, args, risk: riskForAgentTool(name) }
+				);
+				if (gateDecision.action === 'block') {
+					await refuse(gateDecision.reason || `Blocked by guardrail: ${name}`, 'gate');
+					continue;
+				}
+				let gateApproved = false;
+				if (gateDecision.action === 'require-approval') {
+					const approval = await ApprovalDialog.show({
+						tool: name,
+						arguments: summarizeArgs(name, args),
+						risk: approvalLevelForRisk(riskForAgentTool(name)),
+						reason: gateDecision.reason,
+					});
+					trace?.record({
+						type: 'approval',
+						label: name,
+						detail: approval.approved ? 'gate approved' : 'gate denied',
+					});
+					if (!approval.approved) {
+						await flushLane();
+						messages.push({
+							role: 'tool',
+							tool_call_id: call.id,
+							name,
+							content: `Denied by user: ${name}`,
+						});
+						actions.push(`${name} denied (gate)`);
+						continue;
+					}
+					gateApproved = true;
+				}
+
+				opts.onActivity?.({
+					kind: 'tool',
+					label: formatToolActivityLabel(name, args),
+					tool: name,
+					toolCallId: call.id,
+					toolStatus: 'running',
+					detail: JSON.stringify(summarizeArgs(name, args)).slice(0, 200),
+				});
+
+				if (MUTATING.has(name) && !gateApproved) {
+					if (opts.sessionId && opts.sessionStore) {
+						await opts.sessionStore.createCheckpoint(
+							opts.sessionId,
+							`approval:${name}`,
+							{ name, arguments: args },
+							{ pause: false }
+						);
+					}
+					const approval = await ApprovalDialog.show({
+						tool: name,
+						arguments: summarizeArgs(name, args),
+						risk: name === 'shell' || name === 'delete' ? 'high' : 'medium',
+						reason: describeMutation(name, args),
+					});
+					trace?.record({
+						type: 'approval',
+						label: name,
+						detail: approval.approved ? 'approved' : 'denied',
+					});
+					if (!approval.approved) {
+						await flushLane();
+						messages.push({
+							role: 'tool',
+							tool_call_id: call.id,
+							name,
+							content: `Denied by user: ${name}`,
+						});
+						actions.push(`${name} denied`);
+						continue;
+					}
+				}
+
+				if (opts.cancelled() || opts.abortSignal?.aborted) {
+					lane.length = 0;
+					ensureToolResultsForCalls(messages, toolCalls, 'Cancelled by user');
+					turnOutcome = 'cancelled';
+					return 'Cancelled.';
+				}
+
+				const guardAdvice = gates.adviceFor(name, args);
+				if (guardAdvice) {
+					toolAdvice.push(guardAdvice);
+				}
+
+				if (opts.planMode && !PLAN_MODE_TOOLS.has(name)) {
+					const planBlock = opts.isolated
+						? `Not run: "${name}" is not available in this run (exploration tools only).`
+						: `Not run: "${name}" is not available in Plan mode (explore and wiki tools only; the plan goes to wiki_write id=task-plan).`;
+					await flushLane();
+					messages.push({
+						role: 'tool',
+						tool_call_id: call.id,
+						name,
+						content: planBlock,
+					});
+					actions.push(`${name} blocked (plan mode)`);
+					continue;
+				}
+
+				if (name === 'write' || name === 'delete' || name === 'rename') {
+					gates.markMutatingWriteAllowed();
+				}
+
+				const hookPre = await runAgentHooks(
+					'preToolUse',
+					{ tool: name, args, workspaceRoot: opts.workspaceRoot },
+					line => opts.onActivity?.({ kind: 'checkpoint', label: 'hook', detail: line })
+				);
+				if (hookPre.permission === 'deny') {
+					const msg = hookPre.userMessage || `Blocked by preToolUse hook: ${name}`;
+					await flushLane();
+					messages.push({
+						role: 'tool',
+						tool_call_id: call.id,
+						name,
+						content: msg,
+					});
+					actions.push(`${name} blocked (hook)`);
+					continue;
+				}
+				if (name === 'shell') {
+					const hookShell = await runAgentHooks(
+						'beforeShellExecution',
+						{
+							tool: name,
+							args,
+							command: String(args.command ?? ''),
+							workspaceRoot: opts.workspaceRoot,
+						},
+						line => opts.onActivity?.({ kind: 'checkpoint', label: 'hook', detail: line })
+					);
+					if (hookShell.permission === 'deny') {
+						const msg =
+							hookShell.userMessage ||
+							`Blocked by beforeShellExecution hook: ${String(args.command ?? '')}`;
+						messages.push({
+							role: 'tool',
+							tool_call_id: call.id,
+							name,
+							content: msg,
+						});
+						actions.push('shell blocked (hook)');
+						continue;
+					}
+				}
+
+				if (name === 'write' || name === 'edit') {
+					const policy = getApprovalPolicy();
+					const previewEdits =
+						vscode.workspace.getConfiguration('codeforge.ai').get<boolean>('previewEdits') ===
+						true;
+					// Cursor-like: if edits are auto-approved (or user already accepted), skip DiffPreview
+					// unless previewEdits is explicitly enabled.
+					let previewArgs: Record<string, unknown> | undefined = args;
+					if (name === 'edit') {
+						const current = await opts.bridge.readRaw(String(args.path ?? ''));
+						const applied =
+							current === undefined
+								? undefined
+								: applyEdit(current, String(args.old_string ?? ''), String(args.new_string ?? ''), args.replace_all === true);
+						previewArgs = applied?.ok ? { path: args.path, content: applied.text } : undefined;
+					}
+					if (previewArgs && previewEdits && !policy.isAutoApproved('write')) {
+						const ok = await maybeShowWriteDiff(opts.bridge, previewArgs);
+						if (!ok) {
+							messages.push({
+								role: 'tool',
+								tool_call_id: call.id,
+								name,
+								content: 'Write rejected in diff preview',
+							});
+							actions.push('write rejected (diff)');
+							continue;
+						}
+					}
+				}
+
+				const job: ParallelIoJob = {
+					call,
+					name,
+					args,
+					fingerprint,
+					priorFails,
+					pathKey,
+					toolAdvice,
+					readStart,
+					readLimit,
+					readWindowKey,
+					readAliases,
+					incrementsRedRead:
+						name === 'read' &&
+						!mentionsErrorFile(String(args.path ?? ''), gates.lastBuildErrors),
+				};
+				if (exploreTools.has(name)) {
+					lane.push(job);
+					continue;
+				}
+				await commitExecuted(job, await runIoJob(job));
 			}
+
+			await flushLane();
 
 			// Flush deferred nudges only after every tool_result for this assistant turn exists.
 			for (const nudge of pendingNudges) {

@@ -12,6 +12,12 @@ import * as path from 'path';
 import { VSCodeAIBridge } from '../bridge/vscodeBridge';
 import { AiSettingsStore } from '../settings/aiSettingsStore';
 import { runAgentWithTools, AgentActivityEvent, type AgentLoopOptions } from '../agent/agentLoop';
+import {
+	cachedLlamaSlots,
+	effectiveContextBudget,
+	llamaSlotsProbed,
+	refreshLlamaSlots,
+} from '../agent/llamaSlots';
 import { runOrchestrated } from '../agent/orchestratorRun';
 import { runReviewPipeline } from '../agent/reviewPipeline';
 import { SessionStore, type MessageTimings } from '../sessions/sessionStore';
@@ -792,10 +798,32 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		}
 	}
 
+	private async resolveNumCtx(
+		serverId: string,
+		configured: number | undefined,
+		model: string,
+		baseUrl: string,
+		apiKey: string
+	): Promise<number | undefined> {
+		if (baseUrl && !llamaSlotsProbed(serverId, model)) {
+			await refreshLlamaSlots({
+				serverId,
+				model,
+				baseUrl,
+				apiKey,
+				configuredCtx: configured,
+			});
+			this.pushConfig();
+		}
+		return effectiveContextBudget(configured, cachedLlamaSlots(serverId, model));
+	}
+
 	private getModelLabel(): string {
 		const { server, model } = this._store.getActiveSelection();
 		if (server && model) {
-			return `${server.name} · ${model}`;
+			const slots = cachedLlamaSlots(server.id, model);
+			const parallel = slots ? ` · parallel ${slots.parallel}` : '';
+			return `${server.name} · ${model}${parallel}`;
 		}
 		if (server) {
 			return `${server.name} · add a model`;
@@ -1046,6 +1074,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			].join('\n');
 		}
 
+		const numCtx = await this.resolveNumCtx(server.id, server.numCtx, activeModel, baseUrl, apiKey);
+
 		if (this._mode === 'ask') {
 			if (!apiKey && provider !== 'ollama' && provider !== 'lmstudio' && provider !== 'vllm') {
 				return [
@@ -1084,7 +1114,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 				history: this.getHistoryForLlm(),
 				cancelled: () => this._cancelled,
 				abortSignal: this._abort?.signal,
-				numCtx: server.numCtx,
+				numCtx,
 				forceJson: server.forceJson === true,
 				onStatus: text => {
 					// Tool progress uses tool cards — keep pending bubble quiet (no step spam).
@@ -1177,7 +1207,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			history: this.getHistoryForLlm(),
 			cancelled: () => this._cancelled,
 			abortSignal: this._abort?.signal,
-			numCtx: server.numCtx,
+			numCtx,
 			forceJson: server.forceJson === true,
 			onStatus: text => {
 				// Tool progress uses tool cards — keep pending bubble for thinking/checkpoints only.
@@ -1308,7 +1338,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
 		const ctype = (response.headers.get('content-type') || '').toLowerCase();
 		const { server: askServer } = this._store.getActiveSelection();
-		const limit = askServer?.numCtx && askServer.numCtx > 0 ? askServer.numCtx : 0;
+		const configured = askServer?.numCtx && askServer.numCtx > 0 ? askServer.numCtx : undefined;
+		const slots = askServer ? cachedLlamaSlots(askServer.id, model) : undefined;
+		const limit = effectiveContextBudget(configured, slots) ?? 0;
 
 		if (response.body && (ctype.includes('event-stream') || ctype.includes('octet-stream') || !ctype.includes('json'))) {
 			const reader = response.body.getReader();

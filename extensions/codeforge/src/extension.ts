@@ -23,6 +23,7 @@ import { SessionStore } from './sessions/sessionStore';
 import { initTrace } from './trace/traceService';
 import { initMcp } from './mcp/mcpClient';
 import { getSkillsRules } from './skills/skillsRulesLoader';
+import { refreshLlamaSlots } from './agent/llamaSlots';
 import { initGovernanceStore } from './governance/governanceStore';
 import { ensureHomeLayout } from './storage/paths';
 import { initProjectWiki } from './memory/projectWiki';
@@ -173,10 +174,25 @@ export async function activate(context: vscode.ExtensionContext): Promise<CodeFo
         `${governance.getState().guardrails.filter(g => g.enabled).length} guardrails enabled`
     );
 
+    const probeLlamaSlots = () => {
+        const { server, model } = settingsStore.getActiveSelection();
+        if (!server || !model || !server.baseUrl) return;
+        void refreshLlamaSlots({
+            serverId: server.id,
+            model,
+            baseUrl: server.baseUrl,
+            apiKey: server.apiKey,
+            configuredCtx: server.numCtx,
+            log: line => outputChannel.appendLine(line),
+        }).then(() => chatViewProvider.refreshConfig());
+    };
+    probeLlamaSlots();
+
     context.subscriptions.push(
         settingsStore.onDidChange(() => {
             chatViewProvider.refreshConfig();
             void mcp.refresh(settingsStore.getState().mcpServers);
+            probeLlamaSlots();
         })
     );
 

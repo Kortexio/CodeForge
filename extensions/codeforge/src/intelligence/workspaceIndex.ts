@@ -80,7 +80,17 @@ export function pathsNeedingReindex(
 	return next.filter(e => prevByPath.get(e.path) !== e.hash).map(e => e.path);
 }
 
+let indexInflight: Promise<{ indexed: number }> | undefined;
+
 export async function ensureWorkspaceIndex(): Promise<{ indexed: number }> {
+	if (indexInflight) return indexInflight;
+	indexInflight = buildWorkspaceIndex().finally(() => {
+		indexInflight = undefined;
+	});
+	return indexInflight;
+}
+
+async function buildWorkspaceIndex(): Promise<{ indexed: number }> {
 	const folder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
 	if (!folder) {
 		memoryPaths = [];
