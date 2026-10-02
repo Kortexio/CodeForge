@@ -1,8 +1,9 @@
 src/**
 tsconfig*.json
 **/*.tsbuildinfo
-out/**
 esbuild*.mts
+esbuild*.mjs
 package-lock.json
 node_modules/**
 **/*.map
+*.vsix
