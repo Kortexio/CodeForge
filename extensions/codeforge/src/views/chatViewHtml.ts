@@ -530,7 +530,7 @@ export function getChatViewHtml(assets: ChatViewAssets): string {
   const MODES = [
     { id: 'agent', label: 'Agent', desc: 'Edits and runs tools' },
     { id: 'plan', label: 'Plan', desc: 'Explore and write a plan' },
-    { id: 'ask', label: 'Ask', desc: 'Answer without tools' },
+    { id: 'ask', label: 'Ask', desc: 'Read/search/web — no edits' },
   ];
 
   const messagesEl = document.getElementById('messages');

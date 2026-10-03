@@ -92,6 +92,7 @@ import {
 } from './readMemory';
 import { detectOracle, exitCodeOf, formatOracleResult, nodeOracleFs, runOracle, type OracleResult } from './oracle';
 import {
+	ASK_ALLOWED_TOOLS,
 	buildDotnetCommand,
 	currentPhase,
 	DOTNET_TOOL,
@@ -104,6 +105,25 @@ import {
 	toolNamesFor,
 	type AgentPhase,
 } from './toolsets';
+import {
+	appendRoundResult,
+	coachTaskPrompt,
+	collectLockablePaths,
+	denyExperimentMutation,
+	experimentSystemHint,
+	lockedScorePaths,
+	readChecksLock,
+	readRoundResults,
+	shouldRunCoach,
+	writeChecksLock,
+	type ChecksLock,
+} from './experimentLoop';
+import { getEditJournal } from './editJournal';
+import { webFetch, webSearch } from './webTools';
+import { formatTodos, writeTodos } from './todoStore';
+import { awaitBgShell, formatBgStart, startBgShell } from './bgShell';
+import { editNotebook } from './notebookTool';
+import { canvasWrite, generateImage, voiceStatus } from './mediaTools';
 
 /** Oracle result plus the cookbook fix for each error code present (only those). */
 export function oracleNote(result: OracleResult, reason: string): string {
@@ -119,7 +139,26 @@ function dotnetCommandLine(args: Record<string, unknown>): string {
 
 // Note: subagent is inlined via recursive runAgentWithTools — no separate import (avoids cycles).
 
-const MUTATING = new Set(['write', 'edit', 'dotnet', 'delete', 'rename', 'shell', 'wiki_write', 'wiki_fact', 'browser_navigate', 'browser_click', 'browser_type']);
+const MUTATING = new Set([
+	'write',
+	'edit',
+	'dotnet',
+	'delete',
+	'rename',
+	'shell',
+	'wiki_write',
+	'wiki_fact',
+	'browser_navigate',
+	'browser_click',
+	'browser_type',
+	'git_add',
+	'git_commit',
+	'git_push',
+	'gh_pr_create',
+	'edit_notebook',
+	'generate_image',
+	'canvas_write',
+]);
 const READONLY_TOOLS = new Set([
 	'read',
 	'list',
@@ -141,6 +180,11 @@ const READONLY_TOOLS = new Set([
 	'wiki_facts',
 	'browser_snapshot',
 	'skill',
+	'web_search',
+	'web_fetch',
+	'await_shell',
+	'todo_write',
+	'voice_status',
 ]);
 
 function normalizeShellCommand(cmd: string): string {
@@ -451,7 +495,8 @@ export const AGENT_TOOLS = [
 		type: 'function' as const,
 		function: {
 			name: 'shell',
-			description: 'Run a cmd.exe command in the workspace (sandbox optional).',
+			description:
+				'Run a cmd.exe command in the workspace. Prefer web_search/web_fetch for HTTP. Set background=true for long jobs, then await_shell.',
 			parameters: {
 				type: 'object',
 				properties: {
@@ -460,9 +505,211 @@ export const AGENT_TOOLS = [
 						type: 'string',
 						description: 'safe-local | restricted | isolated | container | unrestricted',
 					},
+					background: {
+						type: 'boolean',
+						description: 'If true, start in background and return a job id',
+					},
+					block_until_ms: {
+						type: 'number',
+						description: 'Optional max wait before treating as background (ms)',
+					},
 				},
 				required: ['command'],
 			},
+		},
+	},
+	{
+		type: 'function' as const,
+		function: {
+			name: 'await_shell',
+			description: 'Wait/poll a background shell job by id; optional regex pattern on output.',
+			parameters: {
+				type: 'object',
+				properties: {
+					id: { type: 'string' },
+					pattern: { type: 'string', description: 'Regex matched against stdout/stderr' },
+					block_until_ms: { type: 'number', description: 'Max wait ms (default 30000)' },
+				},
+				required: ['id'],
+			},
+		},
+	},
+	{
+		type: 'function' as const,
+		function: {
+			name: 'web_search',
+			description: 'Search the public web (no API key). Prefer this over shell curl for discovery.',
+			parameters: {
+				type: 'object',
+				properties: {
+					query: { type: 'string' },
+					max_results: { type: 'number' },
+				},
+				required: ['query'],
+			},
+		},
+	},
+	{
+		type: 'function' as const,
+		function: {
+			name: 'web_fetch',
+			description: 'Fetch a URL and return text/markdown-ish content (native HTTPS).',
+			parameters: {
+				type: 'object',
+				properties: {
+					url: { type: 'string' },
+					max_chars: { type: 'number' },
+				},
+				required: ['url'],
+			},
+		},
+	},
+	{
+		type: 'function' as const,
+		function: {
+			name: 'todo_write',
+			description: 'Create or update a multi-step checklist for this session.',
+			parameters: {
+				type: 'object',
+				properties: {
+					todos: {
+						type: 'array',
+						items: {
+							type: 'object',
+							properties: {
+								id: { type: 'string' },
+								content: { type: 'string' },
+								status: {
+									type: 'string',
+									description: 'pending | in_progress | completed | cancelled',
+								},
+							},
+							required: ['content'],
+						},
+					},
+					merge: {
+						type: 'boolean',
+						description: 'Merge into existing todos (default true)',
+					},
+				},
+				required: ['todos'],
+			},
+		},
+	},
+	{
+		type: 'function' as const,
+		function: {
+			name: 'git_add',
+			description: 'Stage files for commit (git add). Omit paths to stage all.',
+			parameters: {
+				type: 'object',
+				properties: {
+					paths: { type: 'array', items: { type: 'string' } },
+				},
+			},
+		},
+	},
+	{
+		type: 'function' as const,
+		function: {
+			name: 'git_commit',
+			description: 'Create a git commit with the given message. Prefer after git_add.',
+			parameters: {
+				type: 'object',
+				properties: { message: { type: 'string' } },
+				required: ['message'],
+			},
+		},
+	},
+	{
+		type: 'function' as const,
+		function: {
+			name: 'git_push',
+			description: 'Push the current branch to the remote (git push).',
+			parameters: {
+				type: 'object',
+				properties: {
+					set_upstream: { type: 'boolean' },
+					remote: { type: 'string' },
+					branch: { type: 'string' },
+				},
+			},
+		},
+	},
+	{
+		type: 'function' as const,
+		function: {
+			name: 'gh_pr_create',
+			description: 'Create a GitHub pull request with the gh CLI.',
+			parameters: {
+				type: 'object',
+				properties: {
+					title: { type: 'string' },
+					body: { type: 'string' },
+					base: { type: 'string' },
+					draft: { type: 'boolean' },
+				},
+				required: ['title', 'body'],
+			},
+		},
+	},
+	{
+		type: 'function' as const,
+		function: {
+			name: 'edit_notebook',
+			description: 'Edit or insert a cell in a Jupyter .ipynb notebook.',
+			parameters: {
+				type: 'object',
+				properties: {
+					path: { type: 'string' },
+					cell_index: { type: 'number' },
+					new_source: { type: 'string' },
+					cell_language: { type: 'string' },
+					is_new_cell: { type: 'boolean' },
+				},
+				required: ['path', 'cell_index', 'new_source'],
+			},
+		},
+	},
+	{
+		type: 'function' as const,
+		function: {
+			name: 'generate_image',
+			description:
+				'Generate an image from a prompt (SVG poster locally, or images API if configured). Saves under .CodeForge/artifacts/images/.',
+			parameters: {
+				type: 'object',
+				properties: {
+					prompt: { type: 'string' },
+					filename: { type: 'string' },
+				},
+				required: ['prompt'],
+			},
+		},
+	},
+	{
+		type: 'function' as const,
+		function: {
+			name: 'canvas_write',
+			description: 'Write a side-panel style canvas doc under .CodeForge/canvas/ (md or html).',
+			parameters: {
+				type: 'object',
+				properties: {
+					id: { type: 'string' },
+					title: { type: 'string' },
+					content: { type: 'string' },
+					format: { type: 'string', description: 'md | html' },
+				},
+				required: ['id', 'title', 'content'],
+			},
+		},
+	},
+	{
+		type: 'function' as const,
+		function: {
+			name: 'voice_status',
+			description: 'Report voice-input availability (UX pending).',
+			parameters: { type: 'object', properties: {} },
 		},
 	},
 	{
@@ -732,7 +979,8 @@ export const AGENT_TOOLS = [
 		type: 'function' as const,
 		function: {
 			name: 'delegate_task',
-			description: 'Run a focused subagent (optional mode: explore).',
+			description:
+				'Run a focused subagent. mode: explore (read-only), general (full agent), or plan.',
 			parameters: {
 				type: 'object',
 				properties: {
@@ -740,7 +988,7 @@ export const AGENT_TOOLS = [
 					context: { type: 'string' },
 					mode: {
 						type: 'string',
-						description: 'Optional: "explore" for read-only codebase survey',
+						description: 'explore | general | plan (default general)',
 					},
 				},
 				required: ['task'],
@@ -938,6 +1186,14 @@ export interface AgentLoopOptions {
 	 */
 	planMode?: boolean;
 	/**
+	 * Method coach: path-gated writes to how-to-work only (experiment loop).
+	 */
+	coachMode?: boolean;
+	/**
+	 * Ask mode: read-only tools + web (no shell/writes).
+	 */
+	askMode?: boolean;
+	/**
 	 * Clean context (orchestrator items): no chat history, no prior-session transcript or read memory.
 	 * Stable facts and tool traces are still shared through the session.
 	 */
@@ -949,6 +1205,7 @@ export interface AgentLoopOptions {
 }
 
 const PLAN_MODE_TOOLS = new Set<string>(PLAN_ALLOWED_TOOLS);
+const ASK_MODE_TOOLS = new Set<string>(ASK_ALLOWED_TOOLS);
 
 export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string> {
 	const checkpointSize = opts.maxSteps ?? 30;
@@ -1016,13 +1273,31 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 		stepBudget = 4;
 		nextCheckpoint = hardCap;
 	}
-	const planModeHint = opts.planMode && opts.isolated
+	const checksLock: ChecksLock | undefined = await readChecksLock(opts.workspaceRoot);
+	const lockedPaths = checksLock ? lockedScorePaths(checksLock) : [];
+	const experimentOn = !!checksLock && !opts.coachMode;
+
+	const planModeHint = opts.coachMode
+		? [
+				'### COACH MODE (active)',
+				'Update only .CodeForge/skills/how-to-work/SKILL.md from the experiment results.',
+				'Do not edit application code, tests, oracle.json, or checks.lock.',
+			].join('\n')
+		: opts.askMode
+		? [
+				'### ASK MODE (active)',
+				'Answer questions using read/search/retrieve/web tools. Do not edit files or run shell.',
+				'Prefer web_search / web_fetch for public docs and APIs.',
+			].join('\n')
+		: opts.planMode && opts.isolated
 		? 'Only exploration tools are available in this run.'
 		: opts.planMode
 		? [
 				'### PLAN MODE (active)',
 				'Explore the repo and write a plan to the wiki (wiki_write id=task-plan with checklist + Definition of Done).',
-				'Only explore and wiki tools are available in this mode. When the plan is saved, reply with a summary of it.',
+				'Draft the feature checks as test files and/or files under .CodeForge/loop/ (production app code stays read-only).',
+				'When you finish, the harness locks those check paths automatically for the next build turn — you do not write checks.lock yourself.',
+				'When the plan is saved, reply with a summary of it and the checks you wrote.',
 			].join('\n')
 		: '';
 	const systemBase = [
@@ -1030,6 +1305,10 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 		`Workspace root: ${opts.workspaceRoot ?? '(none — ask user to open a folder)'}`,
 		'Use tools to read/change files and run commands. Paths are relative to the workspace root.',
 		'For .NET use the `dotnet` tool; shell is cmd.exe (`&&` works; no PowerShell/Unix pipes).',
+		'Prefer web_search and web_fetch for HTTP. Use shell for builds/tests and only fall back to curl when those tools are unavailable.',
+		'Use todo_write for multi-step work. Use delegate_task for parallel sub-work (modes: explore | general | plan).',
+		'Long shell jobs: shell with background=true, then await_shell.',
+		'Do not ask the user for API keys already configured in CodeForge settings; never paste secrets into the chat.',
 		'Long-running servers hand off to the Agent Terminal after startup.',
 		'Use retrieve/search/read for repo context. Call `skill` for playbooks. Call update_status before the final reply.',
 		'Typical flow: retrieve/search → read the slice → edit or write → build/test.',
@@ -1049,6 +1328,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 			? 'This turn asks where the work stopped. Answer from CONTEXT status only. Do not explore the repo, run shell, or call git. The only tool is update_status, after the answer.'
 			: '',
 		planModeHint,
+		experimentOn && !opts.planMode ? experimentSystemHint() : '',
 		agentMode
 			? [
 					`### Mode: ${agentMode.title}`,
@@ -1163,7 +1443,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 	const MAX_ORACLE_REJECTIONS = 6;
 	let gateFinishRejections = 0;
 	const MAX_GATE_FINISH_REJECTIONS = 2;
-	const oracleCfg = opts.planMode ? undefined : detectOracle(opts.workspaceRoot, nodeOracleFs);
+	const oracleCfg = opts.planMode || opts.askMode ? undefined : detectOracle(opts.workspaceRoot, nodeOracleFs);
 	let lastProgressMarker = '';
 	const progressMarker = () =>
 		`${successfulWriteCount}|${readPathsSeen.size}|${gates.buildRed ? 'red' : 'ok'}|${gates.lastBuildErrors.length}`;
@@ -1564,12 +1844,18 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					? 'fix'
 					: opts.basePhase
 				: currentPhase(opts.task, { buildRed: gates.buildRed });
-			const toolProfile = profileForTurn(phase, opts.task, { planMode: opts.planMode });
-			toolCap = toolResultCharCap(contextBudget, toolProfile === 'explore');
+			const toolProfile = profileForTurn(phase, opts.task, {
+				planMode: opts.planMode,
+				coachMode: opts.coachMode,
+				askMode: opts.askMode,
+			});
+			toolCap = toolResultCharCap(contextBudget, toolProfile === 'explore' || toolProfile === 'ask');
 			activeToolNames = toolNamesFor(phase, opts.task, {
 				weakProfile,
 				allNames: allAgentToolNames(agentMode),
 				planMode: opts.planMode,
+				coachMode: opts.coachMode,
+				askMode: opts.askMode,
 				mcpAvailable,
 				exploreSubagent: exploreSubagentOn,
 			});
@@ -1918,19 +2204,76 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 				const blocked = parseBlockedClaim(summary);
 				const changedFiles = successfulWriteCount > 0;
 				let doneNote = '';
-				if (!blocked && changedFiles && !opts.planMode && oracleCfg && !gates.hasVerifiedGreen()) {
+				let loggedExperimentRound = false;
+				if (
+					!blocked &&
+					changedFiles &&
+					!opts.planMode &&
+					!opts.coachMode &&
+					oracleCfg &&
+					!gates.hasVerifiedGreen()
+				) {
 					const result = await runOracleNow('finish check');
+					const roundFiles = [...writtenPaths];
+					const logRound = async (kept: boolean) => {
+						if (!experimentOn) return;
+						await appendRoundResult(opts.workspaceRoot, {
+							kept,
+							feature: opts.task.slice(0, 200),
+							commands: result.commands,
+							failedTests: result.failedTests,
+							errors: result.errors.slice(0, 12).map(e => `${e.code} ${e.file}:${e.line}`),
+							files: roundFiles,
+							at: new Date().toISOString(),
+						});
+						loggedExperimentRound = true;
+					};
 					if (!result.ok && oracleRejections < MAX_ORACLE_REJECTIONS && step + 1 < stepBudget) {
 						oracleRejections += 1;
+						if (experimentOn) {
+							const journal = getEditJournal();
+							const turn = journal.getTurn();
+							try {
+								const n = await journal.revertTurns(turn, {
+									write: (p, c) => opts.bridge.writeRaw(p, c),
+									delete: p => opts.bridge.deleteRaw(p),
+									readRaw: p => opts.bridge.readRaw(p),
+								});
+								opts.onActivity?.({
+									kind: 'checkpoint',
+									label: 'Experiment round undone',
+									detail: n > 0 ? `Reverted ${n} file(s)` : 'No journaled files',
+								});
+							} catch (err) {
+								trace?.info(
+									'harness',
+									`experiment revert failed: ${err instanceof Error ? err.message : String(err)}`
+								);
+							}
+							await logRound(false);
+							successfulWriteCount = 0;
+							writtenPaths.clear();
+							writesSinceOracle = 0;
+						}
 						const note = oracleRejectNote(oracleNote(result, 'finish check'));
 						trace?.info('harness', String(note.length));
 						messages.push({ role: 'assistant', content: summary });
-						messages.push({ role: 'user', content: note });
-						opts.onStatus?.(`Oracle vermelho — a continuar (${oracleRejections}/${MAX_ORACLE_REJECTIONS})…`);
+						messages.push({
+							role: 'user',
+							content: experimentOn
+								? `${note}\n\nExperiment loop: this round was undone. Start the next attempt from the clean tree.`
+								: note,
+						});
+						opts.onStatus?.(
+							`Oracle vermelho — a continuar (${oracleRejections}/${MAX_ORACLE_REJECTIONS})…`
+						);
 						continue;
 					}
 					if (!result.ok) {
+						await logRound(false);
 						doneNote = finalReplyNote('still-red', result.commands[result.commands.length - 1]);
+					} else {
+						await logRound(true);
 					}
 				} else if (!blocked && changedFiles && !oracleCfg && claimsBuildOrTestGreen(summary) && !gates.hasVerifiedGreen()) {
 					doneNote = finalReplyNote('unverified');
@@ -1993,6 +2336,49 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					}
 				}
 
+				if (
+					experimentOn &&
+					!loggedExperimentRound &&
+					!blocked &&
+					changedFiles &&
+					!opts.planMode &&
+					!opts.coachMode &&
+					gates.hasVerifiedGreen()
+				) {
+					// Mid-turn oracle already green — still record a kept round once.
+					await appendRoundResult(opts.workspaceRoot, {
+						kept: true,
+						feature: opts.task.slice(0, 200),
+						files: [...writtenPaths],
+						at: new Date().toISOString(),
+					});
+				}
+
+				// Auto-lock per feature: plan turn that wrote checks creates checks.lock.
+				if (opts.planMode && !opts.coachMode && !blocked) {
+					const lockable = collectLockablePaths([...writtenPaths]);
+					if (lockable.length) {
+						try {
+							const lock = await writeChecksLock(opts.workspaceRoot, lockable, {
+								feature: opts.task.slice(0, 200),
+							});
+							if (lock) {
+								opts.onActivity?.({
+									kind: 'checkpoint',
+									label: 'Experiment loop armed',
+									detail: `Locked ${lock.paths.length} check path(s)`,
+								});
+								doneNote +=
+									`\n\nExperiment loop: locked ${lock.paths.length} check path(s) for the next build turn:\n` +
+									lock.paths.map(p => `- ${p}`).join('\n');
+							}
+						} catch (err) {
+							const msg = err instanceof Error ? err.message : String(err);
+							doneNote += `\n\nExperiment loop: failed to write checks.lock (${msg}).`;
+						}
+					}
+				}
+
 				opts.onTaskUpdate?.({
 					id: taskId,
 					name: truncateHistory(opts.task, 60),
@@ -2008,7 +2394,44 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 				turnOutcome = blocked ? 'blocked' : 'done';
 				turnBlockedReason = blocked ?? '';
 				emitTurnMetrics();
-				return summary + doneNote;
+				let reply = summary + doneNote;
+				if (
+					experimentOn &&
+					!blocked &&
+					!opts.coachMode &&
+					!opts.planMode &&
+					depth === 0
+				) {
+					const rounds = await readRoundResults(opts.workspaceRoot);
+					if (shouldRunCoach(rounds)) {
+						opts.onStatus?.('Coach: a atualizar how-to-work…');
+						opts.onActivity?.({
+							kind: 'checkpoint',
+							label: 'Method coach',
+							detail: 'Updating how-to-work from experiment results',
+						});
+						try {
+							const coachReply = await runAgentWithTools({
+								...opts,
+								task: coachTaskPrompt(rounds, opts.task),
+								coachMode: true,
+								planMode: false,
+								isolated: true,
+								history: [],
+								maxSteps: 6,
+								depth: depth + 1,
+								onStatus: text => opts.onStatus?.(`[coach] ${text}`),
+								onActivity: ev =>
+									opts.onActivity?.({ ...ev, label: `[coach] ${ev.label}` }),
+							});
+							reply += `\n\n### Method coach\n${coachReply}`;
+						} catch (err) {
+							const msg = err instanceof Error ? err.message : String(err);
+							reply += `\n\n### Method coach\n(failed: ${msg})`;
+						}
+					}
+				}
+				return reply;
 			}
 
 			messages.push({
@@ -2643,6 +3066,18 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					toolAdvice.push(guardAdvice);
 				}
 
+				if (opts.askMode && !ASK_MODE_TOOLS.has(name)) {
+					await flushLane();
+					messages.push({
+						role: 'tool',
+						tool_call_id: call.id,
+						name,
+						content: `Not run: "${name}" is not available in Ask mode (read/search/web only).`,
+					});
+					actions.push(`${name} blocked (ask mode)`);
+					continue;
+				}
+
 				if (opts.planMode && !PLAN_MODE_TOOLS.has(name)) {
 					const planBlock = opts.isolated
 						? `Not run: "${name}" is not available in this run (exploration tools only).`
@@ -2655,6 +3090,24 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 						content: planBlock,
 					});
 					actions.push(`${name} blocked (plan mode)`);
+					continue;
+				}
+
+				const experimentDeny = denyExperimentMutation(name, args, {
+					experimentActive: experimentOn,
+					planMode: opts.planMode,
+					coachMode: opts.coachMode,
+					locked: lockedPaths,
+				});
+				if (experimentDeny) {
+					await flushLane();
+					messages.push({
+						role: 'tool',
+						tool_call_id: call.id,
+						name,
+						content: experimentDeny,
+					});
+					actions.push(`${name} blocked (experiment)`);
 					continue;
 				}
 
@@ -3077,18 +3530,115 @@ async function executeTool(
 					? formatRetrievedBlock(hits)
 					: `No snippets for "${query}"`;
 			}
+			case 'web_search':
+				return await webSearch(String(args.query ?? ''), Number(args.max_results ?? 8));
+			case 'web_fetch':
+				return await webFetch(String(args.url ?? ''), Number(args.max_chars ?? 40_000));
+			case 'todo_write': {
+				const list = Array.isArray(args.todos) ? args.todos : [];
+				const normalized = list.map((t: unknown) => {
+					const row = t as { id?: string; content?: string; status?: string };
+					return {
+						id: row.id,
+						content: String(row.content ?? ''),
+						status: row.status as 'pending' | 'in_progress' | 'completed' | 'cancelled' | undefined,
+					};
+				});
+				const next = writeTodos(opts.sessionId, normalized, { merge: args.merge !== false });
+				opts.onActivity?.({
+					kind: 'checkpoint',
+					label: 'Todos',
+					detail: formatTodos(opts.sessionId),
+				});
+				return `Todos updated (${next.length}):\n${formatTodos(opts.sessionId)}`;
+			}
+			case 'await_shell': {
+				const result = await awaitBgShell(String(args.id ?? ''), {
+					pattern: args.pattern ? String(args.pattern) : undefined,
+					blockUntilMs: args.block_until_ms !== undefined ? Number(args.block_until_ms) : undefined,
+				});
+				return result.output;
+			}
+			case 'git_add':
+				return await git.gitAdd(
+					Array.isArray(args.paths) ? args.paths.map(String) : undefined
+				);
+			case 'git_commit':
+				return await git.gitCommit(String(args.message ?? ''));
+			case 'git_push':
+				return await git.gitPush({
+					setUpstream: args.set_upstream === true,
+					remote: args.remote ? String(args.remote) : undefined,
+					branch: args.branch ? String(args.branch) : undefined,
+				});
+			case 'gh_pr_create':
+				return await git.ghPrCreate({
+					title: String(args.title ?? ''),
+					body: String(args.body ?? ''),
+					base: args.base ? String(args.base) : undefined,
+					draft: args.draft === true,
+				});
+			case 'edit_notebook':
+				return await editNotebook({
+					workspaceRoot: opts.workspaceRoot,
+					path: String(args.path ?? ''),
+					cellIndex: Number(args.cell_index ?? 0),
+					newSource: String(args.new_source ?? ''),
+					cellLanguage: args.cell_language ? String(args.cell_language) : undefined,
+					isNewCell: args.is_new_cell === true,
+				});
+			case 'generate_image':
+				return await generateImage({
+					workspaceRoot: opts.workspaceRoot,
+					prompt: String(args.prompt ?? ''),
+					filename: args.filename ? String(args.filename) : undefined,
+					apiBaseUrl: process.env.OPENAI_BASE_URL || process.env.CODEFORGE_IMAGES_BASE_URL,
+					apiKey: process.env.OPENAI_API_KEY || process.env.CODEFORGE_IMAGES_API_KEY,
+				});
+			case 'canvas_write':
+				return await canvasWrite({
+					workspaceRoot: opts.workspaceRoot,
+					id: String(args.id ?? 'canvas'),
+					title: String(args.title ?? 'Canvas'),
+					content: String(args.content ?? ''),
+					format: args.format === 'html' ? 'html' : 'md',
+				});
+			case 'voice_status':
+				return voiceStatus();
+			case 'shell': {
+				const command = String(args.command ?? '');
+				const wantBg =
+					args.background === true ||
+					(typeof args.block_until_ms === 'number' && Number(args.block_until_ms) === 0);
+				if (wantBg) {
+					const job = startBgShell(command, opts.workspaceRoot);
+					opts.onActivity?.({
+						kind: 'checkpoint',
+						label: 'Background shell',
+						detail: job.id,
+					});
+					return formatBgStart(job);
+				}
+				const result = await opts.bridge.execute({
+					id: callId,
+					name: 'shell',
+					arguments: args,
+					abortSignal: opts.abortSignal,
+				});
+				return result.success ? result.output : `Error: ${result.error ?? 'failed'}`;
+			}
 			case 'delegate_task':
 				if (depth >= 1) {
 					return 'Error: max subagent depth reached';
 				}
 				{
-					const exploreOn =
-						vscode.workspace.getConfiguration('codeforge.ai').get<boolean>('exploreSubagent') ===
-						true;
+					const modeRaw = String(args.mode ?? 'general').toLowerCase();
 					const wantExplore =
-						exploreOn &&
-						(/\bexplor/i.test(String(args.mode ?? '')) ||
-							/\b(where is|across the repo|encontrar onde)\b/i.test(String(args.task ?? '')));
+						modeRaw === 'explore' ||
+						(/\b(where is|across the repo|encontrar onde)\b/i.test(String(args.task ?? '')) &&
+							modeRaw !== 'general' &&
+							modeRaw !== 'plan');
+					const wantPlan = modeRaw === 'plan';
 					return await runAgentWithTools({
 						...opts,
 						task: wantExplore
@@ -3096,11 +3646,13 @@ async function executeTool(
 							: String(args.task),
 						history: args.context
 							? [{ role: 'user', content: String(args.context) }]
-							: opts.history,
+							: [],
 						depth: depth + 1,
-						maxSteps: wantExplore ? 10 : 8,
-						planMode: wantExplore ? true : opts.planMode,
-						isolated: wantExplore ? true : opts.isolated,
+						maxSteps: wantExplore ? 10 : wantPlan ? 12 : 16,
+						planMode: wantExplore || wantPlan,
+						askMode: false,
+						coachMode: false,
+						isolated: true,
 						onTaskUpdate: opts.onTaskUpdate
 							? update =>
 									opts.onTaskUpdate?.({

@@ -196,3 +196,72 @@ export async function applyConflictResolution(
 	await git(['add', '--', filePath]);
 	return `Wrote resolution to ${filePath} and staged with git add`;
 }
+
+export async function gitAdd(paths?: string[]): Promise<string> {
+	const args = ['add'];
+	if (paths?.length) args.push('--', ...paths);
+	else args.push('-A');
+	await git(args);
+	return `Staged: ${paths?.length ? paths.join(', ') : 'all changes'}\n\n${await gitStatus()}`;
+}
+
+export async function gitCommit(message: string): Promise<string> {
+	const msg = String(message ?? '').trim();
+	if (!msg) return 'Error: commit message is required';
+	// HEREDOC-style via multiple -m is safer on Windows than shell heredoc
+	const parts = msg.split(/\n\n/).filter(Boolean);
+	const args = ['commit'];
+	for (const p of parts) args.push('-m', p);
+	try {
+		const out = await git(args);
+		return `${out}\n\n${await gitStatus()}`;
+	} catch (err) {
+		return `Error: git commit failed: ${err instanceof Error ? err.message : String(err)}`;
+	}
+}
+
+export async function gitPush(opts?: { setUpstream?: boolean; remote?: string; branch?: string }): Promise<string> {
+	const remote = opts?.remote || 'origin';
+	const args = ['push'];
+	if (opts?.setUpstream) {
+		args.push('-u', remote, opts.branch || 'HEAD');
+	} else if (opts?.branch) {
+		args.push(remote, opts.branch);
+	}
+	try {
+		return await git(args);
+	} catch (err) {
+		return `Error: git push failed: ${err instanceof Error ? err.message : String(err)}`;
+	}
+}
+
+export async function ghPrCreate(opts: {
+	title: string;
+	body: string;
+	base?: string;
+	draft?: boolean;
+}): Promise<string> {
+	const title = String(opts.title ?? '').trim();
+	if (!title) return 'Error: title is required';
+	const body = String(opts.body ?? '').trim() || title;
+	const args = [
+		'pr',
+		'create',
+		'--title',
+		title,
+		'--body',
+		body,
+	];
+	if (opts.base) args.push('--base', opts.base);
+	if (opts.draft) args.push('--draft');
+	try {
+		const { stdout, stderr } = await execFileAsync('gh', args, {
+			cwd: root(),
+			maxBuffer: 2 * 1024 * 1024,
+			windowsHide: true,
+		});
+		return (stdout || stderr || '').trim() || 'PR created';
+	} catch (err) {
+		return `Error: gh pr create failed: ${err instanceof Error ? err.message : String(err)}`;
+	}
+}

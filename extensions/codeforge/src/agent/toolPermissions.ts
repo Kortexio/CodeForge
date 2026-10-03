@@ -14,7 +14,7 @@ export interface PermissionRule {
 
 export type PermissionRuleset = PermissionRule[];
 
-export type ToolPermissionProfile = 'build' | 'explore' | 'plan' | 'status';
+export type ToolPermissionProfile = 'build' | 'explore' | 'plan' | 'status' | 'coach' | 'ask';
 
 /** edit/write share the OpenCode `edit` permission key. */
 const EDIT_TOOLS = new Set(['edit', 'write']);
@@ -67,6 +67,31 @@ function deny(...names: string[]): PermissionRuleset {
 	return names.map(permission => ({ permission, pattern: '*', action: 'deny' as const }));
 }
 
+/** Ask mode: read the repo + web (no writes / shell mutators). */
+export const ASK_ALLOWED_TOOLS = [
+	'list',
+	'read',
+	'search',
+	'retrieve',
+	'diagnostics',
+	'symbols',
+	'references',
+	'definition',
+	'git_status',
+	'git_diff',
+	'git_log',
+	'git_blame',
+	'open',
+	'wiki_read',
+	'wiki_search',
+	'wiki_facts',
+	'web_search',
+	'web_fetch',
+	'skill',
+	'update_status',
+	'todo_write',
+] as const;
+
 /** Plan-mode allow-list (same surface as legacy PLAN_MODE_TOOLS). */
 export const PLAN_ALLOWED_TOOLS = [
 	'list',
@@ -89,6 +114,25 @@ export const PLAN_ALLOWED_TOOLS = [
 	'wiki_facts',
 	'update_status',
 	'skill',
+	'web_search',
+	'web_fetch',
+	'todo_write',
+	/** Draft/lock checks for the experiment loop (path-gated at execute). */
+	'write',
+	'edit',
+] as const;
+
+/** Method coach: read + skill + write/edit gated to how-to-work only. */
+export const COACH_ALLOWED_TOOLS = [
+	'list',
+	'read',
+	'search',
+	'retrieve',
+	'skill',
+	'write',
+	'edit',
+	'update_status',
+	'todo_write',
 ] as const;
 
 const EXPLORE_ALLOWED = [
@@ -106,9 +150,11 @@ const EXPLORE_ALLOWED = [
 	'git_status',
 	'git_diff',
 	'git_log',
+	'web_search',
+	'web_fetch',
 ] as const;
 
-/** Core coding surface for Agent (build) — lean vs full AGENT_TOOLS. */
+/** Full Agent surface (Cursor-parity). */
 const BUILD_ALLOWED_CORE = [
 	'read',
 	'write',
@@ -120,6 +166,7 @@ const BUILD_ALLOWED_CORE = [
 	'rename',
 	'open',
 	'shell',
+	'await_shell',
 	'dotnet',
 	'diagnostics',
 	'symbols',
@@ -128,9 +175,31 @@ const BUILD_ALLOWED_CORE = [
 	'git_status',
 	'git_diff',
 	'git_log',
+	'git_blame',
+	'git_conflicts',
+	'git_commit_msg',
+	'git_add',
+	'git_commit',
+	'git_push',
+	'gh_pr_create',
 	'wiki_read',
 	'wiki_search',
 	'wiki_write',
+	'wiki_fact',
+	'wiki_facts',
+	'web_search',
+	'web_fetch',
+	'todo_write',
+	'edit_notebook',
+	'generate_image',
+	'canvas_write',
+	'voice_status',
+	'browser_navigate',
+	'browser_snapshot',
+	'browser_click',
+	'browser_type',
+	'browser_screenshot',
+	'delegate_task',
 	'update_status',
 	'skill',
 ] as const;
@@ -138,7 +207,7 @@ const BUILD_ALLOWED_CORE = [
 export interface ProfileOptions {
 	/** Include mcp_call when MCP tools are connected. */
 	mcpAvailable?: boolean;
-	/** Include delegate_task when exploreSubagent is enabled. */
+	/** @deprecated delegate_task is always in build; kept for callers. */
 	exploreSubagent?: boolean;
 }
 
@@ -149,14 +218,17 @@ export function rulesetForProfile(
 	switch (profile) {
 		case 'status':
 			return merge(denyAll(), allow('update_status'));
+		case 'ask':
+			return merge(denyAll(), allow(...ASK_ALLOWED_TOOLS));
 		case 'plan':
 			return merge(denyAll(), allow(...PLAN_ALLOWED_TOOLS));
+		case 'coach':
+			return merge(denyAll(), allow(...COACH_ALLOWED_TOOLS));
 		case 'explore':
 			return merge(denyAll(), allow(...EXPLORE_ALLOWED));
 		case 'build': {
 			const extras: string[] = [];
 			if (opts.mcpAvailable) extras.push('mcp_call');
-			if (opts.exploreSubagent) extras.push('delegate_task');
 			return merge(denyAll(), allow(...BUILD_ALLOWED_CORE, ...extras));
 		}
 	}

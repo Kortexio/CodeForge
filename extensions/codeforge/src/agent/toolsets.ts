@@ -10,7 +10,10 @@ import {
 	type ToolPermissionProfile,
 	type ProfileOptions,
 	PLAN_ALLOWED_TOOLS,
+	ASK_ALLOWED_TOOLS,
 } from './toolPermissions';
+
+export { ASK_ALLOWED_TOOLS };
 
 export type AgentPhase = 'explore' | 'implement' | 'fix' | 'review';
 
@@ -50,11 +53,15 @@ export function currentPhase(task: string, state: { buildRed: boolean }): AgentP
 export function profileForTurn(
 	phase: AgentPhase,
 	task: string,
-	opts: { planMode?: boolean }
+	opts: { planMode?: boolean; coachMode?: boolean; askMode?: boolean }
 ): ToolPermissionProfile {
+	void phase; // phase stays for telemetry / activity labels; tools follow mode below
+	if (opts.coachMode) return 'coach';
+	if (opts.askMode) return 'ask';
 	if (isStatusQuestion(task)) return 'status';
 	if (opts.planMode) return 'plan';
-	if (phase === 'explore') return 'explore';
+	// Agent mode: full tool surface (incl. shell for HTTPS/API). Do not strip shell/write
+	// just because the prompt lacked coding verbs — that made "list /v1/models" explore-only.
 	return 'build';
 }
 
@@ -69,15 +76,21 @@ export function toolNamesFor(
 		weakProfile: boolean;
 		allNames: string[];
 		planMode?: boolean;
+		coachMode?: boolean;
+		askMode?: boolean;
 		mcpAvailable?: boolean;
 		exploreSubagent?: boolean;
 	}
 ): Set<string> {
 	void opts.weakProfile;
-	const profile = profileForTurn(phase, task, { planMode: opts.planMode });
+	void opts.exploreSubagent;
+	const profile = profileForTurn(phase, task, {
+		planMode: opts.planMode,
+		coachMode: opts.coachMode,
+		askMode: opts.askMode,
+	});
 	const profileOpts: ProfileOptions = {
 		mcpAvailable: opts.mcpAvailable === true,
-		exploreSubagent: opts.exploreSubagent === true,
 	};
 	return filterToolsByProfile(opts.allNames, profile, profileOpts);
 }

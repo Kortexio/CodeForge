@@ -152,65 +152,96 @@ export class SkillsRulesLoader {
 			return;
 		}
 		for (const name of entries) {
+			const full = path.join(dir, name);
 			const lower = name.toLowerCase();
-			if (!lower.endsWith('.md') && !lower.endsWith('.mdc')) continue;
-			try {
-				const raw = await fs.readFile(path.join(dir, name), 'utf8');
-				const parsed = parseFrontmatter(raw);
-				const title =
-					(typeof parsed.meta.name === 'string' && parsed.meta.name) ||
-					(typeof parsed.meta.title === 'string' && parsed.meta.title) ||
-					name.replace(/\.(mdc|md)$/i, '');
-				if (kind === 'skill') {
-					this.skills.push({
-						id: `${scope}:${title}`,
-						scope: scope as SkillDoc['scope'],
-						title,
-						content: parsed.body,
-						description:
-							typeof parsed.meta.description === 'string'
-								? parsed.meta.description
-								: undefined,
-						triggers: extractTriggers(parsed.body, title, parsed.meta),
-						filePath: path.join(dir, name),
-					});
-				} else {
-					const declaredPaths =
-						parsed.meta.globs !== undefined || parsed.meta.paths !== undefined;
-					const globs = parseGlobs(parsed.meta.globs ?? parsed.meta.paths);
-					let alwaysApply =
-						parsed.meta.alwaysApply === true || parsed.meta.alwaysApply === 'true';
-					if (
-						!alwaysApply &&
-						parsed.meta.alwaysApply !== false &&
-						parsed.meta.alwaysApply !== 'false'
-					) {
-						// Only promote to alwaysApply when no path filter was declared.
-						alwaysApply = !declaredPaths && globs.length === 0;
+			// Nested Cursor-style skills: skills/<id>/SKILL.md
+			if (kind === 'skill' && !lower.endsWith('.md') && !lower.endsWith('.mdc')) {
+				try {
+					const st = await fs.stat(full);
+					if (st.isDirectory()) {
+						for (const nested of ['SKILL.md', 'skill.md']) {
+							const nestedPath = path.join(full, nested);
+							try {
+								await fs.access(nestedPath);
+								await this.loadSkillOrRuleFile(nestedPath, name, scope, kind);
+								break;
+							} catch {
+								/* try next */
+							}
+						}
 					}
-					if (declaredPaths && globs.length === 0) {
-						console.warn(
-							`[CodeForge] rule "${title}" declared globs/paths but none parsed — leaving inactive`
-						);
-						alwaysApply = false;
-					}
-					this.rules.push({
-						id: `${scope}:${title}`,
-						scope: scope as RuleDoc['scope'],
-						title,
-						content: parsed.body,
-						description:
-							typeof parsed.meta.description === 'string'
-								? parsed.meta.description
-								: undefined,
-						globs,
-						alwaysApply,
-						filePath: path.join(dir, name),
-					});
+				} catch {
+					/* skip */
 				}
-			} catch {
-				/* skip */
+				continue;
 			}
+			if (!lower.endsWith('.md') && !lower.endsWith('.mdc')) continue;
+			await this.loadSkillOrRuleFile(full, name, scope, kind);
+		}
+	}
+
+	private async loadSkillOrRuleFile(
+		filePath: string,
+		name: string,
+		scope: SkillDoc['scope'] | RuleDoc['scope'],
+		kind: 'skill' | 'rule'
+	): Promise<void> {
+		try {
+			const raw = await fs.readFile(filePath, 'utf8');
+			const parsed = parseFrontmatter(raw);
+			const title =
+				(typeof parsed.meta.name === 'string' && parsed.meta.name) ||
+				(typeof parsed.meta.title === 'string' && parsed.meta.title) ||
+				name.replace(/\.(mdc|md)$/i, '');
+			if (kind === 'skill') {
+				this.skills.push({
+					id: `${scope}:${title}`,
+					scope: scope as SkillDoc['scope'],
+					title,
+					content: parsed.body,
+					description:
+						typeof parsed.meta.description === 'string'
+							? parsed.meta.description
+							: undefined,
+					triggers: extractTriggers(parsed.body, title, parsed.meta),
+					filePath,
+				});
+			} else {
+				const declaredPaths =
+					parsed.meta.globs !== undefined || parsed.meta.paths !== undefined;
+				const globs = parseGlobs(parsed.meta.globs ?? parsed.meta.paths);
+				let alwaysApply =
+					parsed.meta.alwaysApply === true || parsed.meta.alwaysApply === 'true';
+				if (
+					!alwaysApply &&
+					parsed.meta.alwaysApply !== false &&
+					parsed.meta.alwaysApply !== 'false'
+				) {
+					// Only promote to alwaysApply when no path filter was declared.
+					alwaysApply = !declaredPaths && globs.length === 0;
+				}
+				if (declaredPaths && globs.length === 0) {
+					console.warn(
+						`[CodeForge] rule "${title}" declared globs/paths but none parsed — leaving inactive`
+					);
+					alwaysApply = false;
+				}
+				this.rules.push({
+					id: `${scope}:${title}`,
+					scope: scope as RuleDoc['scope'],
+					title,
+					content: parsed.body,
+					description:
+						typeof parsed.meta.description === 'string'
+							? parsed.meta.description
+							: undefined,
+					globs,
+					alwaysApply,
+					filePath,
+				});
+			}
+		} catch {
+			/* skip */
 		}
 	}
 }

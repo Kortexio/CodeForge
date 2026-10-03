@@ -16,7 +16,7 @@ export interface Disposable {
 const BUILTIN: SlashCommand[] = [
 	{ name: 'help', description: 'List available slash commands' },
 	{ name: 'clear', description: 'Start a new chat' },
-	{ name: 'ask', description: 'Switch to Ask mode (no tools)' },
+	{ name: 'ask', description: 'Switch to Ask mode (read/search/web)' },
 	{ name: 'plan', description: 'Switch to Plan mode (explore + wiki plan only)' },
 	{ name: 'agent', description: 'Switch to Agent mode' },
 	{ name: 'auto', description: 'Allow all edits + shell this session (Agent mode)' },

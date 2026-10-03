@@ -1083,17 +1083,47 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 					`Workspace: ${root ?? '(none)'}`,
 				].join('\n');
 			}
-			return this.callLlm(
-				task,
+			const weakAsk = this.detectWeakHarness(server, activeModel);
+			const cfgAsk = vscode.workspace.getConfiguration('codeforge.ai');
+			return runAgentWithTools({
+				bridge: this._bridge,
 				provider,
 				apiKey,
-				root,
-				false,
-				activeModel,
+				model: activeModel,
 				baseUrl,
-				this.getHistoryForLlm(),
-				images
-			);
+				workspaceRoot: root,
+				task,
+				images,
+				history: this.getHistoryForLlm(),
+				cancelled: () => this._cancelled,
+				abortSignal: this._abort?.signal,
+				numCtx,
+				forceJson: server.forceJson === true,
+				onStatus: text => {
+					if (/^Running\s/i.test(text)) return;
+					if (/^Thinking/i.test(text) || /^Oracle:/i.test(text) || /compacting|retrying|continuing/i.test(text)) {
+						return;
+					}
+					this.updateLastMessage('assistant', text, 'pending');
+				},
+				onActivity: ev => this.pushActivity(ev),
+				onContextBadge: badge => {
+					this._contextBadge = badge;
+					this.pushConfig();
+				},
+				onContextUsage: usage => {
+					this._contextUsage = usage;
+					this.pushConfig();
+				},
+				onTurnMetrics: metrics => this.applyTurnMetrics(metrics),
+				sessionStore: this._sessions,
+				sessionId: this._currentSessionId,
+				turnIndex: this._currentTurn,
+				maxSteps: cfgAsk.get<number>('agentCheckpointSteps') ?? 20,
+				hardCap: 40,
+				weakProfile: weakAsk,
+				askMode: true,
+			});
 		}
 
 		const weakProfile = this.detectWeakHarness(server, activeModel);
@@ -1147,38 +1177,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			});
 		}
 
-		const lower = task.toLowerCase();
-		if (lower.includes('list') && (lower.includes('file') || lower.includes('dir') || lower.includes('pasta'))) {
-			const result = await this._bridge.execute({
-				id: '1',
-				name: 'list',
-				arguments: { path: '.', recursive: false },
-			});
-			return `Workspace: ${root ?? '(none)'}\n\n${result.output}`;
-		}
-
-		if (lower.startsWith('read ') || lower.startsWith('abrir ') || lower.startsWith('open ')) {
-			const filePath = task.split(/\s+/).slice(1).join(' ').trim().replace(/^["']|["']$/g, '');
-			const result = await this._bridge.execute({
-				id: '2',
-				name: 'read',
-				arguments: { path: filePath },
-			});
-			if (!result.success) {
-				return `Could not read ${filePath}: ${result.error}`;
-			}
-			return `Contents of ${filePath}:\n\n\`\`\`\n${result.output}\n\`\`\``;
-		}
-
-		if (lower.startsWith('search ') || lower.startsWith('buscar ') || lower.startsWith('find ')) {
-			const pattern = task.split(/\s+/).slice(1).join(' ').trim();
-			const result = await this._bridge.execute({
-				id: '3',
-				name: 'search',
-				arguments: { pattern },
-			});
-			return result.output;
-		}
+		// No keyword shortcuts that bypass the agent: Portuguese "lista"/"listar" contains
+		// "list", so phrases like "lista … nesta pasta" used to dump the workspace root.
 
 		if (!apiKey && provider !== 'ollama' && provider !== 'lmstudio' && provider !== 'vllm') {
 			return [
@@ -1516,7 +1516,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			case 'ask':
 				await this.setMode('ask');
 				this.addMessage('user', '/ask');
-				this.addMessage('assistant', 'Switched to Ask mode.');
+				this.addMessage(
+					'assistant',
+					'Switched to Ask mode — read/search/web tools only (no edits or shell).'
+				);
 				return true;
 			case 'plan':
 				await this.setMode('plan');
