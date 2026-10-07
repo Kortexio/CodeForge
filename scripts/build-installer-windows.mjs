@@ -114,6 +114,11 @@ Expected folder: ${portableSibling}`);
 }
 
 const sourceDir = resolveSource();
+const copilotDir = path.join(sourceDir, 'resources', 'app', 'extensions', 'copilot');
+if (fs.existsSync(copilotDir)) {
+	console.log('Removing built-in Microsoft Copilot extension...');
+	fs.rmSync(copilotDir, { recursive: true, force: true });
+}
 await run('node', ['scripts/strip-release-secrets.mjs', '--root', sourceDir]);
 const iscc = await ensureInnoSetup();
 fs.mkdirSync(distDir, { recursive: true });

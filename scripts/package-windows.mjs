@@ -144,14 +144,15 @@ ensureCodeForgeExecutable();
 const finalExe = findExe();
 console.log(`Found executable: ${path.basename(finalExe ?? exe)}`);
 
-await run('node', ['scripts/strip-release-secrets.mjs', '--root', portableOut]);
-
-// CodeForge uses codeforge — drop Microsoft Copilot to shrink package / avoid path issues
+// Drop Microsoft Copilot before the secret scan — CodeForge ships its own AI,
+// and Copilot's node_modules trip false-positive credential-URL checks.
 const copilotDir = path.join(portableOut, 'resources', 'app', 'extensions', 'copilot');
 if (fs.existsSync(copilotDir)) {
 	console.log('Removing built-in Microsoft Copilot extension...');
 	rmrf(copilotDir);
 }
+
+await run('node', ['scripts/strip-release-secrets.mjs', '--root', portableOut]);
 
 fs.mkdirSync(distDir, { recursive: true });
 

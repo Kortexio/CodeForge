@@ -369,6 +369,28 @@ if (fs.existsSync(settingsEditor2Path)) {
 	}
 }
 
+// CodeForge does not ship built-in Copilot — skip the ripgrep shim when the SDK is absent.
+const gulpVscodeWinPath = path.join(root, 'vscode', 'build', 'gulpfile.vscode.ts');
+if (fs.existsSync(gulpVscodeWinPath)) {
+	let gulpSrc = fs.readFileSync(gulpVscodeWinPath, 'utf8');
+	const shimCall =
+		'prepareBuiltInCopilotRipgrepShim(platform, arch, builtInCopilotExtensionDir, appNodeModulesDir);';
+	const shimGuard = `if (!fs.existsSync(path.join(builtInCopilotExtensionDir, 'node_modules', '@github', 'copilot', 'sdk'))) {
+			console.warn('[prepareCopilotRipgrepShimTask] Skipping Copilot ripgrep shim (SDK not present).');
+			return;
+		}
+		${shimCall}`;
+	if (gulpSrc.includes("Skipping Copilot ripgrep shim")) {
+		console.log('Copilot ripgrep shim skip already present');
+	} else if (gulpSrc.includes(shimCall)) {
+		gulpSrc = gulpSrc.replace(shimCall, shimGuard);
+		fs.writeFileSync(gulpVscodeWinPath, gulpSrc, 'utf8');
+		console.log('Patched gulpfile.vscode.ts to skip Copilot ripgrep shim when SDK is missing');
+	} else {
+		console.warn('Could not find Copilot ripgrep shim call in gulpfile.vscode.ts');
+	}
+}
+
 // Git must not start Copilot Chat setup (commit message / merge conflicts / edit sessions).
 const gitRepoPath = path.join(root, 'vscode', 'extensions', 'git', 'src', 'repository.ts');
 if (fs.existsSync(gitRepoPath)) {
