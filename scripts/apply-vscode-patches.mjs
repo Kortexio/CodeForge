@@ -368,3 +368,39 @@ if (fs.existsSync(settingsEditor2Path)) {
 		}
 	}
 }
+
+// Git must not start Copilot Chat setup (commit message / merge conflicts / edit sessions).
+const gitRepoPath = path.join(root, 'vscode', 'extensions', 'git', 'src', 'repository.ts');
+if (fs.existsSync(gitRepoPath)) {
+	let gitRepo = fs.readFileSync(gitRepoPath, 'utf8');
+	if (gitRepo.includes('function builtinChatEnabled()')) {
+		console.log('Git builtin-chat guard already present');
+	} else {
+		const helperAnchor = `import { GitQuickDiffProvider, StagedResourceQuickDiffProvider } from './quickDiffProvider';`;
+		const helper = `${helperAnchor}
+
+/** True only when the user explicitly turned the built-in Copilot chat back on. */
+function builtinChatEnabled(): boolean {
+	return workspace.getConfiguration('chat').get<boolean>('disableAIFeatures') === false;
+}`;
+		if (!gitRepo.includes(helperAnchor)) {
+			console.warn('Could not find git repository.ts helper anchor');
+		} else {
+			gitRepo = gitRepo.replace(helperAnchor, helper);
+			gitRepo = gitRepo.replaceAll(
+				`commands.executeCommand('_chat.editSessions.accept', resources);`,
+				`if (builtinChatEnabled()) {\n\t\t\t\t\tcommands.executeCommand('_chat.editSessions.accept', resources);\n\t\t\t\t}`
+			);
+			gitRepo = gitRepo.replaceAll(
+				`commands.executeCommand('_aiEdits.clearAiContributions', uris);`,
+				`if (builtinChatEnabled()) {\n\t\t\t\t\tcommands.executeCommand('_aiEdits.clearAiContributions', uris);\n\t\t\t\t}`
+			);
+			gitRepo = gitRepo.replaceAll(
+				`commands.executeCommand('_aiEdits.clearAiContributions', resources);`,
+				`if (builtinChatEnabled()) {\n\t\t\t\t\tcommands.executeCommand('_aiEdits.clearAiContributions', resources);\n\t\t\t\t}`
+			);
+			fs.writeFileSync(gitRepoPath, gitRepo, 'utf8');
+			console.log('Patched git repository.ts to skip the built-in chat');
+		}
+	}
+}

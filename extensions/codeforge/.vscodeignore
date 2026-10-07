@@ -7,3 +7,12 @@ package-lock.json
 node_modules/**
 **/*.map
 *.vsix
+**/.git/**
+**/.env
+**/.env.*
+**/mcp.json
+**/.mcp.json
+**/.gitconfig
+**/.git-credentials
+**/*.pem
+**/*.key

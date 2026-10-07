@@ -336,15 +336,28 @@ export class McpClientManager {
 			method: 'tools/list',
 			params: {},
 		};
-		const res = await fetch(url, {
-			method: 'POST',
-			headers: {
-				'Content-Type': 'application/json',
-				Accept: 'application/json, text/event-stream',
-				...(server.apiKey ? { Authorization: `Bearer ${server.apiKey}` } : {}),
-			},
-			body: JSON.stringify(body),
-		});
+		const ctrl = new AbortController();
+		const timer = setTimeout(() => ctrl.abort(), 12_000);
+		let res: Response;
+		try {
+			res = await fetch(url, {
+				method: 'POST',
+				headers: {
+					'Content-Type': 'application/json',
+					Accept: 'application/json, text/event-stream',
+					...(server.apiKey ? { Authorization: `Bearer ${server.apiKey}` } : {}),
+				},
+				body: JSON.stringify(body),
+				signal: ctrl.signal,
+			});
+		} catch (err) {
+			if (ctrl.signal.aborted) {
+				throw new Error(`HTTP timeout listing tools from ${server.name}`);
+			}
+			throw err;
+		} finally {
+			clearTimeout(timer);
+		}
 		if (!res.ok) {
 			throw new Error(`HTTP ${res.status}: ${await res.text()}`);
 		}

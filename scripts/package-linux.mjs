@@ -44,6 +44,10 @@ async function main() {
 	}
 
 	await run('npx', ['gulp', 'vscode-linux-x64'], vscodeDir);
+	const linuxOut = path.join(root, 'VSCode-linux-x64');
+	if (fs.existsSync(linuxOut)) {
+		await run('node', ['scripts/strip-release-secrets.mjs', '--root', linuxOut]);
+	}
 
 	const dist = path.join(root, 'dist', 'codeforge-linux-x64');
 	fs.mkdirSync(dist, { recursive: true });

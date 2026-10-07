@@ -149,7 +149,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<CodeFo
     });
 
     context.subscriptions.push(
-        vscode.window.registerWebviewViewProvider('codeforge.chat', chatViewProvider)
+        vscode.window.registerWebviewViewProvider('codeforge.chat', chatViewProvider, {
+            webviewOptions: { retainContextWhenHidden: true },
+        })
     );
     context.subscriptions.push(
         vscode.window.registerTreeDataProvider('codeforge.sessions', sessionsTreeProvider)
@@ -164,15 +166,21 @@ export async function activate(context: vscode.ExtensionContext): Promise<CodeFo
         vscode.languages.registerInlineCompletionItemProvider({ pattern: '**' }, tabEngine)
     );
 
-    // Skills / rules (disk) + governance (editable) + MCP
+    // Skills / rules (disk) + governance (editable). MCP connects in the background:
+    // the Agent view stays on the workbench loading spinner until activate() resolves,
+    // and stdio servers (npx mcp-remote) plus HTTP tools/list can take tens of seconds.
     const skills = getSkillsRules();
     await skills.reload(context.extensionPath);
-    await mcp.refresh(settingsStore.getState().mcpServers);
     outputChannel.appendLine(
       `Governance: ${governance.getState().skills.filter(s => s.enabled).length} skills, ` +
         `${governance.getState().rules.filter(r => r.enabled).length} rules, ` +
         `${governance.getState().guardrails.filter(g => g.enabled).length} guardrails enabled`
     );
+    void mcp.refresh(settingsStore.getState().mcpServers).catch(err => {
+        outputChannel.appendLine(
+            `MCP refresh failed: ${err instanceof Error ? err.message : String(err)}`
+        );
+    });
 
     const probeLlamaSlots = () => {
         const { server, model } = settingsStore.getActiveSelection();

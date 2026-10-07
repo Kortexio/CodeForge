@@ -43,7 +43,22 @@ if (fs.existsSync(destExt)) {
 }
 
 copyDir(srcExt, destExt, {
-	skip: ['node_modules', 'out', 'dist', '.vscode-test', 'package-lock.json'],
+	skip: [
+		'node_modules',
+		'out',
+		'dist',
+		'.vscode-test',
+		'package-lock.json',
+		'.git',
+		'.CodeForge',
+		'.codeforge',
+		'.env',
+		'.env.local',
+		'mcp.json',
+		'.mcp.json',
+		'.gitconfig',
+		'.git-credentials',
+	],
 });
 
 // Built-in tsconfig: use Code-OSS vscode.d.ts + shared @types

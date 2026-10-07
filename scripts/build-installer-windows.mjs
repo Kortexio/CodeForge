@@ -114,6 +114,7 @@ Expected folder: ${portableSibling}`);
 }
 
 const sourceDir = resolveSource();
+await run('node', ['scripts/strip-release-secrets.mjs', '--root', sourceDir]);
 const iscc = await ensureInnoSetup();
 fs.mkdirSync(distDir, { recursive: true });
 

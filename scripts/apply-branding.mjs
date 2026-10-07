@@ -59,6 +59,32 @@ product.configurationDefaults = {
 	'extensions.verifySignature': false,
 };
 
+// Do not keep GitHub Copilot Chat as a built-in to auto-update or as a trusted
+// GitHub auth client. Configuring Git otherwise looks up that old chat extension.
+const COPILOT_CHAT_ID = 'github.copilot-chat';
+product.builtInExtensionsEnabledWithAutoUpdates = (
+	product.builtInExtensionsEnabledWithAutoUpdates || []
+).filter((id) => String(id).toLowerCase() !== COPILOT_CHAT_ID);
+
+const trusted = product.trustedExtensionAuthAccess;
+if (trusted && !Array.isArray(trusted)) {
+	for (const provider of Object.keys(trusted)) {
+		trusted[provider] = (trusted[provider] || []).filter(
+			(id) => String(id).toLowerCase() !== COPILOT_CHAT_ID
+		);
+		if (trusted[provider].length === 0) {
+			delete trusted[provider];
+		}
+	}
+}
+
+if (product.defaultChatAgent) {
+	// SCM "Generate Commit Message" / "Resolve Conflicts with AI" call these,
+	// which starts Copilot Chat setup. CodeForge has its own agent.
+	delete product.defaultChatAgent.generateCommitMessageCommand;
+	delete product.defaultChatAgent.resolveMergeConflictsCommand;
+}
+
 // Keep existing AppIds / UUIDs from upstream if present; only set if missing
 if (!product.win32x64AppId) {
 	product.win32x64AppId = '{{F8A2A209-72B3-11EC-90D6-0242AC120003}';

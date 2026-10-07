@@ -48,6 +48,11 @@ async function main() {
 		console.warn('arm64 gulp target failed (optional):', err.message);
 	});
 
+	for (const name of fs.readdirSync(root)) {
+		if (!name.startsWith('VSCode-darwin-')) continue;
+		await run('node', ['scripts/strip-release-secrets.mjs', '--root', path.join(root, name)]);
+	}
+
 	const dist = path.join(root, 'dist', 'codeforge-darwin');
 	fs.mkdirSync(dist, { recursive: true });
 	console.log('macOS packaging finished. Look for VSCode-darwin-* folders and copy into', dist);

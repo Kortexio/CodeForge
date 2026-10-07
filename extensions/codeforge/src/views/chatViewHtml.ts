@@ -23,7 +23,6 @@ export function getChatViewHtml(assets: ChatViewAssets): string {
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${assets.cspSource} https: data:; style-src ${assets.cspSource} 'unsafe-inline'; script-src ${assets.cspSource} 'unsafe-inline'; font-src ${assets.cspSource} data:;">
 <title>CodeForge AI</title>
 <link rel="stylesheet" href="${assets.hljsCss}" />
-<link rel="stylesheet" href="${assets.katexCss}" />
 <style>
   :root { --gap: 8px; --radius: 8px; }
   * { box-sizing: border-box; }
@@ -500,11 +499,16 @@ export function getChatViewHtml(assets: ChatViewAssets): string {
 
 <script src="${assets.markedJs}"></script>
 <script src="${assets.hljsJs}"></script>
-<script src="${assets.katexJs}"></script>
-<script src="${assets.katexAutoRenderJs}"></script>
-<script src="${assets.mermaidJs}"></script>
 <script>
   const vscode = acquireVsCodeApi();
+  const LAZY = {
+    katexCss: ${JSON.stringify(assets.katexCss)},
+    katexJs: ${JSON.stringify(assets.katexJs)},
+    katexAutoRenderJs: ${JSON.stringify(assets.katexAutoRenderJs)},
+    mermaidJs: ${JSON.stringify(assets.mermaidJs)},
+  };
+  let katexPromise = null;
+  let mermaidPromise = null;
   let mode = 'agent';
   let permissions = 'default';
   let busy = false;
@@ -557,8 +561,64 @@ export function getChatViewHtml(assets: ChatViewAssets): string {
   const ctxArc = document.getElementById('ctxArc');
   const ctxPct = document.getElementById('ctxPct');
 
-  if (window.mermaid) {
-    try { mermaid.initialize({ startOnLoad: false, theme: 'dark', securityLevel: 'strict' }); } catch (e) {}
+  function loadScript(src) {
+    return new Promise(function (resolve, reject) {
+      var existing = document.querySelector('script[data-lazy="' + src + '"]');
+      if (existing && existing.getAttribute('data-loaded') === '1') { resolve(); return; }
+      if (existing && existing.getAttribute('data-failed') === '1') {
+        existing.remove();
+      } else if (existing) {
+        existing.addEventListener('load', function () { resolve(); });
+        existing.addEventListener('error', function () { reject(new Error(src)); });
+        return;
+      }
+      var s = document.createElement('script');
+      s.src = src;
+      s.setAttribute('data-lazy', src);
+      s.onload = function () { s.setAttribute('data-loaded', '1'); resolve(); };
+      s.onerror = function () { s.setAttribute('data-failed', '1'); reject(new Error(src)); };
+      document.body.appendChild(s);
+    });
+  }
+
+  function ensureStylesheet(href) {
+    if (document.querySelector('link[data-lazy="' + href + '"]')) return;
+    var link = document.createElement('link');
+    link.rel = 'stylesheet';
+    link.href = href;
+    link.setAttribute('data-lazy', href);
+    document.head.appendChild(link);
+  }
+
+  function ensureKatex() {
+    if (window.renderMathInElement) return Promise.resolve();
+    if (!katexPromise) {
+      ensureStylesheet(LAZY.katexCss);
+      katexPromise = loadScript(LAZY.katexJs).then(function () {
+        return loadScript(LAZY.katexAutoRenderJs);
+      }).catch(function (err) {
+        katexPromise = null;
+        throw err;
+      });
+    }
+    return katexPromise;
+  }
+
+  function ensureMermaid() {
+    if (window.mermaid) return Promise.resolve();
+    if (!mermaidPromise) {
+      mermaidPromise = loadScript(LAZY.mermaidJs).then(function () {
+        try { mermaid.initialize({ startOnLoad: false, theme: 'dark', securityLevel: 'strict' }); } catch (e) {}
+      }).catch(function (err) {
+        mermaidPromise = null;
+        throw err;
+      });
+    }
+    return mermaidPromise;
+  }
+
+  function looksLikeMath(text) {
+    return /\\$\\$[\\s\\S]+\\$\\$|\\$[^$\\n]+\\$|\\\\\\(|\\\\\\[/.test(String(text || ''));
   }
 
   function syncSendButton() {
@@ -1219,7 +1279,7 @@ export function getChatViewHtml(assets: ChatViewAssets): string {
         showCanvas(btn.getAttribute('data-run-python') || '');
       });
     });
-    enhanceMathAndMermaid(messagesEl);
+    enhanceMathAndMermaid(messagesEl, messages);
     messagesEl.scrollTop = messagesEl.scrollHeight;
   }
 
@@ -1386,28 +1446,47 @@ export function getChatViewHtml(assets: ChatViewAssets): string {
     return div.innerHTML;
   }
 
-  function enhanceMathAndMermaid(root) {
-    if (window.renderMathInElement) {
-      try {
-        renderMathInElement(root, {
-          delimiters: [
-            { left: '$$$$', right: '$$$$', display: true },
-            { left: '$$', right: '$$', display: true },
-            { left: '$', right: '$', display: false },
-            { left: '\\\\(', right: '\\\\)', display: false },
-            { left: '\\\\[', right: '\\\\]', display: true },
-          ],
-          throwOnError: false,
-        });
-      } catch (e) {}
+  function renderMath(root) {
+    if (!window.renderMathInElement) return;
+    try {
+      renderMathInElement(root, {
+        delimiters: [
+          { left: '$$$$', right: '$$$$', display: true },
+          { left: '$$', right: '$$', display: true },
+          { left: '$', right: '$', display: false },
+          { left: '\\\\(', right: '\\\\)', display: false },
+          { left: '\\\\[', right: '\\\\]', display: true },
+        ],
+        throwOnError: false,
+      });
+    } catch (e) {}
+  }
+
+  function renderMermaidNodes(nodes) {
+    nodes.forEach(function (el, i) {
+      var code = el.getAttribute('data-mermaid') || '';
+      var id = 'mmd-' + Date.now() + '-' + i;
+      mermaid.render(id, code).then(function (res) {
+        el.innerHTML = res.svg;
+      }).catch(function () {
+        el.innerHTML = '<pre><code>' + escapeHtml(code) + '</code></pre>';
+      });
+    });
+  }
+
+  function enhanceMathAndMermaid(root, messages) {
+    var mermaidNodes = Array.prototype.slice.call(root.querySelectorAll('[data-mermaid]'));
+    var needsMath = looksLikeMath(root.textContent) || (messages || []).some(function (m) {
+      return looksLikeMath(m && (m.content || m.reasoning));
+    });
+    if (!mermaidNodes.length && !needsMath) return;
+    if (needsMath) {
+      ensureKatex().then(function () { renderMath(root); }).catch(function () {});
     }
-    if (window.mermaid) {
-      root.querySelectorAll('[data-mermaid]').forEach(function (el, i) {
-        var code = el.getAttribute('data-mermaid') || '';
-        var id = 'mmd-' + Date.now() + '-' + i;
-        mermaid.render(id, code).then(function (res) {
-          el.innerHTML = res.svg;
-        }).catch(function () {
+    if (mermaidNodes.length) {
+      ensureMermaid().then(function () { renderMermaidNodes(mermaidNodes); }).catch(function () {
+        mermaidNodes.forEach(function (el) {
+          var code = el.getAttribute('data-mermaid') || '';
           el.innerHTML = '<pre><code>' + escapeHtml(code) + '</code></pre>';
         });
       });
