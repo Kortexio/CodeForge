@@ -69,9 +69,35 @@ export function clipBuildOutput(text: string, max: number): string {
 	return `[summarized output: ${lines.length} lines → errors, failed tests and summary kept]\n${out.join('\n')}`;
 }
 
-/** Tool output clip that keeps build/test signal for shell/dotnet/oracle results. */
+/**
+ * True when output looks like a compiler/test log that should keep error signal lines.
+ * Must NOT match generic JSON/CLI dumps (those often contain the word "error").
+ */
+export function looksLikeBuildTestOutput(text: string): boolean {
+	const t = String(text ?? '');
+	if (
+		/\b(error|warning)\s+(CS|RZ|MSB|NU|NETSDK)\d+\b/i.test(t) ||
+		/\bBuild (succeeded|FAILED)\b/i.test(t) ||
+		/\bTotal tests\b/i.test(t) ||
+		/\bFailed!\s*-\s*Failed:\s*\d+/i.test(t) ||
+		/\bPassed!\s*-\s*Failed:\s*\d+/i.test(t) ||
+		/\bMSBuild version\b/i.test(t) ||
+		/\bdotnet (build|test|restore|publish)\b/i.test(t)
+	) {
+		return true;
+	}
+	let strong = 0;
+	for (const line of t.split('\n')) {
+		if (/\berror\s+(CS|RZ|MSB|NU|NETSDK)\d+\b/i.test(line)) strong += 1;
+		else if (/\bFailed!\b/i.test(line) && /\b(Failed|Passed|Skipped):\s*\d+/i.test(line)) strong += 1;
+		if (strong >= 2) return true;
+	}
+	return false;
+}
+
+/** Tool output clip: build/test keeps signal lines; other shell/data keeps a head clip. */
 export function clipToolOutput(toolName: string, text: string, max: number): string {
-	const buildLike =
-		toolName === 'shell' || toolName === 'dotnet' || toolName === 'oracle' || /^exit\s+\d+/m.test(text);
-	return buildLike ? clipBuildOutput(text, max) : clipData(text, max);
+	if (toolName === 'dotnet' || toolName === 'oracle') return clipBuildOutput(text, max);
+	if (toolName === 'shell' && looksLikeBuildTestOutput(text)) return clipBuildOutput(text, max);
+	return clipData(text, max);
 }

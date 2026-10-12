@@ -1,5 +1,5 @@
 /**
- * Public CodeForge extension API (P0-2) — consumed by vertical extensions (e.g. Zuora).
+ * Public CodeForge extension API — consumed by TriageHub Studio and other verticals.
  */
 
 import type { Disposable } from './agent/toolRegistry';
@@ -35,10 +35,53 @@ import {
 	type AgentModeDefinition,
 } from './agent/agentModes';
 import * as vscode from 'vscode';
+import type {
+	AiSettingsState,
+	AiSettingsStore,
+	McpServerConfig,
+	SettingsProfile,
+} from './settings/aiSettingsStore';
+import { getAiSettingsStore } from './settings/aiSettingsStore';
+import { getMcp } from './mcp/mcpClient';
 
 export type { ToolDefinition, GuardrailGate, ContextProvider, MemoryScope, IMemoryProvider };
+export type { SettingsProfile as AiSettingsProfile, AiSettingsState, McpServerConfig };
 export type { SlashCommand, AttachmentKindDefinition as AttachmentKind, AgentModeDefinition };
 export type { PendingAttachment as Attachment };
+
+/** Minimal external-session handle (TriageHub ticket mirror). */
+export interface ExternalChatSession {
+	id: string;
+	title: string;
+	banner?: string;
+	role?: string;
+	empty?: string;
+	modelLabel?: string;
+	onUserMessage(text: string): void | Promise<void>;
+	onCancel?(): void | Promise<void>;
+	onLink?(url: string): void | Promise<void>;
+	onDetach?(): void;
+}
+
+export interface ExternalChatHandle {
+	readonly id: string;
+	readonly attached: boolean;
+	setMessages(
+		messages: Array<{ role: 'user' | 'assistant'; content: string; status?: string }>,
+		timeline: Array<{
+			id: string;
+			kind: 'tool' | 'thought' | 'checkpoint';
+			label: string;
+			detail?: string;
+			tool?: string;
+			toolStatus?: 'running' | 'ok' | 'failed';
+			turn?: number;
+		}>
+	): void;
+	setRunning(running: boolean): void;
+	update(patch: { title?: string; banner?: string; modelLabel?: string; empty?: string }): void;
+	dispose(): void;
+}
 
 export interface CodeForgeApi {
 	version: '1';
@@ -58,12 +101,36 @@ export interface CodeForgeApi {
 		registerSlashCommand(c: SlashCommand): Disposable;
 		registerAttachmentKind(k: AttachmentKindDefinition): Disposable;
 		openWithPrompt(prompt: string, attachments?: PendingAttachment[]): Promise<void>;
+		attachExternalSession(session: ExternalChatSession): ExternalChatHandle;
+	};
+	settings: {
+		applyProfile(profile: SettingsProfile | undefined): void;
+		activeProfile(): { id: string; label: string } | undefined;
+		onDidChange: vscode.Event<AiSettingsState>;
 	};
 	modes: {
 		registerAgentMode(m: AgentModeDefinition): Disposable;
-		/** `null` clears the mode used by the next agent run. */
 		activateAgentMode(id: string | null): void;
 	};
+	mcp: {
+		setContribution(owner: string, servers: McpServerConfig[]): Promise<void>;
+	};
+}
+
+export interface CodeForgeApiHost {
+	store: AiSettingsStore;
+	attachExternal(session: ExternalChatSession): ExternalChatHandle;
+}
+
+let apiHost: CodeForgeApiHost | undefined;
+
+export function setApiHost(host: CodeForgeApiHost): void {
+	apiHost = host;
+}
+
+function requireHost(): CodeForgeApiHost {
+	if (!apiHost) throw new Error('CodeForge is still starting');
+	return apiHost;
 }
 
 export type OpenWithPromptHandler = (
@@ -147,11 +214,36 @@ export function createCodeForgeApi(): CodeForgeApi {
 				}
 				await openWithPromptHandler(prompt, attachments);
 			},
+			attachExternalSession: session => requireHost().attachExternal(session),
+		},
+		settings: {
+			applyProfile: profile => {
+				const store = apiHost?.store ?? getAiSettingsStore();
+				store?.applyProfile(profile);
+			},
+			activeProfile: () => {
+				const store = apiHost?.store ?? getAiSettingsStore();
+				return store?.activeProfile();
+			},
+			onDidChange: (listener, thisArgs, disposables) => {
+				const store = apiHost?.store ?? getAiSettingsStore();
+				if (!store) {
+					return { dispose() {} };
+				}
+				return store.onDidChange(listener, thisArgs, disposables);
+			},
 		},
 		modes: {
 			registerAgentMode: (m: AgentModeDefinition) => getAgentModeRegistry().register(m),
 			activateAgentMode: (id: string | null) => {
 				getAgentModeRegistry().activate(id);
+			},
+		},
+		mcp: {
+			setContribution: async (owner, servers) => {
+				const mcp = getMcp();
+				if (!mcp) return;
+				await mcp.setContribution(owner, servers);
 			},
 		},
 	};

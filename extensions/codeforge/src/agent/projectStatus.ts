@@ -247,15 +247,16 @@ export function formatStatusMarkdown(file: ProjectStatusFile): string {
 	return lines.join('\n');
 }
 
-/** Final reply waits until this run called update_status (isolated sub-runs keep their own plan). */
-export function shouldRequireStatusUpdate(opts: {
+/**
+ * Formerly blocked the final chat reply until update_status ran (extra LLM round).
+ * Always false now — reply first; harness finishTurn writes the stop point afterward.
+ */
+export function shouldRequireStatusUpdate(_opts: {
 	isolated?: boolean;
 	alreadyUpdated: boolean;
 	nudges: number;
 }): boolean {
-	if (opts.isolated) return false;
-	if (opts.alreadyUpdated) return false;
-	return opts.nudges < 1;
+	return false;
 }
 
 export function shouldWriteHandoff(opts: { isolated?: boolean; depth?: number }): boolean {

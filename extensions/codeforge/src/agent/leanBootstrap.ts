@@ -27,7 +27,7 @@ export async function buildLeanContextPacket(
 		? vscode.workspace.asRelativePath(editor.document.uri)
 		: '(none)';
 
-	let statusLine = 'Status: (none yet — call update_status before the final reply)';
+	let statusLine = 'Status: (none yet — prefer update_status when wrapping up)';
 	try {
 		const file = await loadProjectStatus(opts.workspaceRoot);
 		if (file?.current) {
@@ -53,7 +53,7 @@ export async function buildLeanContextPacket(
 		`- Date: ${new Date().toISOString().slice(0, 10)}`,
 		`- Open file: ${openRel}`,
 		`- ${statusLine}`,
-		'Use retrieve/search/read for repo context. Call skill for playbooks. Call update_status before the final reply.',
+		'Use retrieve/search/read for repo context. Call skill for playbooks. Prefer update_status when wrapping up.',
 	]
 		.filter(Boolean)
 		.join('\n');

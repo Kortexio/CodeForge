@@ -9,7 +9,7 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
 import { resolveSandboxLevel, runSandboxed, type SandboxLevel } from '../sandbox/runtime';
-import { clipBuildOutput, clipData } from '../agent/clip';
+import { clipBuildOutput, clipData, looksLikeBuildTestOutput } from '../agent/clip';
 import { applyEdit, excerptAround } from '../agent/editTool';
 import { documentSymbolRanges, formatOutlineBlock } from '../intelligence/lspBridge';
 import { getEditJournal } from '../agent/editJournal';
@@ -845,12 +845,13 @@ function isLongRunningCommand(command: string): boolean {
 }
 
 /**
- * Keep exit-relevant signal for the model: prefer errors/success lines + head/tail
- * instead of truncating mid-NuGet dump.
+ * Clip shell stdout for the model. Build/test logs keep error signal lines;
+ * JSON/CLI dumps keep a plain head clip (build-style summarization was destroying analysis data).
  */
 export function summarizeShellOutput(raw: string, maxChars = 8000): string {
     const text = raw.replace(/\r\n/g, '\n').trim();
-    return text ? clipBuildOutput(text, maxChars) : '';
+    if (!text) return '';
+    return looksLikeBuildTestOutput(text) ? clipBuildOutput(text, maxChars) : clipData(text, maxChars);
 }
 
 /**

@@ -31,11 +31,54 @@ export const LENGTH_CAP_NOTE = [
 export const EMPTY_TURN_NOTE =
 	'The reply was empty. Continue with the next tool call, or reply with a summary if the task is done.';
 
-/** Finish refused once: this run has not written .CodeForge/memory/status.json. */
+/**
+ * Model narrated the next step ("I'll list…", "Vou verificar…") without tool_calls.
+ * Without a nudge the harness treats that prose as the final reply and stops mid-analysis.
+ */
+export function looksLikeIncompleteIntent(text: string): boolean {
+	const t = String(text || '').trim();
+	if (!t) return false;
+	// Long replies are usually real answers; keep the gate on short/mid preambles.
+	if (t.length > 1200) return false;
+	if (parseBlockedClaim(t)) return false;
+	if (
+		/\b(vou|irei|vamos|deix[ae]-me|deixa eu)\b/i.test(t) ||
+		/\b(I('ll| will)|Let me|I'm going to|I am going to)\b/i.test(t) ||
+		/\b(next\s+I('ll| will)|em seguida|agora vou|primeiro vou)\b/i.test(t)
+	) {
+		return true;
+	}
+	// Trailing ellipsis on a short message often means "more coming".
+	if (t.length < 400 && /\.{2,}\s*$/.test(t)) return true;
+	return false;
+}
+
+/** Intent-only reply: force the model to actually call tools (at most twice). */
+export const INTENT_CONTINUE_NOTE = [
+	'You described the next step but did not call a tool.',
+	'Continue now with the tool call(s) needed — do not only narrate.',
+].join('\n');
+
+/** Tools ran but the final prose has no real findings (common after helper writes). */
+export const THIN_FINAL_NOTE = [
+	'Tool results are available but this reply has no findings yet.',
+	'Write the analysis or answer from those results now — do not stop after a helper script or a one-liner.',
+].join('\n');
+
+/** Short final after tools — likely not a complete answer. */
+export function looksLikeThinFinal(text: string, hadToolActions: boolean): boolean {
+	if (!hadToolActions) return false;
+	const t = String(text || '').trim();
+	if (!t) return true;
+	if (parseBlockedClaim(t)) return false;
+	if (t.length < 200) return true;
+	return false;
+}
+
+/** Soft reminder (no longer blocks the user-visible reply). */
 export const STATUS_UPDATE_NOTE = [
-	'The final reply waits for update_status.',
-	'Call update_status with objective, stoppedAt, and next (blockers and files when you have them).',
-	'That file is what the next turn reads. Do not scan the repo to reconstruct where the work stopped.',
+	'Prefer calling update_status with objective, stoppedAt, and next before you wrap up.',
+	'If you skip it, the harness still records a stop point for the next turn.',
 ].join('\n');
 
 /** Finish refused: the oracle is red. `oracleText` is the formatted oracle result. */

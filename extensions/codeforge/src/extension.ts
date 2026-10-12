@@ -22,6 +22,11 @@ import { initEditJournal, OriginalContentProvider } from './agent/editJournal';
 import { SessionStore } from './sessions/sessionStore';
 import { initTrace } from './trace/traceService';
 import { initMcp } from './mcp/mcpClient';
+import {
+	ensureCodeforgeMcpJson,
+	loadMcpServersFromJsonFiles,
+	mergeMcpServerLists,
+} from './mcp/mcpJsonFile';
 import { getSkillsRules } from './skills/skillsRulesLoader';
 import { refreshLlamaSlots } from './agent/llamaSlots';
 import { initGovernanceStore } from './governance/governanceStore';
@@ -34,9 +39,10 @@ import {
 } from './memory';
 import { setEmbeddingsSettingsStore } from './intelligence/embeddings';
 import { startOutboundMcp, stopOutboundMcp } from './mcp/outbound';
+import type { McpServerConfig } from './settings/aiSettingsStore';
 import { indexEmbeddings } from './intelligence/workspaceIndex';
 import { startWorkspaceIndexWatcher } from './intelligence/indexWatcher';
-import { createCodeForgeApi, setOpenWithPromptHandler, type CodeForgeApi } from './api';
+import { createCodeForgeApi, setApiHost, setOpenWithPromptHandler, type CodeForgeApi } from './api';
 import { getContextProviderRegistry } from './context/providers';
 import { checkForAppUpdate, scheduleStartupUpdateCheck } from './platform/releaseCheck';
 import { getAgentModeRegistry } from './agent/agentModes';
@@ -105,15 +111,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<CodeFo
         })
     );
 
-    try {
-        const status = await startOutboundMcp(3847);
-        outputChannel.appendLine(`MCP outbound: ${status.url ?? 'failed'}`);
-    } catch (err) {
-        outputChannel.appendLine(
-            `MCP outbound not started: ${err instanceof Error ? err.message : String(err)}`
-        );
-    }
-
     outputChannel.appendLine('CodeForge AI extension activated (Code-OSS bridge ready)');
     outputChannel.appendLine(`Workspace: ${bridge.getWorkspaceRoot() ?? '(none)'}`);
     outputChannel.appendLine(`Sessions loaded: ${sessionStore.list().length}`);
@@ -133,6 +130,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<CodeFo
         sessionStore,
         context
     );
+    setApiHost({
+        store: settingsStore,
+        attachExternal: session => chatViewProvider.attachExternal(session),
+    });
     sessionsTreeProvider = new SessionsTreeProvider(sessionStore);
     tasksTreeProvider = new TasksTreeProvider();
 
@@ -166,9 +167,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<CodeFo
         vscode.languages.registerInlineCompletionItemProvider({ pattern: '**' }, tabEngine)
     );
 
-    // Skills / rules (disk) + governance (editable). MCP connects in the background:
-    // the Agent view stays on the workbench loading spinner until activate() resolves,
-    // and stdio servers (npx mcp-remote) plus HTTP tools/list can take tens of seconds.
+    // Skills / rules (disk) + governance (editable). MCP connects after activate:
+    // defer inbound refresh so the Extension Host handshake is not starved by npx/stdio.
     const skills = getSkillsRules();
     await skills.reload(context.extensionPath);
     outputChannel.appendLine(
@@ -176,10 +176,26 @@ export async function activate(context: vscode.ExtensionContext): Promise<CodeFo
         `${governance.getState().rules.filter(r => r.enabled).length} rules, ` +
         `${governance.getState().guardrails.filter(g => g.enabled).length} guardrails enabled`
     );
-    void mcp.refresh(settingsStore.getState().mcpServers).catch(err => {
-        outputChannel.appendLine(
-            `MCP refresh failed: ${err instanceof Error ? err.message : String(err)}`
-        );
+
+    await ensureCodeforgeMcpJson();
+    const effectiveMcpServers = (): McpServerConfig[] => {
+        const ws =
+            vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? bridge.getWorkspaceRoot() ?? undefined;
+        const fromFiles = loadMcpServersFromJsonFiles(ws, line => outputChannel.appendLine(line));
+        return mergeMcpServerLists(fromFiles, settingsStore.getState().mcpServers);
+    };
+
+    const MCP_CONNECT_DELAY_MS = 3000;
+    outputChannel.appendLine(`MCP: will connect inbound servers in ${MCP_CONNECT_DELAY_MS}ms…`);
+    const mcpConnectTimer = setTimeout(() => {
+        void mcp.refresh(effectiveMcpServers()).catch(err => {
+            outputChannel.appendLine(
+                `MCP refresh failed: ${err instanceof Error ? err.message : String(err)}`
+            );
+        });
+    }, MCP_CONNECT_DELAY_MS);
+    context.subscriptions.push({
+        dispose: () => clearTimeout(mcpConnectTimer),
     });
 
     const probeLlamaSlots = () => {
@@ -199,7 +215,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<CodeFo
     context.subscriptions.push(
         settingsStore.onDidChange(() => {
             chatViewProvider.refreshConfig();
-            void mcp.refresh(settingsStore.getState().mcpServers);
+            void mcp.refresh(effectiveMcpServers());
             probeLlamaSlots();
         })
     );
@@ -368,7 +384,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<CodeFo
 
     context.subscriptions.push(
         vscode.commands.registerCommand('codeforge.refreshMcp', async () => {
-            await mcp.refresh(settingsStore.getState().mcpServers);
+            await mcp.refresh(effectiveMcpServers());
             vscode.window.showInformationMessage(`MCP tools: ${mcp.listTools().length}`);
         })
     );
@@ -463,6 +479,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<CodeFo
     context.subscriptions.push({
         dispose: () => setOpenWithPromptHandler(undefined),
     });
+
+    // Outbound MCP after views/commands — never block activate / EH handshake.
+    void startOutboundMcp(3847)
+        .then(status => {
+            outputChannel.appendLine(`MCP outbound: ${status.url ?? 'failed'}`);
+        })
+        .catch(err => {
+            outputChannel.appendLine(
+                `MCP outbound not started: ${err instanceof Error ? err.message : String(err)}`
+            );
+        });
 
     const api = createCodeForgeApi();
     void getContextProviderRegistry();

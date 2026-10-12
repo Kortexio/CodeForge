@@ -191,6 +191,15 @@ export function getChatViewHtml(assets: ChatViewAssets): string {
     border-left: 2px solid color-mix(in srgb, var(--vscode-foreground) 20%, transparent);
     color: var(--vscode-descriptionForeground); font-size: 0.9em;
   }
+  /* Cursor-style: one muted line under the user message while the agent works. */
+  .thinking-live {
+    margin: 2px 0 10px;
+    padding: 0;
+    color: var(--vscode-descriptionForeground);
+    font-size: 0.92em;
+    line-height: 1.4;
+    opacity: 0.85;
+  }
   .msg-actions {
     display: flex; align-items: center; gap: 2px; margin-top: 4px; opacity: 0.55;
   }
@@ -1148,11 +1157,15 @@ export function getChatViewHtml(assets: ChatViewAssets): string {
     } catch (e) { return ''; }
   }
 
-  function renderThinking(reasoning, isPending) {
+  function renderThinking(reasoning, isPending, liveStatus) {
+    // Cursor-style: muted one-liner only (e.g. "Planning next moves") — no spinner, no tool log.
+    if (isPending) {
+      var status = String(liveStatus || 'Planning next moves').trim() || 'Planning next moves';
+      return '<div class="thinking-live" aria-live="polite">' + escapeHtml(status) + '</div>';
+    }
     if (!reasoning) return '';
-    var label = isPending ? '<span class="spin">⚛</span> Thinking' : '🤖 Reasoning';
-    return '<details class="thinking"' + (isPending ? ' open' : '') + '>' +
-      '<summary>' + label + '</summary>' +
+    return '<details class="thinking">' +
+      '<summary>Reasoning</summary>' +
       '<div class="body md">' + renderMarkdown(reasoning) + '</div></details>';
   }
 
@@ -1216,7 +1229,6 @@ export function getChatViewHtml(assets: ChatViewAssets): string {
             ? '<div class="restore-row"><button type="button" class="restore-btn" data-idx="' + idx + '">Restore checkpoint</button></div>'
             : '') +
           '</div>';
-        // Tool/harness activity stays off the chat surface (Llama-style replies only).
         return;
       }
       var split = splitThink(m.content);
@@ -1225,12 +1237,14 @@ export function getChatViewHtml(assets: ChatViewAssets): string {
       var isPending = m.status === 'pending';
       var time = formatTime(m.timestamp);
       html += '<div class="msg assistant ' + (m.status || '') + '" data-idx="' + idx + '">' +
-        '<div class="msg-meta">' +
-          (m.model ? '<span class="model">' + escapeHtml(m.model) + '</span>' : '<span class="model">' + roleLabel + '</span>') +
-          (time ? '<span>' + escapeHtml(time) + '</span>' : '') +
-        '</div>' +
-        renderThinking(reasoning, isPending && !body) +
-        '<div class="msg-body md">' + renderMarkdown(normalizeAssistantContent(body)) + '</div>' +
+        (isPending ? '' : (
+          '<div class="msg-meta">' +
+            (m.model ? '<span class="model">' + escapeHtml(m.model) + '</span>' : '<span class="model">' + roleLabel + '</span>') +
+            (time ? '<span>' + escapeHtml(time) + '</span>' : '') +
+          '</div>'
+        )) +
+        renderThinking(reasoning, isPending, m.liveStatus) +
+        (isPending ? '' : '<div class="msg-body md">' + renderMarkdown(normalizeAssistantContent(body)) + '</div>') +
         renderActions(m, idx, isPending) +
         '</div>';
     });

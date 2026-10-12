@@ -22,10 +22,8 @@ export function getOutboundMcpStatus(): OutboundMcpStatus {
 	};
 }
 
-export async function startOutboundMcp(port = 3847): Promise<OutboundMcpStatus> {
-	if (server) return getOutboundMcpStatus();
-
-	server = http.createServer(async (req, res) => {
+function createOutboundHandler(fallbackPort: number): http.RequestListener {
+	return async (req, res) => {
 		res.setHeader('Access-Control-Allow-Origin', '*');
 		res.setHeader('Content-Type', 'application/json');
 
@@ -35,7 +33,7 @@ export async function startOutboundMcp(port = 3847): Promise<OutboundMcpStatus> 
 			return;
 		}
 
-		const url = new URL(req.url ?? '/', `http://127.0.0.1:${listenPort ?? port}`);
+		const url = new URL(req.url ?? '/', `http://127.0.0.1:${listenPort ?? fallbackPort}`);
 
 		if (req.method === 'GET' && url.pathname === '/health') {
 			res.writeHead(200);
@@ -99,17 +97,59 @@ export async function startOutboundMcp(port = 3847): Promise<OutboundMcpStatus> 
 
 		res.writeHead(404);
 		res.end(JSON.stringify({ error: 'not found' }));
-	});
+	};
+}
 
+async function listenOnPort(tryPort: number, preferredPort: number): Promise<void> {
+	server = http.createServer(createOutboundHandler(preferredPort));
 	await new Promise<void>((resolve, reject) => {
-		server!.once('error', reject);
-		server!.listen(port, '127.0.0.1', () => {
-			listenPort = port;
+		const onError = (err: Error) => {
+			server?.off('listening', onListening);
+			reject(err);
+		};
+		const onListening = () => {
+			server?.off('error', onError);
+			listenPort = tryPort;
 			resolve();
-		});
+		};
+		server!.once('error', onError);
+		server!.listen(tryPort, '127.0.0.1', onListening);
 	});
+}
 
-	return getOutboundMcpStatus();
+/** Prefer `port`, then port+1 … port+9 when EADDRINUSE (multi-instance / parallel IDEs). */
+export async function startOutboundMcp(port = 3847): Promise<OutboundMcpStatus> {
+	if (server) return getOutboundMcpStatus();
+
+	const lastPort = port + 9;
+	let lastErr: unknown;
+	for (let tryPort = port; tryPort <= lastPort; tryPort++) {
+		try {
+			await listenOnPort(tryPort, port);
+			return getOutboundMcpStatus();
+		} catch (err) {
+			lastErr = err;
+			const code =
+				err && typeof err === 'object' && 'code' in err
+					? String((err as NodeJS.ErrnoException).code)
+					: undefined;
+			const failed = server as http.Server | undefined;
+			server = undefined;
+			listenPort = undefined;
+			if (failed) {
+				try {
+					failed.close();
+				} catch {
+					/* ignore */
+				}
+			}
+			if (code === 'EADDRINUSE' && tryPort < lastPort) {
+				continue;
+			}
+			throw err;
+		}
+	}
+	throw lastErr instanceof Error ? lastErr : new Error(`No free port in ${port}-${lastPort}`);
 }
 
 export async function stopOutboundMcp(): Promise<void> {

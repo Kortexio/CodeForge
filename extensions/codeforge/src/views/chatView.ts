@@ -53,11 +53,14 @@ import {
 } from '../agent/editJournal';
 
 import { getChatViewHtml } from './chatViewHtml';
+import type { ExternalChatHandle, ExternalChatSession } from '../api';
 
 const OPEN_TABS_KEY = 'codeforge.ai.openSessionIds';
 
 type AgentMode = 'ask' | 'plan' | 'agent';
 type Permissions = PermissionLevel;
+
+export type { ExternalChatHandle, ExternalChatSession };
 
 interface TimelineItem {
 	id: string;
@@ -81,6 +84,8 @@ interface ChatMessage {
 	reasoning?: string;
 	timings?: MessageTimings;
 	model?: string;
+	/** Live wait label shown while status === 'pending' (Cursor-style Thinking…). */
+	liveStatus?: string;
 }
 
 export class ChatViewProvider implements vscode.WebviewViewProvider {
@@ -91,6 +96,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 	private _bridge: VSCodeAIBridge;
 	private _store: AiSettingsStore;
 	private _sessions: SessionStore;
+	private _external?: {
+		session: ExternalChatSession;
+		messages: Array<{ role: 'user' | 'assistant'; content: string; status?: string }>;
+		timeline: Array<{
+			id: string;
+			kind: 'tool' | 'thought' | 'checkpoint';
+			label: string;
+			detail?: string;
+			tool?: string;
+			toolStatus?: 'running' | 'ok' | 'failed';
+			turn?: number;
+		}>;
+		running: boolean;
+	};
 	private _currentSessionId: string | null = null;
 	private _cancelled = false;
 	private _abort?: AbortController;
@@ -113,6 +132,46 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 	private _turnTimings: MessageTimings | undefined;
 	private _pythonProc: ChildProcessWithoutNullStreams | undefined;
 	private _context?: vscode.ExtensionContext;
+
+	/** Shows an external session in the chat (e.g. ticket mirror from a Studio vertical). */
+	attachExternal(session: ExternalChatSession): ExternalChatHandle {
+		const previous = this._external;
+		const state: NonNullable<typeof this._external> = {
+			session,
+			messages: [],
+			timeline: [],
+			running: false,
+		};
+		this._external = state;
+		if (previous && previous.session !== session) previous.session.onDetach?.();
+		void vscode.commands.executeCommand('codeforge.focusChat');
+		if (this._view) this._view.title = session.title || 'Agent';
+		const isCurrent = () => this._external === state;
+		return {
+			id: session.id,
+			get attached() {
+				return isCurrent();
+			},
+			setMessages: (messages, timeline) => {
+				state.messages = messages;
+				state.timeline = timeline;
+			},
+			setRunning: running => {
+				state.running = running;
+			},
+			update: patch => {
+				Object.assign(state.session, patch);
+				if (isCurrent() && this._view && patch.title) this._view.title = patch.title;
+			},
+			dispose: () => {
+				if (isCurrent()) {
+					this._external = undefined;
+					if (this._view) this._view.title = 'Agent';
+					previous?.session.onDetach?.();
+				}
+			},
+		};
+	}
 
 	constructor(
 		extensionUri: vscode.Uri,
@@ -573,11 +632,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			getEditJournal().setContext(this._currentSessionId, this._currentTurn);
 		}
 
-		this.addMessage(
-			'assistant',
-			this._mode === 'ask' ? 'Thinking...' : 'Working...',
-			'pending'
-		);
+		this.addMessage('assistant', '', 'pending');
+		const pending = this._messages[this._messages.length - 1];
+		if (pending?.role === 'assistant') {
+			pending.liveStatus =
+				this._mode === 'ask'
+					? 'Thinking'
+					: this._mode === 'plan'
+						? 'Planning next moves'
+						: 'Planning next moves';
+		}
 		this._turnReasoning = '';
 		this._turnTimings = undefined;
 		this.updateView();
@@ -887,12 +951,28 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			}
 			return;
 		}
-		// Harness noise — never show in the user-facing tool timeline.
-		if (event.kind === 'context' || event.kind === 'thinking' || event.kind === 'compact') {
+		// Live wait label (Cursor-style): Thinking / Reading / Grepping / Planning…
+		if (event.kind === 'thinking') {
+			this.setPendingLiveStatus(event.label || 'Thinking…');
+			return;
+		}
+		if (event.kind === 'compact') {
+			this.setPendingLiveStatus(event.label || 'Compacting…');
+			return;
+		}
+		if (event.kind === 'context') {
+			this.setPendingLiveStatus(event.label || 'Loading context…');
 			return;
 		}
 		if (event.kind === 'checkpoint') {
 			const label = String(event.label || '');
+			if (/^Phase:\s*plan/i.test(label) || /\bplanning\b/i.test(label)) {
+				this.setPendingLiveStatus('Planning…');
+			} else if (
+				/Incomplete intent|Thin final|retry tools|ask for findings/i.test(label)
+			) {
+				this.setPendingLiveStatus(label);
+			}
 			if (
 				/^(hook|Lesson|Oracle|LLM |Repaired|Retry|Nuked|Switched|Parsed|Truncated|Build-fix|context |Phase:|Prior context|Turn summary|Stopped)/i.test(
 					label
@@ -902,6 +982,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 				/^Thinking/i.test(label)
 			) {
 				return;
+			}
+		}
+		if (event.kind === 'tool') {
+			if (event.toolStatus === 'running') {
+				this.setPendingLiveStatus(event.label || `Running ${event.tool || 'tool'}…`);
+			} else if (event.toolStatus === 'ok' || event.toolStatus === 'failed' || event.success !== undefined) {
+				// Between tools the model thinks again.
+				this.setPendingLiveStatus('Thinking…');
 			}
 		}
 		if (event.kind === 'tool' && event.toolCallId) {
@@ -1099,13 +1187,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 				abortSignal: this._abort?.signal,
 				numCtx,
 				forceJson: server.forceJson === true,
-				onStatus: text => {
-					if (/^Running\s/i.test(text)) return;
-					if (/^Thinking/i.test(text) || /^Oracle:/i.test(text) || /compacting|retrying|continuing/i.test(text)) {
-						return;
-					}
-					this.updateLastMessage('assistant', text, 'pending');
-				},
+				onStatus: text => this.setPendingLiveStatus(text),
 				onActivity: ev => this.pushActivity(ev),
 				onContextBadge: badge => {
 					this._contextBadge = badge;
@@ -1146,16 +1228,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 				abortSignal: this._abort?.signal,
 				numCtx,
 				forceJson: server.forceJson === true,
-				onStatus: text => {
-					// Tool progress uses tool cards — keep pending bubble quiet (no step spam).
-					if (/^Running\s/i.test(text)) {
-						return;
-					}
-					if (/^Thinking/i.test(text) || /^Oracle:/i.test(text) || /compacting|retrying|continuing/i.test(text)) {
-						return;
-					}
-					this.updateLastMessage('assistant', text, 'pending');
-				},
+				onStatus: text => this.setPendingLiveStatus(text),
 				onActivity: ev => this.pushActivity(ev),
 				onContextBadge: badge => {
 					this._contextBadge = badge;
@@ -1209,16 +1282,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			abortSignal: this._abort?.signal,
 			numCtx,
 			forceJson: server.forceJson === true,
-			onStatus: text => {
-				// Tool progress uses tool cards — keep pending bubble for thinking/checkpoints only.
-				if (/^Running\s/i.test(text)) {
-					return;
-				}
-				if (/^Thinking/i.test(text) || /^Oracle:/i.test(text) || /compacting|retrying|continuing/i.test(text)) {
-					return;
-				}
-				this.updateLastMessage('assistant', text, 'pending');
-			},
+			onStatus: text => this.setPendingLiveStatus(text),
 			onActivity: ev => this.pushActivity(ev),
 			onContextBadge: badge => {
 				this._contextBadge = badge;
@@ -1592,6 +1656,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		if (lastIndex >= 0 && this._messages[lastIndex].role === role) {
 			this._messages[lastIndex].content = content;
 			this._messages[lastIndex].status = status;
+			if (status !== 'pending') {
+				delete this._messages[lastIndex].liveStatus;
+			}
 			if (extra?.reasoning !== undefined) {
 				this._messages[lastIndex].reasoning = extra.reasoning;
 			}
@@ -1599,6 +1666,37 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 				this._messages[lastIndex].timings = extra.timings;
 			}
 		}
+		this.updateView();
+	}
+
+	/** Cursor-style muted status line (e.g. "Planning next moves") — not a tool audit log. */
+	private setPendingLiveStatus(text: string): void {
+		let cleaned = String(text || '')
+			.replace(/\s+/g, ' ')
+			.trim();
+		if (!cleaned) return;
+		if (/^Thinking/i.test(cleaned)) cleaned = 'Thinking';
+		else if (/^Working/i.test(cleaned) || /^Continuing/i.test(cleaned)) cleaned = 'Planning next moves';
+		else if (/^Planning/i.test(cleaned)) cleaned = 'Planning next moves';
+		else if (/^Oracle:/i.test(cleaned) || /Checking build/i.test(cleaned)) cleaned = 'Checking build';
+		else if (/^Compacting/i.test(cleaned)) cleaned = 'Compacting context';
+		else if (/^Loading context/i.test(cleaned)) cleaned = 'Gathering context';
+		else if (/^Reading\b/i.test(cleaned)) {
+			const file = cleaned.replace(/^Reading\s+/i, '').split(/[/\\]/).pop() || '';
+			cleaned = file ? `Reading ${file}` : 'Reading files';
+		} else if (/^Grepping\b/i.test(cleaned)) cleaned = 'Grepping';
+		else if (/^Searching\b/i.test(cleaned)) cleaned = 'Searching codebase';
+		else if (/^Listing\b/i.test(cleaned)) cleaned = 'Listing files';
+		else if (/^Writing\b/i.test(cleaned)) cleaned = 'Writing files';
+		else if (/^Editing\b/i.test(cleaned)) cleaned = 'Editing files';
+		else if (/^Deleting\b|^Renaming\b|^Inspecting\b/i.test(cleaned)) cleaned = 'Updating files';
+		else if (/^Running\b/i.test(cleaned)) cleaned = 'Running command';
+		else if (/^Updating status/i.test(cleaned)) cleaned = 'Updating status';
+		else cleaned = 'Planning next moves';
+		const last = this._messages[this._messages.length - 1];
+		if (!last || last.role !== 'assistant' || last.status !== 'pending') return;
+		if (last.liveStatus === cleaned) return;
+		last.liveStatus = cleaned.slice(0, 64);
 		this.updateView();
 	}
 

@@ -9,6 +9,7 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import { spawn, ChildProcessWithoutNullStreams } from 'child_process';
 import { McpServerConfig } from '../settings/aiSettingsStore';
+import { parseEnvFile } from './mcpJsonFile';
 
 export interface McpToolDef {
 	serverId: string;
@@ -44,6 +45,10 @@ export class McpClientManager {
 	lastRefreshSummary = '';
 	private refreshGen = 0;
 	private refreshLock: Promise<void> = Promise.resolve();
+	/** Servers from AI Settings / mcp.json merge. */
+	private settingsServers: McpServerConfig[] = [];
+	/** Extra servers contributed by extensions (keyed by owner, e.g. active Zuora tenant). */
+	private readonly contributions = new Map<string, McpServerConfig[]>();
 
 	constructor(output: vscode.OutputChannel) {
 		this.output = output;
@@ -61,7 +66,66 @@ export class McpClientManager {
 		return this.httpMeta.get(serverId);
 	}
 
+	/** Remember settings/file MCP and reconnect, keeping extension contributions. */
 	async refresh(servers: McpServerConfig[]): Promise<void> {
+		this.settingsServers = servers;
+		return this.connectAll(this.mergedServers());
+	}
+
+	/**
+	 * Register MCP servers owned by an extension (replaced as a set).
+	 * Pass [] to remove that owner's servers. Reconnects immediately.
+	 */
+	async setContribution(owner: string, servers: McpServerConfig[]): Promise<void> {
+		const usable = servers.filter(s => (s.command ?? '').trim() || (s.url ?? '').trim());
+		// Tenant-exclusive owners keep an empty list so merge does not fall back to Cursor globals.
+		if (usable.length === 0 && !this.isTenantExclusiveOwner(owner)) {
+			this.contributions.delete(owner);
+		} else {
+			this.contributions.set(owner, usable);
+		}
+		return this.connectAll(this.mergedServers());
+	}
+
+	/**
+	 * Product tenant owners (`triagehub:…`, `managed-services:…`, `codeforge-zuora:…`)
+	 * replace Settings/Cursor MCP so the agent only sees that tenant's servers.
+	 */
+	private static readonly TENANT_OWNER_PREFIXES = [
+		'triagehub:',
+		'managed-services:',
+		'codeforge-zuora:',
+	];
+
+	private isTenantExclusiveOwner(owner: string): boolean {
+		return McpClientManager.TENANT_OWNER_PREFIXES.some(p => owner.startsWith(p));
+	}
+
+	private mergedServers(): McpServerConfig[] {
+		const exclusive = new Map<string, McpServerConfig>();
+		let hasExclusiveOwner = false;
+		for (const [owner, list] of this.contributions) {
+			if (!this.isTenantExclusiveOwner(owner)) continue;
+			hasExclusiveOwner = true;
+			for (const s of list) exclusive.set(s.id, s);
+		}
+		// Active product tenant contribution replaces Cursor/Settings MCP even when empty.
+		if (hasExclusiveOwner) {
+			return [...exclusive.values()];
+		}
+		const seen = new Set(this.settingsServers.map(s => s.id));
+		const extra: McpServerConfig[] = [];
+		for (const list of this.contributions.values()) {
+			for (const s of list) {
+				if (seen.has(s.id)) continue;
+				seen.add(s.id);
+				extra.push(s);
+			}
+		}
+		return [...this.settingsServers, ...extra];
+	}
+
+	private async connectAll(servers: McpServerConfig[]): Promise<void> {
 		const run = async () => {
 			const gen = ++this.refreshGen;
 			const snap = {
@@ -193,17 +257,30 @@ export class McpClientManager {
 		}
 		const http = this.httpMeta.get(tool.serverId);
 		if (http?.url) {
-			return this.invokeHttp(http.url, http.apiKey, tool.name, args);
+			return this.invokeHttp(http, tool.name, args);
 		}
 		throw new Error(`MCP server ${tool.serverName} is not connected`);
 	}
 
+	private httpHeaders(server: McpServerConfig): Record<string, string> {
+		const headers: Record<string, string> = {
+			'Content-Type': 'application/json',
+			Accept: 'application/json, text/event-stream',
+			...(server.headers ?? {}),
+		};
+		if (server.apiKey && !headers.Authorization && !headers.authorization) {
+			headers.Authorization = `Bearer ${server.apiKey}`;
+		}
+		return headers;
+	}
+
 	async invokeHttp(
-		url: string,
-		apiKey: string | undefined,
+		server: McpServerConfig,
 		name: string,
 		args: Record<string, unknown>
 	): Promise<string> {
+		const url = server.url;
+		if (!url) throw new Error(`MCP server ${server.name} has no url`);
 		const body = {
 			jsonrpc: '2.0',
 			id: this.nextId++,
@@ -212,11 +289,7 @@ export class McpClientManager {
 		};
 		const res = await fetch(url, {
 			method: 'POST',
-			headers: {
-				'Content-Type': 'application/json',
-				Accept: 'application/json, text/event-stream',
-				...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
-			},
+			headers: this.httpHeaders(server),
 			body: JSON.stringify(body),
 		});
 		if (!res.ok) {
@@ -255,8 +328,9 @@ export class McpClientManager {
 		const readyHint = /mcp-remote/i.test([server.command, ...(server.args ?? [])].join(' '));
 		const readyPromise = readyHint ? deferred<void>() : undefined;
 
+		const fileEnv = loadStdioEnvFile(server);
 		const proc = spawn(command, args, {
-			env: { ...process.env, ...(server.env ?? {}) },
+			env: { ...process.env, ...fileEnv, ...(server.env ?? {}) },
 			shell: false,
 			windowsHide: true,
 			stdio: ['pipe', 'pipe', 'pipe'],
@@ -342,11 +416,7 @@ export class McpClientManager {
 		try {
 			res = await fetch(url, {
 				method: 'POST',
-				headers: {
-					'Content-Type': 'application/json',
-					Accept: 'application/json, text/event-stream',
-					...(server.apiKey ? { Authorization: `Bearer ${server.apiKey}` } : {}),
-				},
+				headers: this.httpHeaders(server),
 				body: JSON.stringify(body),
 				signal: ctrl.signal,
 			});
@@ -566,6 +636,16 @@ function findNodeExecutable(): string {
 	}
 	// Last resort — may still fail in Electron host.
 	return process.platform === 'win32' ? 'node.exe' : 'node';
+}
+
+function loadStdioEnvFile(server: McpServerConfig): Record<string, string> {
+	const envFile = server.envFile?.trim();
+	if (!envFile) return {};
+	try {
+		return parseEnvFile(envFile);
+	} catch {
+		return {};
+	}
 }
 
 function sleep(ms: number): Promise<void> {

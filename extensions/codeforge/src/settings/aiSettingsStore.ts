@@ -53,8 +53,12 @@ export interface McpServerConfig {
 	command?: string;
 	args?: string[];
 	url?: string;
+	/** HTTP/SSE headers from Cursor mcp.json (`headers`). */
+	headers?: Record<string, string>;
 	apiKey?: string;
 	env?: Record<string, string>;
+	/** Path to .env file (Cursor `envFile`, stdio only). */
+	envFile?: string;
 	enabled: boolean;
 }
 
@@ -126,15 +130,61 @@ function looksLikeLegacyAutoSeed(server: AiServer): boolean {
 	return defaults.every(m => server.models.includes(m));
 }
 
+/** Overlay from a vertical (TriageHub / MS2 / CodeForgeZ) while a tenant is active. */
+export interface SettingsProfile {
+	id: string;
+	label: string;
+	state: AiSettingsState;
+	onSave?: (s: AiSettingsState) => void | Promise<void>;
+}
+
+/** @deprecated alias — Studio callers may use AiSettingsProfile */
+export type AiSettingsProfile = SettingsProfile;
+
+let boundStore: AiSettingsStore | undefined;
+
+export function getAiSettingsStore(): AiSettingsStore | undefined {
+	return boundStore;
+}
+
 export class AiSettingsStore {
 	private readonly _onDidChange = new vscode.EventEmitter<AiSettingsState>();
 	readonly onDidChange = this._onDidChange.event;
 	private purgedPlaceholders = false;
 	private unifiedOnce = false;
+	private activeProfileOverlay: SettingsProfile | undefined;
 
-	constructor(private readonly context: vscode.ExtensionContext) {}
+	constructor(private readonly context: vscode.ExtensionContext) {
+		boundStore = this;
+	}
+
+	/** Point the AI panel at a tenant profile; pass undefined to restore global settings. */
+	applyProfile(profile: SettingsProfile | undefined): void {
+		this.activeProfileOverlay = profile
+			? { ...profile, state: structuredClone(profile.state) }
+			: undefined;
+		this._onDidChange.fire(this.getState());
+	}
+
+	/** @deprecated use applyProfile */
+	setProfile(profile: SettingsProfile | undefined): void {
+		this.applyProfile(profile);
+	}
+
+	activeProfile(): { id: string; label: string } | undefined {
+		const p = this.activeProfileOverlay;
+		return p ? { id: p.id, label: p.label } : undefined;
+	}
+
+	/** @deprecated use activeProfile */
+	getProfile(): { id: string; label: string } | undefined {
+		return this.activeProfile();
+	}
 
 	getState(): AiSettingsState {
+		if (this.activeProfileOverlay) {
+			return this.normalizeState(this.activeProfileOverlay.state);
+		}
 		const disk = this.readDiskSync();
 		const raw =
 			this.context.globalState.get<AiSettingsState>(STATE_KEY) ??
@@ -148,9 +198,13 @@ export class AiSettingsStore {
 		} else {
 			return this.seedFromLegacySettings();
 		}
+		return this.normalizeState(state);
+	}
+
+	private normalizeState(state: AiSettingsState): AiSettingsState {
 		const cfgBudget =
 			vscode.workspace.getConfiguration('codeforge.ai').get<number>('contextBudget') ?? 32768;
-		state = {
+		const next: AiSettingsState = {
 			servers: (state.servers ?? []).map(s => ({
 				...s,
 				numCtx: typeof s.numCtx === 'number' && s.numCtx > 0 ? s.numCtx : cfgBudget,
@@ -160,8 +214,7 @@ export class AiSettingsStore {
 			activeModel: state.activeModel ?? null,
 			mcpServers: state.mcpServers ?? [],
 		};
-		state = this.dropUnconfiguredPlaceholders(state);
-		return state;
+		return this.dropUnconfiguredPlaceholders(next);
 	}
 
 	/**
@@ -193,6 +246,12 @@ export class AiSettingsStore {
 	}
 
 	async save(state: AiSettingsState): Promise<void> {
+		if (this.activeProfileOverlay?.onSave) {
+			this.activeProfileOverlay.state = state;
+			await this.activeProfileOverlay.onSave(state);
+			this._onDidChange.fire(this.getState());
+			return;
+		}
 		await this.context.globalState.update(STATE_KEY, state);
 		await this.writeDisk(state);
 		await this.syncActiveToWorkspaceSettings(state);

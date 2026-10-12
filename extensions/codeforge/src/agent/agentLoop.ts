@@ -62,7 +62,6 @@ import {
 	finishTurn,
 	parseRepoSnapshot,
 	saveProjectStatus,
-	shouldRequireStatusUpdate,
 	type StatusOutcome,
 } from './projectStatus';
 import { execFile } from 'child_process';
@@ -77,10 +76,13 @@ import {
 	claimsBuildOrTestGreen,
 	EMPTY_TURN_NOTE,
 	finalReplyNote,
+	INTENT_CONTINUE_NOTE,
 	LENGTH_CAP_NOTE,
+	looksLikeIncompleteIntent,
+	looksLikeThinFinal,
 	oracleRejectNote,
 	parseBlockedClaim,
-	STATUS_UPDATE_NOTE,
+	THIN_FINAL_NOTE,
 } from './nudges';
 import { clipData, clipToolOutput } from './clip';
 import {
@@ -1310,7 +1312,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 		'Long shell jobs: shell with background=true, then await_shell.',
 		'Do not ask the user for API keys already configured in CodeForge settings; never paste secrets into the chat.',
 		'Long-running servers hand off to the Agent Terminal after startup.',
-		'Use retrieve/search/read for repo context. Call `skill` for playbooks. Call update_status before the final reply.',
+		'Use retrieve/search/read for repo context. Call `skill` for playbooks. Prefer update_status when wrapping up (harness records a stop point if you skip it).',
 		'Typical flow: retrieve/search → read the slice → edit or write → build/test.',
 		'Tool results stay in this chat. Independent reads/searches can be issued together.',
 		vscode.workspace.getConfiguration('codeforge.ai').get<boolean>('exploreSubagent')
@@ -1416,8 +1418,11 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 	/** Paths successfully written/edited this turn — used for the project handoff. */
 	const writtenPaths = new Set<string>();
 	let emptyFinishNudges = 0;
+	/** Retries when the model narrates next steps without tool_calls. */
+	let intentContinueNudges = 0;
+	/** Retries when tools ran but the final reply has no findings. */
+	let thinFinalNudges = 0;
 	let statusUpdated = false;
-	let statusNudges = 0;
 	let turnOutcome: StatusOutcome = 'done';
 	let turnBlockedReason = '';
 	let handoffDone = false;
@@ -2176,13 +2181,61 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					continue;
 				}
 
-				// Empty turn before any work: one neutral reminder, then accept.
-				if ((!content || trivial) && successfulWriteCount === 0 && emptyFinishNudges < 2 && step + 1 < stepBudget) {
+				// Empty/trivial finish: always nudge (including after helper writes) — then accept.
+				if ((!content || trivial) && emptyFinishNudges < 2 && step + 1 < stepBudget) {
 					emptyFinishNudges += 1;
 					const note = EMPTY_TURN_NOTE;
 					trace?.info('harness', String(note.length));
 					messages.push({ role: 'assistant', content: content || '(empty)' });
 					messages.push({ role: 'user', content: note });
+					continue;
+				}
+
+				// Narrated intent without tools ("Vou listar…") — do not treat as final.
+				if (
+					content &&
+					!trivial &&
+					looksLikeIncompleteIntent(content) &&
+					intentContinueNudges < 2 &&
+					step + 1 < stepBudget
+				) {
+					intentContinueNudges += 1;
+					const note = INTENT_CONTINUE_NOTE;
+					trace?.info('harness', String(note.length));
+					messages.push({ role: 'assistant', content: content });
+					messages.push({ role: 'user', content: note });
+					opts.onStatus?.(
+						`Continuing — model narrated without tools (${intentContinueNudges}/2)…`
+					);
+					opts.onActivity?.({
+						kind: 'checkpoint',
+						label: 'Incomplete intent — retry tools',
+						detail: content.slice(0, 160),
+					});
+					continue;
+				}
+
+				// Tools ran but the reply is too thin to be the answer (e.g. wrote a helper and stopped).
+				if (
+					content &&
+					!trivial &&
+					looksLikeThinFinal(content, actions.length > 0) &&
+					thinFinalNudges < 2 &&
+					step + 1 < stepBudget
+				) {
+					thinFinalNudges += 1;
+					const note = THIN_FINAL_NOTE;
+					trace?.info('harness', String(note.length));
+					messages.push({ role: 'assistant', content: content });
+					messages.push({ role: 'user', content: note });
+					opts.onStatus?.(
+						`Continuing — thin final after tools (${thinFinalNudges}/2)…`
+					);
+					opts.onActivity?.({
+						kind: 'checkpoint',
+						label: 'Thin final — ask for findings',
+						detail: content.slice(0, 160),
+					});
 					continue;
 				}
 
@@ -2279,21 +2332,8 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					doneNote = finalReplyNote('unverified');
 				}
 
-				if (
-					shouldRequireStatusUpdate({
-						isolated: opts.isolated,
-						alreadyUpdated: statusUpdated,
-						nudges: statusNudges,
-					}) &&
-					step + 1 < stepBudget
-				) {
-					statusNudges += 1;
-					trace?.info('harness', String(STATUS_UPDATE_NOTE.length));
-					messages.push({ role: 'assistant', content: summary });
-					messages.push({ role: 'user', content: STATUS_UPDATE_NOTE });
-					opts.onStatus?.('A gravar o ponto de situação…');
-					continue;
-				}
+				// Do not block the user-visible reply on update_status. An extra model
+				// round here felt like lag; the harness records a stop point in recordHandoff().
 
 				if (!blocked) {
 					const finishDecision = await decideGates(
@@ -2441,6 +2481,8 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 			});
 			lengthTruncationNudges = 0;
 			emptyFinishNudges = 0;
+			intentContinueNudges = 0;
+			thinFinalNudges = 0;
 
 			const exploreTools = new Set([
 				'read',
@@ -3338,7 +3380,8 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 		});
 		throw err;
 	} finally {
-		await recordHandoff();
+		// Fire-and-forget so the chat bubble can settle before git/status I/O.
+		void recordHandoff();
 	}
 }
 
@@ -5204,14 +5247,12 @@ function summarizeArgs(name: string, args: Record<string, unknown>): Record<stri
 }
 
 /** Short label for the chat timeline (Cursor-like: "Shell npm test", not "shell ok"). */
+/** Cursor-style live activity label (Reading…, Grepping…, Running…). */
 function formatToolActivityLabel(name: string, args: Record<string, unknown>): string {
-	const title = name
-		.replace(/_/g, ' ')
-		.replace(/\b\w/g, c => c.toUpperCase())
-		.replace(/^Mcp /, 'MCP ');
 	const primary = String(
 		args.path ??
 			args.oldPath ??
+			args.newPath ??
 			args.command ??
 			args.pattern ??
 			args.query ??
@@ -5222,13 +5263,49 @@ function formatToolActivityLabel(name: string, args: Record<string, unknown>): s
 	)
 		.replace(/\s+/g, ' ')
 		.trim();
-	if (!primary) return title;
-	const clipped = primary.length > 72 ? primary.slice(0, 69) + '…' : primary;
-	if (name === 'shell' || name === 'dotnet') return `Shell ${clipped}`;
-	if (name === 'read' || name === 'write' || name === 'edit' || name === 'delete' || name === 'open') {
-		return `${title} ${clipped}`;
+	const clipped = primary
+		? primary.length > 64
+			? primary.slice(0, 61) + '…'
+			: primary
+		: '';
+	switch (name) {
+		case 'read':
+		case 'open':
+			return clipped ? `Reading ${clipped}` : 'Reading…';
+		case 'list':
+			return clipped ? `Listing ${clipped}` : 'Listing…';
+		case 'search':
+			return clipped ? `Grepping ${clipped}` : 'Grepping…';
+		case 'retrieve':
+			return clipped ? `Searching ${clipped}` : 'Searching…';
+		case 'write':
+			return clipped ? `Writing ${clipped}` : 'Writing…';
+		case 'edit':
+			return clipped ? `Editing ${clipped}` : 'Editing…';
+		case 'delete':
+			return clipped ? `Deleting ${clipped}` : 'Deleting…';
+		case 'rename':
+			return clipped ? `Renaming ${clipped}` : 'Renaming…';
+		case 'shell':
+		case 'dotnet':
+			return clipped ? `Running ${clipped}` : 'Running…';
+		case 'todo_write':
+			return 'Planning…';
+		case 'update_status':
+			return 'Updating status…';
+		case 'symbols':
+		case 'definition':
+		case 'references':
+		case 'outline':
+			return clipped ? `Inspecting ${clipped}` : 'Inspecting…';
+		default: {
+			const title = name
+				.replace(/_/g, ' ')
+				.replace(/\b\w/g, c => c.toUpperCase())
+				.replace(/^Mcp /, 'MCP ');
+			return clipped ? `${title} ${clipped}` : `${title}…`;
+		}
 	}
-	return `${title} ${clipped}`;
 }
 
 /**
