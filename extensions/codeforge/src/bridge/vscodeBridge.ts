@@ -11,6 +11,7 @@ import * as fs from 'fs';
 import { resolveSandboxLevel, runSandboxed, type SandboxLevel } from '../sandbox/runtime';
 import { clipBuildOutput, clipData, looksLikeBuildTestOutput } from '../agent/clip';
 import { applyEdit, excerptAround } from '../agent/editTool';
+import { applyPatchHunk, parsePatch } from '../agent/applyPatch';
 import { documentSymbolRanges, formatOutlineBlock } from '../intelligence/lspBridge';
 import { getEditJournal } from '../agent/editJournal';
 
@@ -109,6 +110,11 @@ export class VSCodeAIBridge {
                     String(args.old_string ?? ''),
                     String(args.new_string ?? ''),
                     args.replace_all === true || args.replace_all === 'true'
+                );
+            case 'apply_patch':
+                return this.applyPatchFile(
+                    String(args.patch ?? args.patchText ?? ''),
+                    args.path ? String(args.path) : undefined
                 );
             case 'list':
                 return this.listDirectory(String(args.path ?? '.'), Boolean(args.recursive));
@@ -229,14 +235,55 @@ export class VSCodeAIBridge {
                         /* fall through */
                     }
                 }
+                const suggestions = await this.suggestSimilarPaths(filePath);
                 return [
                     `FILE_NOT_FOUND: ${filePath}`,
                     'This path does not exist yet. Create it with write if the task needs it; list/retrieve show existing names.',
-                ].join('\n');
+                    suggestions.length
+                        ? `Did you mean one of these?\n${suggestions.map(s => `- ${s}`).join('\n')}`
+                        : '',
+                ]
+                    .filter(Boolean)
+                    .join('\n');
             }
             throw err;
         }
     }
+
+	/** Up to 3 sibling files with similar basenames (for FILE_NOT_FOUND hints). */
+	private async suggestSimilarPaths(filePath: string): Promise<string[]> {
+		try {
+			const norm = filePath.replace(/\\/g, '/');
+			const slash = norm.lastIndexOf('/');
+			const dir = slash >= 0 ? norm.slice(0, slash) : '.';
+			const base = (slash >= 0 ? norm.slice(slash + 1) : norm).toLowerCase();
+			if (!base) return [];
+			const uri = this.resolveUri(dir === '.' ? '' : dir);
+			const entries = await vscode.workspace.fs.readDirectory(uri);
+			const scored = entries
+				.filter(([, t]) => t === vscode.FileType.File)
+				.map(([name]) => {
+					const lower = name.toLowerCase();
+					let score = 0;
+					if (lower === base) score = 100;
+					else if (lower.includes(base) || base.includes(lower)) score = 50;
+					else {
+						const a = new Set(lower);
+						const b = new Set(base);
+						let inter = 0;
+						for (const ch of a) if (b.has(ch)) inter++;
+						score = inter;
+					}
+					return { name, score };
+				})
+				.filter(x => x.score > 0)
+				.sort((a, b) => b.score - a.score)
+				.slice(0, 3);
+			return scored.map(x => (dir === '.' ? x.name : `${dir}/${x.name}`));
+		} catch {
+			return [];
+		}
+	}
 
     private async writeFile(filePath: string, content: string): Promise<string> {
         try {
@@ -290,11 +337,69 @@ export class VSCodeAIBridge {
         if (!result.ok) {
             throw new Error(`edit ${filePath}: ${result.error}`);
         }
+        if (result.alreadyApplied) {
+            const excerpt = clipData(excerptAround(result.text, result.firstLine, newString), 4000);
+            return [
+                `Already applied: new_string is already present in ${filePath}. No write needed.`,
+                'Do not retry this edit. Continue with any remaining fixes on other files.',
+                excerpt,
+            ].join('\n');
+        }
         await vscode.workspace.fs.writeFile(this.resolveUri(filePath), Buffer.from(result.text, 'utf8'));
         const excerpt = clipData(excerptAround(result.text, result.firstLine, newString), 4000);
         const total = result.text.split(/\r?\n/).length;
         return `Edited ${filePath} (${result.count} replacement${result.count > 1 ? 's' : ''}; file now ${total} lines)\n${excerpt}`;
     }
+
+	private async applyPatchFile(patchText: string, fallbackPath?: string): Promise<string> {
+		let text = String(patchText || '');
+		if (fallbackPath && !/\*\*\*\s*(Add|Update|Delete)\s+File:/i.test(text)) {
+			text = `*** Begin Patch\n*** Update File: ${fallbackPath}\n${text}\n*** End Patch`;
+		}
+		const parsed = parsePatch(text);
+		if (!parsed.ok) {
+			throw new Error(`apply_patch: ${parsed.error}`);
+		}
+		const applied: string[] = [];
+		for (const hunk of parsed.hunks) {
+			const pathForHunk =
+				hunk.type === 'update' ? hunk.movePath || hunk.path : hunk.path;
+			try {
+				await getEditJournal().recordBeforeWrite(pathForHunk, p => this.readRaw(p));
+			} catch {
+				/* best-effort */
+			}
+			if (hunk.type === 'add') {
+				await vscode.workspace.fs.writeFile(
+					this.resolveUri(hunk.path),
+					Buffer.from(hunk.contents, 'utf8')
+				);
+				applied.push(`A ${hunk.path}`);
+				continue;
+			}
+			if (hunk.type === 'delete') {
+				const existing = await this.readRaw(hunk.path);
+				if (existing === undefined) {
+					throw new Error(`apply_patch: Failed to delete ${hunk.path}: file does not exist`);
+				}
+				await vscode.workspace.fs.delete(this.resolveUri(hunk.path));
+				applied.push(`D ${hunk.path}`);
+				continue;
+			}
+			const existing = await this.readRaw(hunk.path);
+			const updated = applyPatchHunk(hunk, () => existing);
+			if (!updated.ok) {
+				throw new Error(`apply_patch: ${updated.error}`);
+			}
+			const dest = hunk.movePath || hunk.path;
+			await vscode.workspace.fs.writeFile(this.resolveUri(dest), Buffer.from(updated.text, 'utf8'));
+			if (hunk.movePath && hunk.movePath !== hunk.path) {
+				await vscode.workspace.fs.delete(this.resolveUri(hunk.path));
+			}
+			applied.push(`M ${dest}`);
+		}
+		return `Success. Updated the following files:\n${applied.join('\n')}`;
+	}
 
     private async listDirectory(dirPath: string, recursive: boolean): Promise<string> {
         const normalized = (dirPath || '.').replace(/\\/g, '/');

@@ -16,8 +16,8 @@ export type PermissionRuleset = PermissionRule[];
 
 export type ToolPermissionProfile = 'build' | 'explore' | 'plan' | 'status' | 'coach' | 'ask';
 
-/** edit/write share the OpenCode `edit` permission key. */
-const EDIT_TOOLS = new Set(['edit', 'write']);
+/** edit/write/apply_patch share the OpenCode `edit` permission key. */
+const EDIT_TOOLS = new Set(['edit', 'write', 'apply_patch']);
 
 function permissionKeyForTool(tool: string): string {
 	return EDIT_TOOLS.has(tool) ? 'edit' : tool;
@@ -120,6 +120,7 @@ export const PLAN_ALLOWED_TOOLS = [
 	/** Draft/lock checks for the experiment loop (path-gated at execute). */
 	'write',
 	'edit',
+	'apply_patch',
 ] as const;
 
 /** Method coach: read + skill + write/edit gated to how-to-work only. */
@@ -131,6 +132,7 @@ export const COACH_ALLOWED_TOOLS = [
 	'skill',
 	'write',
 	'edit',
+	'apply_patch',
 	'update_status',
 	'todo_write',
 ] as const;
@@ -159,6 +161,7 @@ const BUILD_ALLOWED_CORE = [
 	'read',
 	'write',
 	'edit',
+	'apply_patch',
 	'list',
 	'search',
 	'retrieve',

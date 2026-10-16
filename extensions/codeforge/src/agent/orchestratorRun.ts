@@ -47,7 +47,7 @@ async function buildPlan(opts: AgentLoopOptions, root: string, forced: boolean, 
 		return resumablePlan(loadPlan(root), fresh) ?? fresh;
 	}
 	if (!wantsNewApp(opts.task) && !forced) return undefined;
-	opts.onStatus?.('A planear os passos…');
+	opts.onStatus?.('Planning steps…');
 	const reply = await runAgentWithTools({
 		...opts,
 		task: PLANNING_PROMPT(opts.task),

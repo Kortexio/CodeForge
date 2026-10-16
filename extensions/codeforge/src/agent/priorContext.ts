@@ -16,9 +16,10 @@ export function buildPriorAgentTranscript(
 	const useful = traces.filter(
 		t =>
 			t.success &&
-			['read', 'list', 'retrieve', 'search', 'shell', 'dotnet', 'write', 'edit', 'wiki_read'].includes(t.name)
-	);
-	const isWrite = (t: ToolTraceEntry) => t.name === 'write' || t.name === 'edit';
+			['read', 'list', 'retrieve', 'search', 'shell', 'dotnet', 'write', 'edit', 'apply_patch', 'wiki_read'].includes(t.name)
+		);
+	const isWrite = (t: ToolTraceEntry) =>
+		t.name === 'write' || t.name === 'edit' || t.name === 'apply_patch';
 	const pathOf = (t: ToolTraceEntry) => String(t.arguments.path ?? '').replace(/\\/g, '/').toLowerCase();
 	const lastWriteAt = new Map<string, number>();
 	useful.forEach((t, i) => {

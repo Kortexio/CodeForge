@@ -604,12 +604,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		}
 
 		const attached = this._pendingAttachments;
-		let fullTask = task;
+		let displayTask = task;
+		let agentTask = task;
 		let images: Array<{ mime: string; dataUrl: string; label?: string }> = [];
 		if (attached.length) {
 			const payload = buildAttachmentPayload(attached);
 			if (payload.textBlock) {
-				fullTask = `${task}\n\n${payload.textBlock}`;
+				displayTask = `${task}\n\n${payload.textBlock}`;
+				agentTask = `${agentTask}\n\n${payload.textBlock}`;
 			}
 			images = payload.images;
 			this._pendingAttachments = [];
@@ -619,10 +621,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
 		// Keep full content (incl. attachments) in in-memory history for follow-up turns.
 		// Images are referenced by label in stored text (base64 kept only for this turn).
+		// Bare "continue" stays short in the chat; agentTask may include a harness stall note.
 		const historyText =
 			images.length > 0
-				? `${fullTask}\n\n(Attached images: ${images.map(i => i.label || 'image').join(', ')})`
-				: fullTask;
+				? `${displayTask}\n\n(Attached images: ${images.map(i => i.label || 'image').join(', ')})`
+				: displayTask;
 		this.addMessage('user', historyText);
 		await this._sessions.appendMessage(this._currentSessionId, 'user', historyText);
 		await this._sessions.updateState(this._currentSessionId, 'running');
@@ -648,7 +651,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		this.pushQueue();
 
 		try {
-			const reply = await this.executeLocalAgent(fullTask, images);
+			const reply = await this.executeLocalAgent(agentTask, images);
 			if (!this._cancelled) {
 				const extra = {
 					reasoning: this._turnReasoning || undefined,

@@ -1,0 +1,28 @@
+---
+description: No intent crutches — agent works from tool contract, not chat/phrase triggers
+alwaysApply: true
+---
+
+# No intent crutches
+
+CodeForge’s agent must work from a stable **tool + system contract**, not from hardcoded intent detection.
+
+## Forbidden
+
+- Rewriting the user message with “Harness note” / apply / continue enrichers based on phrase matchers
+- Regex (or similar) sniffers on user or assistant text to decide the model “meant apply / corrija / I’ll fix”
+- Soft coaching nudges injected as fake `user` turns (“you narrated without tools”, “thin final”, “stuck — try edit”)
+- Growing matchers for Portuguese/English synonyms instead of fixing tools or the system prompt
+
+Portuguese/English regexes are allowed only as **matchers of user input** where the product must recognize locale (see `english-texts.mdc`), not to drive agent behavior.
+
+## Allowed (structural)
+
+- System prompt and tool schemas that state how to work (`edit` workflow, no prose-only patches)
+- Tool-result feedback (`Already applied`, `old_string was not found`, failed-repeat refusal)
+- Execution gates: `readThisTurn`, edit fingerprint block, stage/path refusals
+- Protocol events: length truncation, invalid tool JSON, step-budget / hard stuck wrap, oracle red
+
+## When the model only describes a fix
+
+Do **not** add a new trigger. Improve the contract (system/`edit` description) or the tool loop so calling tools is the natural path. Leave the failure visible rather than papering over it with matchers.

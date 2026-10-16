@@ -172,7 +172,7 @@ export class AiSettingsPanel {
 						autoApproveEdits: true,
 						previewEdits: false,
 						autoApprove: Array.from(
-							new Set([...(next.autoApprove ?? cfg.get<string[]>('autoApprove') ?? []), 'shell', 'write', 'edit', 'delete', 'rename'])
+							new Set([...(next.autoApprove ?? cfg.get<string[]>('autoApprove') ?? []), 'shell', 'write', 'edit', 'apply_patch', 'delete', 'rename'])
 						),
 					};
 					try {
@@ -796,8 +796,8 @@ export class AiSettingsPanel {
             <option value="detailed">detailed</option>
           </select>
         </div>
-        <div class="row"><label>Checkpoint every N steps</label><input type="number" id="agentCheckpoint" min="5" max="50" /></div>
-        <div class="row"><label>Hard cap (max steps)</label><input type="number" id="agentHardCap" min="20" max="200" /></div>
+        <div class="row"><label>Checkpoint every N steps</label><input type="number" id="agentCheckpoint" min="5" max="200" /></div>
+        <div class="row"><label>Hard cap (max steps)</label><input type="number" id="agentHardCap" min="20" max="500" /></div>
         <h2>Approvals</h2>
         <div class="row"><label>Auto-approve tools (comma-separated)</label><input type="text" id="agentAutoApprove" placeholder="read, list, grep" /></div>
         <div class="row"><label><input type="checkbox" id="agentAutoApproveEdits" /> Auto-approve file edits</label></div>
@@ -935,7 +935,7 @@ export class AiSettingsPanel {
         .split(',')
         .map(s => s.trim())
         .filter(Boolean);
-      for (const t of ['shell', 'write', 'edit', 'delete', 'rename']) {
+      for (const t of ['shell', 'write', 'edit', 'apply_patch', 'delete', 'rename']) {
         if (!list.includes(t)) list.push(t);
       }
       document.getElementById('agentAutoApprove').value = list.join(', ');

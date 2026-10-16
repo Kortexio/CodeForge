@@ -310,15 +310,15 @@
           "type": "number",
           "default": 30,
           "minimum": 5,
-          "maximum": 50,
+          "maximum": 200,
           "description": "Checkpoint every N steps: evaluate agent progress and extend budget on positive reviews"
         },
         "codeforge.ai.agentHardCap": {
           "type": "number",
           "default": 100,
           "minimum": 20,
-          "maximum": 200,
-          "description": "Max steps per agent task (absolute hard cap)"
+          "maximum": 500,
+          "description": "Max steps per agent task (absolute hard cap; uses your settings value as-is)"
         },
         "codeforge.ai.contextBudget": {
           "type": "number",

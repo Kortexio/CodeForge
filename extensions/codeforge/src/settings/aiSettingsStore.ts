@@ -252,6 +252,11 @@ export class AiSettingsStore {
 			this._onDidChange.fire(this.getState());
 			return;
 		}
+		// Overlay without onSave must not trap getState() on a stale in-memory copy
+		// (e.g. a tenant MCP push that only set mcpServers). Persist globally.
+		if (this.activeProfileOverlay) {
+			this.activeProfileOverlay = undefined;
+		}
 		await this.context.globalState.update(STATE_KEY, state);
 		await this.writeDisk(state);
 		await this.syncActiveToWorkspaceSettings(state);

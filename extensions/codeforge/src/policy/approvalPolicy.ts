@@ -9,7 +9,7 @@ const GLOBAL_KEY = 'codeforge.ai.approvals.always';
 const EDITS_ALWAYS_KEY = 'codeforge.ai.approvals.editsAlways';
 
 /** File-modification tools that share "Allow all edits". */
-export const EDIT_TOOLS = new Set(['write', 'rename', 'delete']);
+export const EDIT_TOOLS = new Set(['edit', 'write', 'apply_patch', 'rename', 'delete']);
 
 export type PermissionLevel = 'default' | 'assisted' | 'allowAll';
 

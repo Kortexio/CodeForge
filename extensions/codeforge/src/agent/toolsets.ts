@@ -12,6 +12,7 @@ import {
 	PLAN_ALLOWED_TOOLS,
 	ASK_ALLOWED_TOOLS,
 } from './toolPermissions';
+import { toolDescription } from './toolContracts';
 
 export { ASK_ALLOWED_TOOLS };
 
@@ -29,6 +30,7 @@ export function isStatusQuestion(task: string): boolean {
 	);
 }
 
+/** Phase heuristic only (telemetry / stage seed) — not used to rewrite user chat. */
 const CODING_TASK =
 	/\b(create|implement|add|fix|write|build|make|change|update|refactor|migrate|gerar|criar|cria|escrev\w*|implementar|implementa|corrigir|corrige|adicionar|adiciona|alterar|altera|refatorar|desenvolv\w*|executar|executa|continu[ae]r?|continue)\b/i;
 const REVIEW_TASK =
@@ -179,8 +181,7 @@ export const DOTNET_TOOL = {
 	type: 'function' as const,
 	function: {
 		name: 'dotnet',
-		description:
-			'.NET CLI: new | sln_add | add_reference | add_package | build | test.',
+		description: toolDescription('dotnet'),
 		parameters: {
 			type: 'object',
 			properties: {

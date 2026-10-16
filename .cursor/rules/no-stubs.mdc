@@ -1,0 +1,31 @@
+---
+description: Do the real work. Do not ship stubs, fake PASS results, or placeholder UI.
+alwaysApply: true
+---
+
+# No stubs
+
+Implement the behavior the task asks for. A compiling placeholder is not done.
+
+## Forbidden
+
+- Stubs, `TODO`, `FIXME`, `NotImplementedException`, "Coming soon", "would run here", or SQL / filters that contain `TBD`.
+- A `Pass` that only means the HTTP call returned. Validate the business rule (counts, thresholds, mismatches).
+- Fake data that looks like a real check. Example: every LELY-237 rule must not be `select Id from workflow_task where Status = 'Error'`.
+- A connector without credentials that returns a success sentence. Leave it disabled. Dependent checks stay blocked.
+- Admin or report pages that are only a paragraph saying the feature is pending.
+
+## When the source is missing
+
+Return `NotRun` (or blocked-by-connector) with the reason. Leave the task incomplete. Do not invent a result.
+
+## Allowed exceptions
+
+- `ManualCheck` returns `PendingManual` with the runbook steps. That waits for a person.
+- LLM evaluation and dashboard-snapshot evidence stay future. Do not stub them into the current path.
+
+## Before you finish
+
+Search the diff for `stub`, `TODO`, `TBD`, `Coming soon`, `NotImplemented`, and `placeholder`. Fix each hit or say the task is incomplete.
+
+Add a test that fails if the new behavior is fake. Examples: Billing Preview must not pass without a comparison; a contracted check must call its API or end as `NotRun`.

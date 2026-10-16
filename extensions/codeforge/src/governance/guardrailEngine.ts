@@ -7,7 +7,7 @@ import { getGovernanceStore } from './governanceStore';
 import { getProjectWikiStore } from '../memory/projectWiki';
 
 const BROAD_EXPLORE = new Set(['list', 'glob']);
-const MUTATING_FILE = new Set(['write', 'delete', 'rename']);
+const MUTATING_FILE = new Set(['write', 'edit', 'apply_patch', 'delete', 'rename']);
 
 export function isBuildOrTestCommand(command: unknown): boolean {
 	const c = String(command ?? '').toLowerCase();

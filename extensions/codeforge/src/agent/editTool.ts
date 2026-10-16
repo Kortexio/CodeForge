@@ -1,17 +1,40 @@
 /**
- * `edit` tool core: exact old_string → new_string replacement with useful errors.
+ * `edit` tool core: exact old_string → new_string with tolerant match tiers.
  * Pure — the bridge does the file IO.
+ *
+ * Match order (opencode-inspired):
+ * 1. Exact (after CRLF normalization / LF view)
+ * 2. Unicode-normalized (smart quotes, dashes, NBSP)
+ * 3. Line-wise ignoring trailing whitespace
  */
 
 export type EditResult =
-	| { ok: true; text: string; count: number; firstLine: number }
+	| { ok: true; text: string; count: number; firstLine: number; alreadyApplied?: boolean }
 	| { ok: false; error: string };
 
+interface Match {
+	start: number;
+	end: number;
+}
+
+const CRLF = '\r\n';
+
 /** `  12|code` prefixes copied from read output. */
-function stripReadLineNumbers(s: string): string {
+export function stripReadLineNumbers(s: string): string {
 	const lines = s.split('\n');
-	const numbered = lines.filter(l => l.trim()).every(l => /^\s*\d+\|/.test(l));
+	const nonempty = lines.filter(l => l.trim());
+	if (!nonempty.length) return s;
+	const numbered = nonempty.every(l => /^\s*\d+\|/.test(l));
 	return numbered ? lines.map(l => l.replace(/^\s*\d+\|/, '')).join('\n') : s;
+}
+
+/** Typographic quote / dash / space variants → ASCII. */
+export function normalizeForMatch(value: string): string {
+	return value
+		.replace(/[\u2018\u2019\u201A\u201B]/g, "'")
+		.replace(/[\u201C\u201D\u201E\u201F]/g, '"')
+		.replace(/[\u2010\u2011\u2012\u2013\u2014\u2015\u2212]/g, '-')
+		.replace(/[\u00A0\u2002-\u200A\u202F\u205F\u3000]/g, ' ');
 }
 
 function bigrams(s: string): Map<string, number> {
@@ -51,15 +74,113 @@ export function closestLines(fileText: string, oldString: string, n = 3): string
 		.map(x => `${String(x.i + 1).padStart(4, ' ')}|${x.line}`);
 }
 
-function countOccurrences(hay: string, needle: string): number {
-	let count = 0;
+function findOccurrences(hay: string, needle: string): Match[] {
+	const result: Match[] = [];
+	if (!needle) return result;
 	let from = 0;
 	for (;;) {
 		const idx = hay.indexOf(needle, from);
-		if (idx < 0) return count;
-		count++;
+		if (idx < 0) return result;
+		result.push({ start: idx, end: idx + needle.length });
 		from = idx + needle.length;
 	}
+}
+
+/** Line-wise match ignoring trailing whitespace on each line. */
+function findLineOccurrences(content: string, search: string): Match[] {
+	const trailingNewline = search.endsWith('\n');
+	const expected = search.split('\n');
+	if (trailingNewline) expected.pop();
+	const lines = [...content.matchAll(/[^\n]*(?:\n|$)/g)]
+		.filter(match => match[0] !== '')
+		.map(match => {
+			const newline = match[0].endsWith('\n');
+			const text = newline ? match[0].slice(0, -1) : match[0];
+			return {
+				start: match.index!,
+				end: match.index! + match[0].length,
+				text,
+				contentEnd: match.index! + text.length - (text.endsWith('\r') ? 1 : 0),
+				newline,
+			};
+		});
+	const candidates = lines.flatMap((line, index) => {
+		const actual = lines.slice(index, index + expected.length);
+		if (actual.length !== expected.length) return [];
+		if (
+			!actual.every(
+				(item, lineIndex) =>
+					normalizeForMatch(item.text.trimEnd()) === normalizeForMatch(expected[lineIndex].trimEnd())
+			)
+		)
+			return [];
+		const last = actual[actual.length - 1]!;
+		if (trailingNewline && !last.newline) return [];
+		return [{ start: line.start, end: trailingNewline ? last.end : last.contentEnd }];
+	});
+	return candidates.reduce<Match[]>((result, candidate) => {
+		if (result.some(match => match.end > candidate.start && match.start < candidate.end)) return result;
+		result.push(candidate);
+		return result;
+	}, []);
+}
+
+function countBefore(positions: number[], offset: number): number {
+	let low = 0;
+	let high = positions.length;
+	while (low < high) {
+		const middle = (low + high) >> 1;
+		if (positions[middle]! < offset) low = middle + 1;
+		else high = middle;
+	}
+	return low;
+}
+
+function lineEnding(text: string, fallback: string): string {
+	const crlfCount = text.split(CRLF).length - 1;
+	const lfCount = text.split('\n').length - 1 - crlfCount;
+	if (crlfCount === lfCount) return fallback;
+	return crlfCount > lfCount ? CRLF : '\n';
+}
+
+/**
+ * Match against the LF view (what Read shows), then map offsets back to source
+ * so CRLF / mixed endings neither block matches nor leak into untouched regions.
+ */
+function matchView(source: string, oldString: string, newString: string): {
+	matches: Match[];
+	replace: (match: Match) => string;
+} {
+	const view = source.replaceAll(CRLF, '\n');
+	const removed = [...source.matchAll(/\r\n/g)].map((match, index) => match.index! - index);
+	const fileEnding = lineEnding(source, '\n');
+	const search = oldString.replaceAll(CRLF, '\n');
+	const replacement = newString.replaceAll(CRLF, '\n');
+
+	const exact = findOccurrences(view, search);
+	const unicode =
+		exact.length > 0
+			? []
+			: findOccurrences(normalizeForMatch(view), normalizeForMatch(search));
+	const trailing =
+		exact.length > 0 || unicode.length > 0 ? [] : findLineOccurrences(view, search);
+
+	const matches = (exact.length > 0 ? exact : unicode.length > 0 ? unicode : trailing).map(match => ({
+		start: match.start + countBefore(removed, match.start),
+		end: match.end + countBefore(removed, match.end),
+	}));
+
+	return {
+		matches,
+		replace: (match: Match) => {
+			const region = source.slice(match.start, match.end);
+			const ending = lineEnding(region, fileEnding);
+			const lines = replacement.split('\n');
+			return lines
+				.map((line, i) => (i === lines.length - 1 ? line : line + ending))
+				.join('');
+		},
+	};
 }
 
 export function applyEdit(
@@ -69,38 +190,45 @@ export function applyEdit(
 	replaceAll = false
 ): EditResult {
 	let oldString = stripReadLineNumbers(String(oldStringRaw ?? ''));
-	let newString = String(newStringRaw ?? '');
+	let newString = stripReadLineNumbers(String(newStringRaw ?? ''));
 	if (!oldString) {
-		return { ok: false, error: 'old_string is empty. To create a file use write; to change one, copy the exact text to replace.' };
+		return {
+			ok: false,
+			error:
+				'old_string is empty. To create a file use write; to change one, copy the exact text to replace.',
+		};
 	}
 	if (oldString === newString) {
 		return { ok: false, error: 'old_string and new_string are identical — nothing to change.' };
 	}
-	const crlf = fileText.includes('\r\n');
-	if (crlf) {
-		oldString = oldString.replace(/\r?\n/g, '\r\n');
-		newString = newString.replace(/\r?\n/g, '\r\n');
-	}
-	let count = countOccurrences(fileText, oldString);
+
+	const { matches, replace } = matchView(fileText, oldString, newString);
+	const count = matches.length;
+
 	if (count === 0) {
-		// Tolerate trailing-whitespace drift on each line (common when models retype code).
-		const pattern = oldString
-			.split(/\r?\n/)
-			.map(l => l.trimEnd().replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '[ \\t]*')
-			.join('\\r?\\n');
-		const re = new RegExp(pattern, 'g');
-		const matches = [...fileText.matchAll(re)];
-		if (matches.length === 1 || (matches.length > 1 && replaceAll)) {
-			oldString = matches[0][0];
-			count = countOccurrences(fileText, oldString);
+		// Model often invents a broken old_string when the desired new_string is already on disk.
+		const view = fileText.replaceAll(CRLF, '\n');
+		const neu = newString.replaceAll(CRLF, '\n');
+		const already =
+			view.includes(neu) ||
+			normalizeForMatch(view).includes(normalizeForMatch(neu));
+		if (already) {
+			const idx = view.indexOf(neu);
+			const firstLine =
+				idx >= 0 ? view.slice(0, idx).split('\n').length : 1;
+			return {
+				ok: true,
+				text: fileText,
+				count: 0,
+				firstLine,
+				alreadyApplied: true,
+			};
 		}
-	}
-	if (count === 0) {
 		const near = closestLines(fileText, oldString);
 		return {
 			ok: false,
 			error: [
-				'old_string was not found in the file.',
+				'old_string was not found in the file. It must match exactly (including whitespace and indentation), or match after Unicode/trailing-whitespace normalization.',
 				near.length ? 'Closest lines (copy the exact text from here or read the file again):' : '',
 				...near,
 			]
@@ -109,22 +237,24 @@ export function applyEdit(
 		};
 	}
 	if (count > 1 && !replaceAll) {
-		const lines: number[] = [];
-		let from = 0;
-		for (let k = 0; k < Math.min(count, 5); k++) {
-			const idx = fileText.indexOf(oldString, from);
-			lines.push(fileText.slice(0, idx).split('\n').length);
-			from = idx + oldString.length;
-		}
+		const lines = matches.slice(0, 5).map(m => fileText.slice(0, m.start).split('\n').length);
 		return {
 			ok: false,
 			error: `old_string matches ${count} places (lines ${lines.join(', ')}). Add surrounding lines to make it unique, or set replace_all=true.`,
 		};
 	}
-	const firstIdx = fileText.indexOf(oldString);
-	const firstLine = fileText.slice(0, firstIdx).split('\n').length;
-	const text = replaceAll ? fileText.split(oldString).join(newString) : fileText.replace(oldString, () => newString);
-	return { ok: true, text, count: replaceAll ? count : 1, firstLine };
+
+	const chosen = replaceAll ? matches : matches.slice(0, 1);
+	const first = chosen[0]!;
+	const firstLine = fileText.slice(0, first.start).split('\n').length;
+	let text = fileText;
+	for (const match of [...chosen].reverse()) {
+		text = `${text.slice(0, match.start)}${replace(match)}${text.slice(match.end)}`;
+	}
+	if (text === fileText) {
+		return { ok: false, error: 'No changes to apply: the edit leaves the file unchanged.' };
+	}
+	return { ok: true, text, count: chosen.length, firstLine };
 }
 
 /** Numbered excerpt around the edit so the model sees the result without another read. */

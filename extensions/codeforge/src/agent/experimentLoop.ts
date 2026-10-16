@@ -153,6 +153,7 @@ export function pathsTouchedByTool(tool: string, args: Record<string, unknown>):
 	switch (tool) {
 		case 'write':
 		case 'edit':
+		case 'apply_patch':
 		case 'delete':
 			return [normalizeRelPath(String(args.path ?? ''))].filter(Boolean);
 		case 'rename': {
@@ -217,7 +218,7 @@ export function denyExperimentMutation(
 		if (tool === 'shell' || tool === 'dotnet' || tool === 'delete' || tool === 'rename') {
 			return `Not run: "${tool}" is not available in coach mode (only edit ${HOW_TO_WORK_REL}).`;
 		}
-		if (tool === 'write' || tool === 'edit') {
+		if (tool === 'write' || tool === 'edit' || tool === 'apply_patch') {
 			const paths = pathsTouchedByTool(tool, args);
 			if (!paths.length || paths.some(p => !isHowToWorkPath(p))) {
 				return `Not run: coach mode may only write ${HOW_TO_WORK_REL}.`;
@@ -227,7 +228,7 @@ export function denyExperimentMutation(
 	}
 
 	if (opts.planMode) {
-		if (tool === 'write' || tool === 'edit' || tool === 'delete' || tool === 'rename') {
+		if (tool === 'write' || tool === 'edit' || tool === 'apply_patch' || tool === 'delete' || tool === 'rename') {
 			const paths = pathsTouchedByTool(tool, args);
 			if (!paths.length || paths.some(p => !planMayWritePath(p, opts.locked))) {
 				return `Not run: in Plan mode write only checks, ${CHECKS_LOCK_REL}, or ${ORACLE_JSON_REL}.`;
@@ -245,7 +246,7 @@ export function denyExperimentMutation(
 		return null;
 	}
 
-	if (tool === 'write' || tool === 'edit' || tool === 'delete' || tool === 'rename') {
+	if (tool === 'write' || tool === 'edit' || tool === 'apply_patch' || tool === 'delete' || tool === 'rename') {
 		const paths = pathsTouchedByTool(tool, args);
 		const hit = paths.find(p => isLockedScorePath(p, opts.locked));
 		if (hit) {

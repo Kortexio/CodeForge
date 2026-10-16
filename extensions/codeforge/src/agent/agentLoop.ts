@@ -19,13 +19,28 @@ import {
 	parseOverflowTokens,
 	updateTokenCalibration,
 } from './contextOverflow';
+import { TOOL_SYSTEM_CONTRACT, toolDescription } from './toolContracts';
+import { looksLikeXmlToolMarkup, parseXmlToolCalls } from './xmlToolCalls';
 import {
 	filterAnthropicToolResults,
 	formatReadLedger,
 	midCompactMessages,
 	normalizeToolProtocolHistory,
+	safeMidCompactTailStart,
 	softCompactToolResults,
 } from './toolHistory';
+import {
+	applySoftThinkSwitch,
+	llmSamplingOptions,
+	llmThinkingRequestFields,
+	shouldDisableThinking,
+	shouldEnableThinking,
+	splitThinkContent,
+	stripReasoningFromMessages,
+	stripThinkBlocks,
+	toolAwareMaxTokens,
+	type ThinkingRoundInput,
+} from './llmThinking';
 import * as lsp from '../intelligence/lspBridge';
 import * as git from '../intelligence/gitTools';
 import {
@@ -76,15 +91,33 @@ import {
 	claimsBuildOrTestGreen,
 	EMPTY_TURN_NOTE,
 	finalReplyNote,
-	INTENT_CONTINUE_NOTE,
 	LENGTH_CAP_NOTE,
-	looksLikeIncompleteIntent,
-	looksLikeThinFinal,
 	oracleRejectNote,
 	parseBlockedClaim,
-	THIN_FINAL_NOTE,
+	TRUNCATED_TOOL_JSON_FINAL_NOTE,
+	TRUNCATED_TOOL_JSON_NOTE,
+	MAX_STEPS_PROMPT,
+	STUCK_WRAP_PROMPT,
 } from './nudges';
+import {
+	advancePlanAfterWrites,
+	createInternalPlan,
+	ensureScaffoldPlan,
+	formatPlanForPrompt,
+	looksLikeScaffoldTask,
+	parseScaffoldPlanJson,
+	pathAllowedByPlan,
+	resolveCurrentPlan,
+	type InternalPlan,
+} from './internalPlans';
 import { clipData, clipToolOutput } from './clip';
+import {
+	buildCompactionPrompt,
+	COMPACTION_NUDGE,
+	formatCheckpointUserMessage,
+	looksLikeStructuredSummary,
+} from './structuredCompaction';
+import { cleanupToolOutputSpill, clipWithSpill } from './toolOutputSpill';
 import {
 	canonicalizePathKey,
 	invalidatePaths,
@@ -98,6 +131,7 @@ import {
 	buildDotnetCommand,
 	currentPhase,
 	DOTNET_TOOL,
+	isCodingTask,
 	isPartialRewrite,
 	isStatusQuestion,
 	LARGE_FILE_LINES,
@@ -133,6 +167,11 @@ export function oracleNote(result: OracleResult, reason: string): string {
 	return formatOracleResult(result, reason) + (hints.length ? `\n\nKnown fixes:\n${hints.map(h => `- ${h}`).join('\n')}` : '');
 }
 import { applyEdit } from './editTool';
+import {
+	applyPatchHunk,
+	modelUsesApplyPatch,
+	parsePatch,
+} from './applyPatch';
 
 function dotnetCommandLine(args: Record<string, unknown>): string {
 	const built = buildDotnetCommand(args);
@@ -144,6 +183,7 @@ function dotnetCommandLine(args: Record<string, unknown>): string {
 const MUTATING = new Set([
 	'write',
 	'edit',
+	'apply_patch',
 	'dotnet',
 	'delete',
 	'rename',
@@ -340,7 +380,7 @@ export const AGENT_TOOLS = [
 		type: 'function' as const,
 		function: {
 			name: 'read',
-			description: 'Read a file slice with line numbers (default 120 lines).',
+			description: toolDescription('read'),
 			parameters: {
 				type: 'object',
 				properties: {
@@ -370,7 +410,7 @@ export const AGENT_TOOLS = [
 		type: 'function' as const,
 		function: {
 			name: 'write',
-			description: 'Create or replace a whole file. Prefer edit for partial changes.',
+			description: toolDescription('write'),
 			parameters: {
 				type: 'object',
 				properties: {
@@ -388,13 +428,21 @@ export const AGENT_TOOLS = [
 		type: 'function' as const,
 		function: {
 			name: 'edit',
-			description: 'Replace an exact unique span in a file (old_string → new_string).',
+			description:
+				toolDescription('edit'),
 			parameters: {
 				type: 'object',
 				properties: {
-					path: { type: 'string' },
-					old_string: { type: 'string', description: 'Exact existing text to replace' },
-					new_string: { type: 'string', description: 'Replacement text' },
+					path: { type: 'string', description: 'Workspace-relative path' },
+					old_string: {
+						type: 'string',
+						description:
+							'Exact text currently on disk, copied from a read this turn — omit numbered prefixes like "  12|"',
+					},
+					new_string: {
+						type: 'string',
+						description: 'Replacement text (must differ from old_string)',
+					},
 					replace_all: {
 						type: 'boolean',
 						description: 'Replace every occurrence (default false)',
@@ -404,13 +452,39 @@ export const AGENT_TOOLS = [
 			},
 		},
 	},
+	{
+		type: 'function' as const,
+		function: {
+			name: 'apply_patch',
+			description:
+				toolDescription('apply_patch'),
+			parameters: {
+				type: 'object',
+				properties: {
+					path: {
+						type: 'string',
+						description: 'Optional single-file path when the patch body omits *** Update File',
+					},
+					patch: {
+						type: 'string',
+						description: 'Full patch text (*** Begin Patch … *** End Patch)',
+					},
+					patchText: {
+						type: 'string',
+						description: 'Alias for patch',
+					},
+				},
+				required: ['patch'],
+			},
+		},
+	},
 	DOTNET_TOOL,
 	{
 		type: 'function' as const,
 		function: {
 			name: 'list',
 			description:
-				'List the files of one folder (non-recursive by default).',
+				toolDescription('list'),
 			parameters: {
 				type: 'object',
 				properties: {
@@ -428,7 +502,7 @@ export const AGENT_TOOLS = [
 		type: 'function' as const,
 		function: {
 			name: 'search',
-			description: 'Search workspace files for a regex/text pattern',
+			description: toolDescription('search'),
 			parameters: {
 				type: 'object',
 				properties: {
@@ -443,7 +517,7 @@ export const AGENT_TOOLS = [
 		type: 'function' as const,
 		function: {
 			name: 'retrieve',
-			description: 'Top-k code snippets for a query (prefer over dumping full files).',
+			description: toolDescription('retrieve'),
 			parameters: {
 				type: 'object',
 				properties: {
@@ -458,7 +532,7 @@ export const AGENT_TOOLS = [
 		type: 'function' as const,
 		function: {
 			name: 'delete',
-			description: 'Delete a file',
+			description: toolDescription('delete'),
 			parameters: {
 				type: 'object',
 				properties: { path: { type: 'string' } },
@@ -470,7 +544,7 @@ export const AGENT_TOOLS = [
 		type: 'function' as const,
 		function: {
 			name: 'rename',
-			description: 'Rename or move a file',
+			description: toolDescription('rename'),
 			parameters: {
 				type: 'object',
 				properties: {
@@ -485,7 +559,7 @@ export const AGENT_TOOLS = [
 		type: 'function' as const,
 		function: {
 			name: 'open',
-			description: 'Open a file in the editor',
+			description: toolDescription('open'),
 			parameters: {
 				type: 'object',
 				properties: { path: { type: 'string' } },
@@ -498,7 +572,7 @@ export const AGENT_TOOLS = [
 		function: {
 			name: 'shell',
 			description:
-				'Run a cmd.exe command in the workspace. Prefer web_search/web_fetch for HTTP. Set background=true for long jobs, then await_shell.',
+				toolDescription('shell'),
 			parameters: {
 				type: 'object',
 				properties: {
@@ -524,7 +598,7 @@ export const AGENT_TOOLS = [
 		type: 'function' as const,
 		function: {
 			name: 'await_shell',
-			description: 'Wait/poll a background shell job by id; optional regex pattern on output.',
+			description: toolDescription('await_shell'),
 			parameters: {
 				type: 'object',
 				properties: {
@@ -540,7 +614,7 @@ export const AGENT_TOOLS = [
 		type: 'function' as const,
 		function: {
 			name: 'web_search',
-			description: 'Search the public web (no API key). Prefer this over shell curl for discovery.',
+			description: toolDescription('web_search'),
 			parameters: {
 				type: 'object',
 				properties: {
@@ -555,7 +629,7 @@ export const AGENT_TOOLS = [
 		type: 'function' as const,
 		function: {
 			name: 'web_fetch',
-			description: 'Fetch a URL and return text/markdown-ish content (native HTTPS).',
+			description: toolDescription('web_fetch'),
 			parameters: {
 				type: 'object',
 				properties: {
@@ -570,7 +644,7 @@ export const AGENT_TOOLS = [
 		type: 'function' as const,
 		function: {
 			name: 'todo_write',
-			description: 'Create or update a multi-step checklist for this session.',
+			description: toolDescription('todo_write'),
 			parameters: {
 				type: 'object',
 				properties: {
@@ -602,7 +676,7 @@ export const AGENT_TOOLS = [
 		type: 'function' as const,
 		function: {
 			name: 'git_add',
-			description: 'Stage files for commit (git add). Omit paths to stage all.',
+			description: toolDescription('git_add'),
 			parameters: {
 				type: 'object',
 				properties: {
@@ -615,7 +689,7 @@ export const AGENT_TOOLS = [
 		type: 'function' as const,
 		function: {
 			name: 'git_commit',
-			description: 'Create a git commit with the given message. Prefer after git_add.',
+			description: toolDescription('git_commit'),
 			parameters: {
 				type: 'object',
 				properties: { message: { type: 'string' } },
@@ -627,7 +701,7 @@ export const AGENT_TOOLS = [
 		type: 'function' as const,
 		function: {
 			name: 'git_push',
-			description: 'Push the current branch to the remote (git push).',
+			description: toolDescription('git_push'),
 			parameters: {
 				type: 'object',
 				properties: {
@@ -642,7 +716,7 @@ export const AGENT_TOOLS = [
 		type: 'function' as const,
 		function: {
 			name: 'gh_pr_create',
-			description: 'Create a GitHub pull request with the gh CLI.',
+			description: toolDescription('gh_pr_create'),
 			parameters: {
 				type: 'object',
 				properties: {
@@ -659,7 +733,7 @@ export const AGENT_TOOLS = [
 		type: 'function' as const,
 		function: {
 			name: 'edit_notebook',
-			description: 'Edit or insert a cell in a Jupyter .ipynb notebook.',
+			description: toolDescription('edit_notebook'),
 			parameters: {
 				type: 'object',
 				properties: {
@@ -678,7 +752,7 @@ export const AGENT_TOOLS = [
 		function: {
 			name: 'generate_image',
 			description:
-				'Generate an image from a prompt (SVG poster locally, or images API if configured). Saves under .CodeForge/artifacts/images/.',
+				toolDescription('generate_image'),
 			parameters: {
 				type: 'object',
 				properties: {
@@ -693,7 +767,7 @@ export const AGENT_TOOLS = [
 		type: 'function' as const,
 		function: {
 			name: 'canvas_write',
-			description: 'Write a side-panel style canvas doc under .CodeForge/canvas/ (md or html).',
+			description: toolDescription('canvas_write'),
 			parameters: {
 				type: 'object',
 				properties: {
@@ -710,7 +784,7 @@ export const AGENT_TOOLS = [
 		type: 'function' as const,
 		function: {
 			name: 'voice_status',
-			description: 'Report voice-input availability (UX pending).',
+			description: toolDescription('voice_status'),
 			parameters: { type: 'object', properties: {} },
 		},
 	},
@@ -718,7 +792,7 @@ export const AGENT_TOOLS = [
 		type: 'function' as const,
 		function: {
 			name: 'diagnostics',
-			description: 'Language errors/warnings for a file or workspace.',
+			description: toolDescription('diagnostics'),
 			parameters: {
 				type: 'object',
 				properties: { path: { type: 'string' } },
@@ -729,7 +803,7 @@ export const AGENT_TOOLS = [
 		type: 'function' as const,
 		function: {
 			name: 'symbols',
-			description: 'List document symbols or search workspace symbols',
+			description: toolDescription('symbols'),
 			parameters: {
 				type: 'object',
 				properties: {
@@ -743,7 +817,7 @@ export const AGENT_TOOLS = [
 		type: 'function' as const,
 		function: {
 			name: 'references',
-			description: 'Find references at a position (1-based line)',
+			description: toolDescription('references'),
 			parameters: {
 				type: 'object',
 				properties: {
@@ -759,7 +833,7 @@ export const AGENT_TOOLS = [
 		type: 'function' as const,
 		function: {
 			name: 'definition',
-			description: 'Go to definition at a position (1-based line)',
+			description: toolDescription('definition'),
 			parameters: {
 				type: 'object',
 				properties: {
@@ -775,7 +849,7 @@ export const AGENT_TOOLS = [
 		type: 'function' as const,
 		function: {
 			name: 'git_status',
-			description: 'Show git status',
+			description: toolDescription('git_status'),
 			parameters: { type: 'object', properties: {} },
 		},
 	},
@@ -783,7 +857,7 @@ export const AGENT_TOOLS = [
 		type: 'function' as const,
 		function: {
 			name: 'git_diff',
-			description: 'Show git diff',
+			description: toolDescription('git_diff'),
 			parameters: {
 				type: 'object',
 				properties: { path: { type: 'string' } },
@@ -794,7 +868,7 @@ export const AGENT_TOOLS = [
 		type: 'function' as const,
 		function: {
 			name: 'git_log',
-			description: 'Show recent git commits',
+			description: toolDescription('git_log'),
 			parameters: {
 				type: 'object',
 				properties: { count: { type: 'number' } },
@@ -805,7 +879,7 @@ export const AGENT_TOOLS = [
 		type: 'function' as const,
 		function: {
 			name: 'git_commit_msg',
-			description: 'Suggest a commit message from current changes',
+			description: toolDescription('git_commit_msg'),
 			parameters: { type: 'object', properties: {} },
 		},
 	},
@@ -813,7 +887,7 @@ export const AGENT_TOOLS = [
 		type: 'function' as const,
 		function: {
 			name: 'git_blame',
-			description: 'Git blame for a file (optional line range)',
+			description: toolDescription('git_blame'),
 			parameters: {
 				type: 'object',
 				properties: {
@@ -829,7 +903,7 @@ export const AGENT_TOOLS = [
 		type: 'function' as const,
 		function: {
 			name: 'git_conflicts',
-			description: 'List merge conflicts in the workspace.',
+			description: toolDescription('git_conflicts'),
 			parameters: {
 				type: 'object',
 				properties: { path: { type: 'string' } },
@@ -840,7 +914,7 @@ export const AGENT_TOOLS = [
 		type: 'function' as const,
 		function: {
 			name: 'wiki_read',
-			description: 'Read a project wiki doc by id (or list ids).',
+			description: toolDescription('wiki_read'),
 			parameters: {
 				type: 'object',
 				properties: { id: { type: 'string' } },
@@ -851,7 +925,7 @@ export const AGENT_TOOLS = [
 		type: 'function' as const,
 		function: {
 			name: 'wiki_write',
-			description: 'Create/update a project wiki document.',
+			description: toolDescription('wiki_write'),
 			parameters: {
 				type: 'object',
 				properties: {
@@ -868,7 +942,7 @@ export const AGENT_TOOLS = [
 		type: 'function' as const,
 		function: {
 			name: 'wiki_search',
-			description: 'Search project wiki documents',
+			description: toolDescription('wiki_search'),
 			parameters: {
 				type: 'object',
 				properties: { query: { type: 'string' } },
@@ -880,7 +954,7 @@ export const AGENT_TOOLS = [
 		type: 'function' as const,
 		function: {
 			name: 'wiki_fact',
-			description: 'Add/supersede a project fact (key/value).',
+			description: toolDescription('wiki_fact'),
 			parameters: {
 				type: 'object',
 				properties: {
@@ -896,7 +970,7 @@ export const AGENT_TOOLS = [
 		type: 'function' as const,
 		function: {
 			name: 'wiki_facts',
-			description: 'List current project facts.',
+			description: toolDescription('wiki_facts'),
 			parameters: { type: 'object', properties: {} },
 		},
 	},
@@ -904,7 +978,7 @@ export const AGENT_TOOLS = [
 		type: 'function' as const,
 		function: {
 			name: 'update_status',
-			description: 'Save handoff (objective/stoppedAt/next) before the final reply.',
+			description: toolDescription('update_status'),
 			parameters: {
 				type: 'object',
 				properties: {
@@ -926,7 +1000,7 @@ export const AGENT_TOOLS = [
 		type: 'function' as const,
 		function: {
 			name: 'browser_navigate',
-			description: 'Open a URL in the embedded browser agent (Playwright optional)',
+			description: toolDescription('browser_navigate'),
 			parameters: {
 				type: 'object',
 				properties: { url: { type: 'string' } },
@@ -938,7 +1012,7 @@ export const AGENT_TOOLS = [
 		type: 'function' as const,
 		function: {
 			name: 'browser_snapshot',
-			description: 'Capture text snapshot of the current browser page',
+			description: toolDescription('browser_snapshot'),
 			parameters: { type: 'object', properties: {} },
 		},
 	},
@@ -946,7 +1020,7 @@ export const AGENT_TOOLS = [
 		type: 'function' as const,
 		function: {
 			name: 'browser_click',
-			description: 'Click a CSS selector in the browser',
+			description: toolDescription('browser_click'),
 			parameters: {
 				type: 'object',
 				properties: { selector: { type: 'string' } },
@@ -958,7 +1032,7 @@ export const AGENT_TOOLS = [
 		type: 'function' as const,
 		function: {
 			name: 'browser_type',
-			description: 'Type into a CSS selector in the browser',
+			description: toolDescription('browser_type'),
 			parameters: {
 				type: 'object',
 				properties: {
@@ -973,7 +1047,7 @@ export const AGENT_TOOLS = [
 		type: 'function' as const,
 		function: {
 			name: 'browser_screenshot',
-			description: 'Take a full-page screenshot (saved as artifact)',
+			description: toolDescription('browser_screenshot'),
 			parameters: { type: 'object', properties: {} },
 		},
 	},
@@ -982,7 +1056,7 @@ export const AGENT_TOOLS = [
 		function: {
 			name: 'delegate_task',
 			description:
-				'Run a focused subagent. mode: explore (read-only), general (full agent), or plan.',
+				toolDescription('delegate_task'),
 			parameters: {
 				type: 'object',
 				properties: {
@@ -1001,7 +1075,7 @@ export const AGENT_TOOLS = [
 		type: 'function' as const,
 		function: {
 			name: 'mcp_call',
-			description: 'Call an MCP tool by full name (server__tool)',
+			description: toolDescription('mcp_call'),
 			parameters: {
 				type: 'object',
 				properties: {
@@ -1017,7 +1091,7 @@ export const AGENT_TOOLS = [
 		function: {
 			name: 'skill',
 			description:
-				'Load a playbook/skill by id or title. Call when you need domain conventions or a workflow. Catalog is injected at runtime.',
+				toolDescription('skill'),
 			parameters: {
 				type: 'object',
 				properties: {
@@ -1043,10 +1117,21 @@ function allAgentToolNames(mode?: AgentModeDefinition): string[] {
 	return [...new Set([...AGENT_TOOL_NAMES, ...ext])];
 }
 
-function toolsForRound(activeToolNames: Set<string>, mode?: AgentModeDefinition): typeof AGENT_TOOLS {
+function toolsForRound(
+	activeToolNames: Set<string>,
+	mode?: AgentModeDefinition,
+	modelId?: string
+): typeof AGENT_TOOLS {
 	const registry = getToolRegistry();
 	const catalog = formatSkillCatalogForTool();
-	const native = AGENT_TOOLS.filter(t => activeToolNames.has(t.function.name)).map(t => {
+	const usePatch = modelId ? modelUsesApplyPatch(modelId) : false;
+	const native = AGENT_TOOLS.filter(t => {
+		if (!activeToolNames.has(t.function.name)) return false;
+		// gpt-* (non-oss): expose apply_patch, hide edit/write. Others: hide apply_patch.
+		if (usePatch && (t.function.name === 'edit' || t.function.name === 'write')) return false;
+		if (!usePatch && t.function.name === 'apply_patch') return false;
+		return true;
+	}).map(t => {
 		if (t.function.name !== 'skill') return t;
 		return {
 			type: 'function' as const,
@@ -1305,21 +1390,18 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 	const systemBase = [
 		'You are CodeForge Agent, a coding agent inside a VS Code-based IDE on Windows.',
 		`Workspace root: ${opts.workspaceRoot ?? '(none — ask user to open a folder)'}`,
-		'Use tools to read/change files and run commands. Paths are relative to the workspace root.',
-		'For .NET use the `dotnet` tool; shell is cmd.exe (`&&` works; no PowerShell/Unix pipes).',
-		'Prefer web_search and web_fetch for HTTP. Use shell for builds/tests and only fall back to curl when those tools are unavailable.',
-		'Use todo_write for multi-step work. Use delegate_task for parallel sub-work (modes: explore | general | plan).',
-		'Long shell jobs: shell with background=true, then await_shell.',
+		'Paths are relative to the workspace root.',
+		TOOL_SYSTEM_CONTRACT,
 		'Do not ask the user for API keys already configured in CodeForge settings; never paste secrets into the chat.',
 		'Long-running servers hand off to the Agent Terminal after startup.',
-		'Use retrieve/search/read for repo context. Call `skill` for playbooks. Prefer update_status when wrapping up (harness records a stop point if you skip it).',
-		'Typical flow: retrieve/search → read the slice → edit or write → build/test.',
-		'Tool results stay in this chat. Independent reads/searches can be issued together.',
+		'Call `skill` for playbooks. Use todo_write for multi-step work. Use delegate_task for parallel sub-work (modes: explore | general | plan).',
 		vscode.workspace.getConfiguration('codeforge.ai').get<boolean>('exploreSubagent')
-			? 'For broad “where is X across the repo” questions, you may call delegate_task with mode explore (read-only). Prefer retrieve for focused lookups.'
+			? 'For broad “where is X across the repo” questions, call delegate_task with mode explore (read-only). Prefer retrieve for focused lookups.'
 			: '',
 		'The IDE runs build/test (oracle) after writes and when you finish; done when green. If blocked, reply `blocked: <reason>`.',
-		'Final reply: a short summary of what changed and how to run it.',
+		opts.planMode
+			? 'In plan mode you may reason carefully before exploring (/think).'
+			: 'On tool rounds call tools directly (/no_think).',
 		opts.forceJson
 			? 'This server expects JSON responses. Prefer native tool_calls when available; otherwise reply with ONLY JSON like {"tool_calls":[{"id":"call_1","type":"function","function":{"name":"write","arguments":{"path":"...","content":"..."}}}]} — no markdown fences.'
 			: '',
@@ -1401,6 +1483,11 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 	const recentFingerprints: string[] = [];
 	const resultCache = new Map<string, string>();
 	const readPathsSeen = new Set<string>();
+	/**
+	 * Paths read (or written) in THIS turn only — prior-session preload goes into
+	 * readPathsSeen but does not satisfy the read-before-mutate gate.
+	 */
+	const readThisTurn = new Set<string>();
 	/** Highest end line already returned per path (1-based inclusive). */
 	const readMaxEnd = new Map<string, number>();
 	const readWindows = new Map<string, Array<{ start: number; end: number }>>();
@@ -1417,17 +1504,33 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 	const touchedPaths = new Set<string>();
 	/** Paths successfully written/edited this turn — used for the project handoff. */
 	const writtenPaths = new Set<string>();
+	/**
+	 * Stage for code tasks: explore → act → verify.
+	 * Tool schemas stay identical every round (prefix cache); stage is enforced at execution.
+	 * Initialized after internal-plan resolution below.
+	 */
+	type LoopStage = 'explore' | 'act' | 'verify';
+	let useStages = false;
+	let loopStage: LoopStage = 'act';
+	let exploreReopens = 0;
+	const EXPLORE_TOOLS_STAGE = new Set(['list', 'search', 'retrieve']);
 	let emptyFinishNudges = 0;
-	/** Retries when the model narrates next steps without tool_calls. */
-	let intentContinueNudges = 0;
-	/** Retries when tools ran but the final reply has no findings. */
-	let thinFinalNudges = 0;
 	let statusUpdated = false;
 	let turnOutcome: StatusOutcome = 'done';
 	let turnBlockedReason = '';
 	let handoffDone = false;
 	/** Extra retries when completion hits max_tokens (~8192) without a tool call. */
 	let lengthTruncationNudges = 0;
+	/** Caps step-=1 refunds so repair/overflow paths cannot spin forever. */
+	let refundedSteps = 0;
+	const MAX_REFUNDED_STEPS = 12;
+	/** Tool steps that only hit cache / soft memory / blocks (no fresh I/O). */
+	let consecutiveNoopToolSteps = 0;
+	/** Identical tool fingerprint batches in a row. */
+	let consecutiveSameBatch = 0;
+	let lastToolBatchKey = '';
+	/** Explore-only steps without a write/shell since last mutate. */
+	let exploreOnlySteps = 0;
 	/** Retries when gateway rejects truncated tool-call JSON (common with large writes). */
 	let truncatedToolRetries = 0;
 	/** Retries when model dumps tool JSON in content but parse fails. */
@@ -1478,7 +1581,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 		trace?.info('oracle', `${result.ok ? 'green' : 'red'} ${reason} ${result.commands.join(' → ')}`);
 		opts.onActivity?.({
 			kind: 'checkpoint',
-			label: `Oracle ${result.ok ? 'verde' : 'vermelho'}`,
+			label: `Oracle ${result.ok ? 'green' : 'red'}`,
 			detail: result.ok
 				? result.commands.join(' → ')
 				: [...result.errors.slice(0, 3).map(e => `${e.code} ${e.file}:${e.line}`), ...result.failedTests.slice(0, 3)].join(' | '),
@@ -1607,6 +1710,80 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 	}
 	let systemBaseWithPacket =
 		typeof messages[0]?.content === 'string' ? messages[0].content : system;
+	// Model-only scaffold plan under .CodeForge/plans (not shown in chat).
+	// Scoped to session/task — never inject a stale plan from an unrelated task.
+	let activeInternalPlan: InternalPlan | undefined;
+	if (opts.workspaceRoot && !opts.planMode && !opts.askMode && !opts.isolated) {
+		try {
+			activeInternalPlan = await resolveCurrentPlan(opts.workspaceRoot, {
+				task: opts.task,
+				sessionId: opts.sessionId,
+			});
+			if (!activeInternalPlan && looksLikeScaffoldTask(opts.task)) {
+				// Title-only seed; try one no-tools LLM call for items+paths.
+				activeInternalPlan = await ensureScaffoldPlan(
+					opts.workspaceRoot,
+					opts.task,
+					opts.sessionId
+				);
+				try {
+					const planPrompt = [
+						'Return ONLY JSON (no markdown) with this shape:',
+						'{"items":[{"title":"...","paths":["rel/path",...]}]}',
+						'At most 8 items. Paths are optional; omit paths when unknown.',
+						`Task: ${opts.task.slice(0, 800)}`,
+					].join('\n');
+					const planRound = await postAgentRound(
+						opts,
+						`${(opts.baseUrl || defaultBase(opts.provider)).replace(/\/$/, '')}/chat/completions`,
+						[
+							{ role: 'system', content: 'You decompose scaffold tasks into ordered file slices. Reply with JSON only.' },
+							{ role: 'user', content: planPrompt },
+						],
+						1024,
+						[],
+						'none'
+					);
+					if (planRound.ok) {
+						const raw = coerceMessageContent(planRound.data.choices?.[0]?.message?.content);
+						const items = parseScaffoldPlanJson(raw);
+						if (items?.length) {
+							activeInternalPlan = await createInternalPlan(opts.workspaceRoot, {
+								task: opts.task,
+								sessionId: opts.sessionId,
+								items,
+							});
+						}
+					}
+				} catch {
+					/* keep title-only seed */
+				}
+			}
+			if (activeInternalPlan) {
+				const block = formatPlanForPrompt(activeInternalPlan);
+				systemBaseWithPacket = `${systemBaseWithPacket}\n\n${block}`;
+				if (messages[0]?.role === 'system') {
+					messages[0] = { role: 'system', content: systemBaseWithPacket };
+				}
+			}
+		} catch {
+			/* best-effort */
+		}
+	}
+	void cleanupToolOutputSpill(opts.workspaceRoot);
+	useStages =
+		!opts.planMode &&
+		!opts.askMode &&
+		!opts.coachMode &&
+		!opts.isolated &&
+		(isCodingTask(opts.task) || !!activeInternalPlan);
+	loopStage =
+		useStages &&
+		activeInternalPlan?.items.some(i => i.status === 'pending' && (i.paths?.length ?? 0) > 0)
+			? 'act'
+			: useStages
+				? 'explore'
+				: 'act';
 	const contextBudget = getContextBudget(opts.numCtx);
 	let toolCap = toolResultCharCap(contextBudget);
 	const exploreSubagentOn =
@@ -1681,7 +1858,16 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 	};
 
 	try {
-		for (let step = 0; step < stepBudget; step++) {
+		let step = 0;
+		/** Why the main tool loop ended (budget vs anti-loop). */
+		let loopExit: 'budget' | 'stuck' | undefined;
+		const tryRefundContinue = (): boolean => {
+			if (refundedSteps >= MAX_REFUNDED_STEPS) return false;
+			refundedSteps += 1;
+			step -= 1;
+			return true;
+		};
+		for (; step < stepBudget; step++) {
 			if (opts.cancelled() || opts.abortSignal?.aborted) {
 				opts.onTaskUpdate?.({
 					id: taskId,
@@ -1789,12 +1975,25 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 				sm.transition('executing');
 			} else if (tokEst > midCompactAt) {
 				sm.transition('compacting');
-				opts.onActivity?.({ kind: 'compact', label: 'Mid compact (summarize old turns)…' });
-				messages = midCompactMessages(
-					messages as Parameters<typeof midCompactMessages>[0],
+				opts.onActivity?.({ kind: 'compact', label: 'Mid compact (structured summary)…' });
+				const structured = await tryStructuredMidCompact(
+					opts,
+					url,
+					messages,
 					systemBaseWithPacket,
-					{ readLedger: buildReadLedger() }
-				) as ChatMessage[];
+					buildReadLedger(),
+					activeInternalPlan
+						? formatPlanForPrompt(activeInternalPlan).slice(0, 400)
+						: undefined,
+					toolsForRound(activeToolNames, agentMode, opts.model)
+				);
+				messages = structured
+					? (structured as ChatMessage[])
+					: (midCompactMessages(
+							messages as Parameters<typeof midCompactMessages>[0],
+							systemBaseWithPacket,
+							{ readLedger: buildReadLedger() }
+						) as ChatMessage[]);
 				sm.transition('executing');
 			} else if (
 				tokEst > softCompactAt ||
@@ -1844,6 +2043,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 			const llmStart = Date.now();
 			normalizeToolProtocolHistory(messages as Parameters<typeof normalizeToolProtocolHistory>[0]);
 			const sentTokenEstimate = estimateTokens(messages);
+			if (useStages && loopStage === 'explore' && step >= 3) loopStage = 'act';
 			phase = opts.basePhase
 				? opts.basePhase === 'implement' && gates.buildRed
 					? 'fix'
@@ -1877,7 +2077,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 				url,
 				sanitizeMessages(messages),
 				completionCap,
-				toolsForRound(activeToolNames, agentMode)
+				toolsForRound(activeToolNames, agentMode, opts.model)
 			);
 			if (!round.ok) {
 				const errText = round.errorText;
@@ -1918,8 +2118,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 						label: `Context overflow — compact + retry ${contextOverflowRetries}/2`,
 						detail: errText.slice(0, 200),
 					});
-					step -= 1;
-					continue;
+					if (tryRefundContinue()) continue;
 				}
 				if (round.status === 408 || /timeout|timed out|cancelled/i.test(errText)) {
 					opts.onActivity?.({
@@ -1944,8 +2143,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 						label: 'Repaired tool history',
 						detail: errText.slice(0, 200),
 					});
-					step -= 1;
-					continue;
+					if (tryRefundContinue()) continue;
 				}
 				// Models like CodeGemma reject native tools — switch the whole loop to prose JSON tools.
 				// Never for native Anthropic or for broken tool-history protocol errors.
@@ -1972,26 +2170,43 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 						label: 'Switched to prose tool mode',
 						detail: `${opts.model}: ${errText.slice(0, 180)}`,
 					});
-					step -= 1;
-					continue;
+					if (tryRefundContinue()) continue;
 				}
-				if (isTruncatedToolCallError(round.status, errText) && truncatedToolRetries < 3) {
+				if (isTruncatedToolCallError(round.status, errText)) {
 					truncatedToolRetries += 1;
-					messages.push({
-						role: 'user',
-						content: [
-							'The gateway rejected your last tool call: its JSON arguments were incomplete (usually a long write.content cut off).',
-							'Repeat it smaller: change an existing file with edit, or write a new file in parts.',
-						].join('\n'),
-					});
-					opts.onStatus?.('Truncated tool JSON — asking for a smaller write…');
+					const note =
+						truncatedToolRetries >= 3
+							? TRUNCATED_TOOL_JSON_FINAL_NOTE
+							: TRUNCATED_TOOL_JSON_NOTE;
+					messages.push({ role: 'user', content: note });
+					opts.onStatus?.(
+						truncatedToolRetries >= 3
+							? 'Invalid tool JSON — last retry with a tiny edit…'
+							: 'Invalid tool JSON — asking for a smaller edit…'
+					);
 					opts.onActivity?.({
 						kind: 'checkpoint',
-						label: 'Retry: truncated tool JSON',
-						detail: errText.slice(0, 200),
+						label: `Retry: invalid tool JSON (${truncatedToolRetries}/4)`,
+						detail: errText.slice(0, 240),
 					});
-					step -= 1;
-					continue;
+					if (truncatedToolRetries <= 4) {
+						if (tryRefundContinue()) continue;
+						continue;
+					}
+					turnOutcome = 'error';
+					opts.onTaskUpdate?.({
+						id: taskId,
+						name: truncateHistory(opts.task, 60),
+						status: 'failed',
+						result: 'truncated tool JSON',
+						elapsed: Date.now() - started,
+					});
+					return [
+						'Stopped: the model kept sending incomplete/invalid tool JSON (usually an edit/write that was too large or mixed with XML).',
+						'Ask to continue and specify a small patch (one function), or break the change into steps.',
+						'',
+						summarizeActionsForLlm(actions),
+					].join('\n');
 				}
 				if (isBrokenToolHistoryError(round.status, errText) && !compactedOnce) {
 					compactedOnce = true;
@@ -2009,8 +2224,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 						messages as Parameters<typeof normalizeToolProtocolHistory>[0]
 					);
 					opts.onStatus?.('Gateway lost context — retrying with compacted history…');
-					step -= 1;
-					continue;
+					if (tryRefundContinue()) continue;
 				}
 				if (isBrokenToolHistoryError(round.status, errText) && !historyNukeOnce) {
 					historyNukeOnce = true;
@@ -2032,8 +2246,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 						label: 'Nuked broken tool history',
 						detail: errText.slice(0, 200),
 					});
-					step -= 1;
-					continue;
+					if (tryRefundContinue()) continue;
 				}
 				if (isBrokenToolHistoryError(round.status, errText)) {
 					if (isNativeAnthropic(opts)) {
@@ -2092,15 +2305,15 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 			// Some local models put text in alternate fields or return huge empty generations
 			const alt = msg as Record<string, unknown>;
 			let content = coerceMessageContent(msg.content);
-			if (!content) {
-				content = coerceMessageContent(alt.reasoning) || coerceMessageContent(alt.thinking);
-			}
+			const split = splitThinkContent(content);
+			content = split.content;
+			const thoughtFromFields =
+				coerceMessageContent(alt.reasoning_content) ||
+				coerceMessageContent(alt.reasoning) ||
+				coerceMessageContent(alt.thinking);
+			const thoughtRaw = (split.reasoning || thoughtFromFields || '').trim();
 			content = content.trim();
 
-			const thoughtRaw =
-				(typeof alt.reasoning === 'string' && alt.reasoning) ||
-				(typeof alt.thinking === 'string' && alt.thinking) ||
-				'';
 			if (thoughtRaw && thoughtRaw !== content) {
 				turnReasoningParts.push(String(thoughtRaw));
 				opts.onActivity?.({
@@ -2149,13 +2362,15 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 							'{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"write","arguments":{"path":"hello.txt","content":"Hello, World!"}}}]}',
 						].join('\n'),
 					});
-					step -= 1;
-					continue;
+					if (tryRefundContinue()) continue;
 				}
 			}
 
-			// When tools came from prose JSON, don't keep the raw JSON as assistant chat content
-			const assistantContent = toolCalls.length && looksLikeToolJson(content) ? '' : content;
+			// When tools came from prose JSON, don't keep the raw JSON as assistant chat content.
+			// Never keep <think> / CoT in the message history (bloats the next round).
+			const assistantContent = stripThinkBlocks(
+				toolCalls.length && looksLikeToolJson(content) ? '' : content
+			);
 
 			if (!toolCalls.length) {
 				const trivial = isTrivialAssistantContent(content);
@@ -2164,78 +2379,38 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					tokensOut >= 7500 ||
 					(content.length >= 12000 && !looksLikeToolJson(content));
 
-				// Completion budget ran out mid-answer: a technical event, so say so and continue.
-				if (hitLengthCap && lengthTruncationNudges < 5 && step + 1 <= stepBudget) {
+				// Completion budget ran out mid-answer: at most 2 continuations (opencode-style).
+				if (hitLengthCap && lengthTruncationNudges < 2 && step + 1 <= stepBudget) {
 					lengthTruncationNudges += 1;
 					messages.push({ role: 'assistant', content: clipData(content || '(truncated)', 1500) });
 					const note = LENGTH_CAP_NOTE;
 					trace?.info('harness', String(note.length));
 					messages.push({ role: 'user', content: note });
-					opts.onStatus?.(`Truncated reply (max_tokens) — continuing (${lengthTruncationNudges}/5)…`);
+					opts.onStatus?.(`Truncated reply (max_tokens) — continuing (${lengthTruncationNudges}/2)…`);
 					opts.onActivity?.({
 						kind: 'checkpoint',
 						label: 'Truncated completion — retry tools',
 						detail: `finish_reason=${finishReason || '?'} tokensOut=${tokensOut}`,
 					});
-					step -= 1;
-					continue;
+					if (tryRefundContinue()) continue;
+				}
+				if (hitLengthCap && lengthTruncationNudges >= 2) {
+					loopExit = 'stuck';
+					opts.onActivity?.({
+						kind: 'checkpoint',
+						label: 'Stopped after length truncations',
+						detail: '2 continuations exhausted',
+					});
+					break;
 				}
 
-				// Empty/trivial finish: always nudge (including after helper writes) — then accept.
+				// Empty/trivial finish: one protocol retry, then accept (not an intent crutch).
 				if ((!content || trivial) && emptyFinishNudges < 2 && step + 1 < stepBudget) {
 					emptyFinishNudges += 1;
 					const note = EMPTY_TURN_NOTE;
 					trace?.info('harness', String(note.length));
 					messages.push({ role: 'assistant', content: content || '(empty)' });
 					messages.push({ role: 'user', content: note });
-					continue;
-				}
-
-				// Narrated intent without tools ("Vou listar…") — do not treat as final.
-				if (
-					content &&
-					!trivial &&
-					looksLikeIncompleteIntent(content) &&
-					intentContinueNudges < 2 &&
-					step + 1 < stepBudget
-				) {
-					intentContinueNudges += 1;
-					const note = INTENT_CONTINUE_NOTE;
-					trace?.info('harness', String(note.length));
-					messages.push({ role: 'assistant', content: content });
-					messages.push({ role: 'user', content: note });
-					opts.onStatus?.(
-						`Continuing — model narrated without tools (${intentContinueNudges}/2)…`
-					);
-					opts.onActivity?.({
-						kind: 'checkpoint',
-						label: 'Incomplete intent — retry tools',
-						detail: content.slice(0, 160),
-					});
-					continue;
-				}
-
-				// Tools ran but the reply is too thin to be the answer (e.g. wrote a helper and stopped).
-				if (
-					content &&
-					!trivial &&
-					looksLikeThinFinal(content, actions.length > 0) &&
-					thinFinalNudges < 2 &&
-					step + 1 < stepBudget
-				) {
-					thinFinalNudges += 1;
-					const note = THIN_FINAL_NOTE;
-					trace?.info('harness', String(note.length));
-					messages.push({ role: 'assistant', content: content });
-					messages.push({ role: 'user', content: note });
-					opts.onStatus?.(
-						`Continuing — thin final after tools (${thinFinalNudges}/2)…`
-					);
-					opts.onActivity?.({
-						kind: 'checkpoint',
-						label: 'Thin final — ask for findings',
-						detail: content.slice(0, 160),
-					});
 					continue;
 				}
 
@@ -2318,7 +2493,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 								: note,
 						});
 						opts.onStatus?.(
-							`Oracle vermelho — a continuar (${oracleRejections}/${MAX_ORACLE_REJECTIONS})…`
+							`Oracle red — continuing (${oracleRejections}/${MAX_ORACLE_REJECTIONS})…`
 						);
 						continue;
 					}
@@ -2444,7 +2619,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 				) {
 					const rounds = await readRoundResults(opts.workspaceRoot);
 					if (shouldRunCoach(rounds)) {
-						opts.onStatus?.('Coach: a atualizar how-to-work…');
+						opts.onStatus?.('Coach: updating how-to-work…');
 						opts.onActivity?.({
 							kind: 'checkpoint',
 							label: 'Method coach',
@@ -2481,8 +2656,6 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 			});
 			lengthTruncationNudges = 0;
 			emptyFinishNudges = 0;
-			intentContinueNudges = 0;
-			thinFinalNudges = 0;
 
 			const exploreTools = new Set([
 				'read',
@@ -2496,6 +2669,10 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 
 			/** User nudges deferred until all tool_results for this turn are present (all providers). */
 			const pendingNudges: string[] = [];
+			/** Fresh I/O this step (not cache / soft-hit / refuse). */
+			let stepFreshIo = false;
+			const stepFingerprints: string[] = [];
+			let stepHadMutate = false;
 
 			/** Read-only tools from one model step. I/O overlaps; results commit in call order. */
 			interface ParallelIoJob {
@@ -2646,13 +2823,64 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 						}
 					}
 				}
-				if ((name === 'write' || name === 'edit') && success) {
+				if ((name === 'write' || name === 'edit' || name === 'apply_patch') && success) {
 					gates.onSuccessfulWrite(args.path);
 					successfulWriteCount += 1;
 					writesSinceOracle += 1;
 					if (typeof args.path === 'string' && args.path.trim()) {
-						writtenPaths.add(args.path.replace(/\\/g, '/'));
+						const wp = args.path.replace(/\\/g, '/');
+						writtenPaths.add(wp);
+						const pk = canonicalizePathKey(wp);
+						if (pk) readThisTurn.add(pk);
 					}
+					if (useStages && loopStage === 'act') loopStage = 'verify';
+					if (opts.workspaceRoot && writtenPaths.size) {
+						void advancePlanAfterWrites(opts.workspaceRoot, writtenPaths, {
+							task: opts.task,
+							sessionId: opts.sessionId,
+						}).then(p => {
+							if (p) {
+								activeInternalPlan = p;
+								if (useStages && p.items.some(i => i.status === 'pending')) {
+									loopStage = 'act';
+									// Re-inject plan into system message after slice advance.
+									if (messages[0]?.role === 'system') {
+										const base = systemBaseWithPacket.replace(
+											/\n\n### Internal build plan[\s\S]*$/,
+											''
+										);
+										const block = formatPlanForPrompt(p);
+										systemBaseWithPacket = `${base}\n\n${block}`;
+										messages[0] = { role: 'system', content: systemBaseWithPacket };
+									}
+								}
+							}
+						});
+					}
+				}
+				// Stale old_string: clear read-this-turn so the next edit must re-read (tool result already explains).
+				if (
+					(name === 'edit' || name === 'apply_patch') &&
+					!success &&
+					/old_string was not found|hunk \d+:|context not found/i.test(output)
+				) {
+					const pk = canonicalizePathKey(String(args.path ?? ''));
+					if (pk) readThisTurn.delete(pk);
+				}
+				if (name === 'read' && success) {
+					const pk = canonicalizePathKey(String(args.path ?? ''));
+					if (pk) readThisTurn.add(pk);
+				}
+				if (
+					name === 'read' &&
+					!success &&
+					/FILE_NOT_FOUND/i.test(output) &&
+					useStages &&
+					loopStage !== 'explore' &&
+					exploreReopens < 2
+				) {
+					loopStage = 'explore';
+					exploreReopens += 1;
 				}
 				if (name === 'delete' || name === 'rename') {
 					if (success) successfulWriteCount += 1;
@@ -2727,7 +2955,11 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 
 				if (name === 'read' && pathKey && success) {
 					readPathsSeen.add(pathKey);
+					readThisTurn.add(pathKey);
 					readsWhileRed = gates.buildRed ? readsWhileRed + 1 : 0;
+					if (useStages && loopStage === 'explore' && readThisTurn.size >= 2) {
+						loopStage = 'act';
+					}
 					const parsed = parseReadCoverage(output);
 					const endLine = parsed?.end ?? readStart + readLimit - 1;
 					const startLine = parsed?.start ?? readStart;
@@ -2769,13 +3001,23 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 
 				if (name === 'retrieve' && success) {
 					output = annotateRetrieveWithReadMemory(output, readPathsSeen, readMaxEnd);
+					if (useStages && loopStage === 'explore') loopStage = 'act';
+				}
+				if (name === 'search' && success && useStages && loopStage === 'explore') {
+					loopStage = 'act';
 				}
 
 				messages.push({
 					role: 'tool',
 					tool_call_id: call.id,
 					name,
-					content: clipToolOutput(name, output, toolCap + 400),
+					content: await clipWithSpill(
+						opts.workspaceRoot,
+						name,
+						output,
+						toolCap + 400,
+						clipToolOutput
+					),
 				});
 			};
 
@@ -2897,6 +3139,8 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 				}
 
 				const fingerprint = toolFingerprint(name, args);
+				stepFingerprints.push(fingerprint);
+				if (!exploreTools.has(name)) stepHadMutate = true;
 				const priorCount = recentFingerprints.filter(f => f === fingerprint).length;
 				recentFingerprints.push(fingerprint);
 				if (recentFingerprints.length > 40) {
@@ -2993,6 +3237,30 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					consecutiveToolFails += 1;
 					continue;
 				}
+				// Identical edit/write/apply_patch that already failed (or duplicate in this step batch).
+				const dupInStep =
+					stepFingerprints.filter(f => f === fingerprint).length >= 2;
+				if (
+					(priorFails >= 1 || dupInStep) &&
+					(name === 'edit' || name === 'write' || name === 'apply_patch')
+				) {
+					const pk = canonicalizePathKey(String(args.path ?? ''));
+					if (pk) readThisTurn.delete(pk);
+					// Treat as failed so later identical calls in this run stay blocked.
+					failedFingerprints.set(fingerprint, Math.max(priorFails, 1));
+					const refusal = [
+						`Not run: this exact ${name} already failed in this run (same arguments).`,
+						pk
+							? `Call read on ${args.path} again (fresh this turn), copy the EXACT bytes into old_string, then edit with a shorter unique span.`
+							: 'Re-read the target file and retry with different arguments.',
+						'Do not repeat the same old_string/new_string. If the change is already present in the file, move on.',
+					].join('\n');
+					await flushLane();
+					messages.push({ role: 'tool', tool_call_id: call.id, name, content: refusal });
+					actions.push(`${name} blocked (failed-repeat)`);
+					consecutiveToolFails += 1;
+					continue;
+				}
 
 				if (cached && priorCount >= 1 && isReadonly) {
 					await flushLane();
@@ -3064,35 +3332,40 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 				});
 
 				if (MUTATING.has(name) && !gateApproved) {
-					if (opts.sessionId && opts.sessionStore) {
-						await opts.sessionStore.createCheckpoint(
-							opts.sessionId,
-							`approval:${name}`,
-							{ name, arguments: args },
-							{ pause: false }
-						);
-					}
-					const approval = await ApprovalDialog.show({
-						tool: name,
-						arguments: summarizeArgs(name, args),
-						risk: name === 'shell' || name === 'delete' ? 'high' : 'medium',
-						reason: describeMutation(name, args),
-					});
-					trace?.record({
-						type: 'approval',
-						label: name,
-						detail: approval.approved ? 'approved' : 'denied',
-					});
-					if (!approval.approved) {
-						await flushLane();
-						messages.push({
-							role: 'tool',
-							tool_call_id: call.id,
-							name,
-							content: `Denied by user: ${name}`,
+					const policy = getApprovalPolicy();
+					if (policy.isAutoApproved(name)) {
+						/* Allow all / auto-approve — no HITL checkpoint */
+					} else {
+						if (opts.sessionId && opts.sessionStore) {
+							await opts.sessionStore.createCheckpoint(
+								opts.sessionId,
+								`approval:${name}`,
+								{ name, arguments: args },
+								{ pause: false }
+							);
+						}
+						const approval = await ApprovalDialog.show({
+							tool: name,
+							arguments: summarizeArgs(name, args),
+							risk: name === 'shell' || name === 'delete' ? 'high' : 'medium',
+							reason: describeMutation(name, args),
 						});
-						actions.push(`${name} denied`);
-						continue;
+						trace?.record({
+							type: 'approval',
+							label: name,
+							detail: approval.approved ? 'approved' : 'denied',
+						});
+						if (!approval.approved) {
+							await flushLane();
+							messages.push({
+								role: 'tool',
+								tool_call_id: call.id,
+								name,
+								content: `Denied by user: ${name}`,
+							});
+							actions.push(`${name} denied`);
+							continue;
+						}
 					}
 				}
 
@@ -3153,7 +3426,77 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					continue;
 				}
 
-				if (name === 'write' || name === 'delete' || name === 'rename') {
+				// Stage enforcement (stable tool schemas — refuse at execution).
+				const explorationClosed = useStages && loopStage !== 'explore';
+				if (explorationClosed && EXPLORE_TOOLS_STAGE.has(name)) {
+					await flushLane();
+					messages.push({
+						role: 'tool',
+						tool_call_id: call.id,
+						name,
+						content: [
+							`Not run: exploration is closed for this step (stage=${loopStage}).`,
+							'Edit focus paths, or call delegate_task (mode explore) with a precise question.',
+						].join('\n'),
+					});
+					actions.push(`${name} blocked (stage ${loopStage})`);
+					continue;
+				}
+
+				// Path gate for scaffold slices (only when current item lists paths).
+				if (
+					(name === 'write' || name === 'edit' || name === 'apply_patch') &&
+					activeInternalPlan &&
+					!pathAllowedByPlan(activeInternalPlan, String(args.path ?? ''))
+				) {
+					const item = activeInternalPlan.items.find(i => i.status === 'pending');
+					await flushLane();
+					messages.push({
+						role: 'tool',
+						tool_call_id: call.id,
+						name,
+						content: `Not run: current slice allows only ${(item?.paths ?? []).join(', ') || '(none)'}. Finish that item before other paths.`,
+					});
+					actions.push(`${name} blocked (plan path gate)`);
+					continue;
+				}
+
+				// Hard read-before-mutate gate (this turn only).
+				if (name === 'edit' || name === 'apply_patch') {
+					const pk = canonicalizePathKey(String(args.path ?? ''));
+					if (pk && !readThisTurn.has(pk)) {
+						await flushLane();
+						messages.push({
+							role: 'tool',
+							tool_call_id: call.id,
+							name,
+							content: `Not run: read ${args.path} first this turn, then ${name}.`,
+						});
+						actions.push(`${name} blocked (read-this-turn gate)`);
+						continue;
+					}
+				}
+				if (name === 'write') {
+					const pk = canonicalizePathKey(String(args.path ?? ''));
+					const alreadySeen =
+						pk &&
+						(readPathsSeen.has(pk) ||
+							[...readPathsSeen].some(k => k === pk || k.endsWith('/' + pk)));
+					// Overwrite of an existing/previously-seen file requires a read this turn.
+					if (pk && alreadySeen && !readThisTurn.has(pk)) {
+						await flushLane();
+						messages.push({
+							role: 'tool',
+							tool_call_id: call.id,
+							name,
+							content: `Not run: read ${args.path} first this turn before overwriting with write.`,
+						});
+						actions.push(`${name} blocked (read-this-turn gate)`);
+						continue;
+					}
+				}
+
+				if (name === 'write' || name === 'delete' || name === 'rename' || name === 'apply_patch') {
 					gates.markMutatingWriteAllowed();
 				}
 
@@ -3200,7 +3543,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					}
 				}
 
-				if (name === 'write' || name === 'edit') {
+				if (name === 'write' || name === 'edit' || name === 'apply_patch') {
 					const policy = getApprovalPolicy();
 					const previewEdits =
 						vscode.workspace.getConfiguration('codeforge.ai').get<boolean>('previewEdits') ===
@@ -3215,6 +3558,18 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 								? undefined
 								: applyEdit(current, String(args.old_string ?? ''), String(args.new_string ?? ''), args.replace_all === true);
 						previewArgs = applied?.ok ? { path: args.path, content: applied.text } : undefined;
+					}
+					if (name === 'apply_patch') {
+						const patchBody = String(args.patch ?? args.patchText ?? '');
+						const parsed = parsePatch(patchBody);
+						if (parsed.ok && parsed.hunks.length === 1 && parsed.hunks[0]!.type === 'update') {
+							const hunk = parsed.hunks[0]!;
+							const current = await opts.bridge.readRaw(hunk.path);
+							const applied = applyPatchHunk(hunk, () => current);
+							previewArgs = applied.ok
+								? { path: hunk.movePath || hunk.path, content: applied.text }
+								: undefined;
+						}
 					}
 					if (previewArgs && previewEdits && !policy.isAutoApproved('write')) {
 						const ok = await maybeShowWriteDiff(opts.bridge, previewArgs);
@@ -3231,6 +3586,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					}
 				}
 
+				stepFreshIo = true;
 				const job: ParallelIoJob = {
 					call,
 					name,
@@ -3256,10 +3612,49 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 
 			await flushLane();
 
-			// Flush deferred nudges only after every tool_result for this assistant turn exists.
+			const batchKey = stepFingerprints.slice().sort().join('\0');
+			if (batchKey && batchKey === lastToolBatchKey) {
+				consecutiveSameBatch += 1;
+			} else {
+				consecutiveSameBatch = 0;
+				lastToolBatchKey = batchKey;
+			}
+			if (stepFreshIo) {
+				consecutiveNoopToolSteps = 0;
+			} else {
+				consecutiveNoopToolSteps += 1;
+			}
+			if (stepHadMutate) {
+				exploreOnlySteps = 0;
+			} else if (toolCalls.some(tc => exploreTools.has(tc.function.name))) {
+				exploreOnlySteps += 1;
+			}
+			// Flush any remaining deferred notes (oracle / protocol) after tool_results.
 			for (const nudge of pendingNudges) {
 				trace?.info('harness', String(nudge.length));
 				messages.push({ role: 'user', content: nudge });
+			}
+
+			// Hard stop when tools loop without progress — no coaching nudges.
+			const stuckHard =
+				(consecutiveNoopToolSteps >= 6 ||
+					consecutiveSameBatch >= 5 ||
+					exploreOnlySteps >= 20) &&
+				step >= 5;
+			if (stuckHard) {
+				loopExit = 'stuck';
+				opts.onActivity?.({
+					kind: 'checkpoint',
+					label: 'Stopped tool loop',
+					detail:
+						consecutiveNoopToolSteps >= 6
+							? 'repeated cache-only tools'
+							: consecutiveSameBatch >= 5
+								? 'identical tool batch repeated'
+								: 'explore-only streak',
+				});
+				opts.onStatus?.('Tools stuck — final status without tools…');
+				break;
 			}
 
 			// Oracle after a batch of writes: the project's build/test speaks instead of advice text.
@@ -3297,6 +3692,65 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 			}
 		}
 
+		if (!loopExit) loopExit = 'budget';
+		const stepsUsed = Math.min(step + 1, stepBudget);
+
+		// Stuck: final prose turn. Keep tool schemas (prefix-cache) but force tool_choice none.
+		if (loopExit === 'stuck') {
+			messages.push({
+				role: 'user',
+				content: STUCK_WRAP_PROMPT,
+			});
+			opts.onStatus?.('Tools were stuck — final status without tools…');
+			try {
+				const wrap = await postAgentRound(
+					opts,
+					url,
+					sanitizeMessages(messages),
+					2048,
+					toolsForRound(activeToolNames, agentMode, opts.model),
+					'none'
+				);
+				if (wrap.ok) {
+					const msg = wrap.data.choices?.[0]?.message;
+					const raw = coerceMessageContent(msg?.content);
+					const split = splitThinkContent(raw);
+					let answer = (split.content || raw).trim();
+					// If the model still emitted tool_calls, ignore explore and only keep a short edit intent in prose.
+					if ((!answer || looksLikeToolJson(answer)) && msg?.tool_calls?.length) {
+						const names = msg.tool_calls.map(t => t.function.name).join(', ');
+						answer = `I still tried to call tools (${names}) after being told to stop. Name one file and the exact change for the next turn.`;
+					}
+					if (answer) {
+						turnOutcome = 'done';
+						opts.onTaskUpdate?.({
+							id: taskId,
+							name: truncateHistory(opts.task, 60),
+							status: 'completed',
+							result: truncateHistory(answer, 120),
+							elapsed: Date.now() - started,
+						});
+						return answer;
+					}
+				}
+			} catch {
+				/* fall through */
+			}
+			turnOutcome = 'max-steps';
+			opts.onTaskUpdate?.({
+				id: taskId,
+				name: truncateHistory(opts.task, 60),
+				status: 'failed',
+				result: 'stuck tools',
+				elapsed: Date.now() - started,
+			});
+			return [
+				'Stopped: tools were repeating without new progress.',
+				summarizeActionsForLlm(actions),
+				'Tip: restate a concrete next step (file + change), not just “continue”.',
+			].join('\n\n');
+		}
+
 		opts.onTaskUpdate?.({
 			id: taskId,
 			name: truncateHistory(opts.task, 60),
@@ -3308,7 +3762,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 
 		let finalSummary = '';
 		try {
-			opts.onStatus?.('Hard cap — asking for a final summary…');
+			opts.onStatus?.('Step budget exhausted — asking for a final summary…');
 			const base = (opts.baseUrl || defaultBase(opts.provider)).replace(/\/$/, '');
 			const res = await fetch(`${base}/chat/completions`, {
 				method: 'POST',
@@ -3360,13 +3814,20 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 			statusFallback = (saved ? formatStatusForPrompt(saved) : emptyStatusPrompt()) + '\n\n';
 		}
 
+		const noProgress = actions.length === 0 || /writes=0/.test(summarizeActionsForLlm(actions));
 		return (
 			statusFallback +
-			`Reached max tool steps (${stepBudget}/${hardCap}) without finishing tools.\n\n` +
+			`Reached max tool steps (${stepsUsed}/${hardCap}) without finishing tools` +
+			(activeInternalPlan
+				? ` (slice ${activeInternalPlan.items.filter(i => i.status === 'done').length + 1}/${activeInternalPlan.items.length})`
+				: '') +
+			`.\n\n` +
 			(finalSummary ? `${finalSummary}\n\n` : '') +
 			`${summarizeActionsForLlm(actions)}\n` +
 			(reviewLog.length ? `Last checkpoint: ${reviewLog[reviewLog.length - 1]}\n\n` : '') +
-			`Tip: ask to continue, or break the task into smaller steps.`
+			(noProgress
+				? `Tip: “continue” alone will not help — say the concrete next step (file + change).`
+				: `Tip: ask to continue with a specific next step, or break the task into smaller pieces.`)
 		);
 	} catch (err) {
 		turnOutcome = 'error';
@@ -3804,6 +4265,93 @@ async function maybeShowWriteDiff(
 
 /** Soft/mid compact helpers live in ./toolHistory (pure, unit-tested). */
 
+/** Mid-loop structured compaction; returns undefined to fall back to mechanical digest. */
+async function tryStructuredMidCompact(
+	opts: AgentLoopOptions,
+	openaiUrl: string,
+	previous: ChatMessage[],
+	systemContent: string,
+	readLedger: string,
+	planHint: string | undefined,
+	tools: typeof AGENT_TOOLS
+): Promise<ChatMessage[] | undefined> {
+	try {
+		const hasCheckpoint = previous.some(
+			m => m.role === 'user' && /### Checkpoint \(compacted context\)/.test(contentToPlainText(m.content))
+		);
+		const digestSource = previous
+			.slice(1, Math.max(1, previous.length - 10))
+			.map(m => {
+				const text = contentToPlainText(m.content);
+				if (m.role === 'tool') {
+					return `tool:${m.name || '?'}: ${clipToolOutput(m.name || '', text, 400)}`;
+				}
+				if (m.role === 'assistant' && m.tool_calls?.length) {
+					return `assistant tools: ${m.tool_calls.map(t => t.function.name).join(', ')}`;
+				}
+				return `${m.role}: ${clipData(text, 500)}`;
+			})
+			.join('\n');
+		const prompt = buildCompactionPrompt({ update: hasCheckpoint, planHint });
+		const round = await postAgentRound(
+			opts,
+			openaiUrl,
+			[
+				{ role: 'system', content: 'You write structured checkpoints for coding agents. No tools.' },
+				{
+					role: 'user',
+					content: `Task: ${opts.task}\n\nOlder turns:\n${clipData(digestSource, 8000)}\n\n${prompt}`,
+				},
+			],
+			1200,
+			tools,
+			'none'
+		);
+		if (!round.ok) return undefined;
+		let summary = coerceMessageContent(round.data.choices?.[0]?.message?.content).trim();
+		if (!looksLikeStructuredSummary(summary)) {
+			const retry = await postAgentRound(
+				opts,
+				openaiUrl,
+				[
+					{ role: 'system', content: 'You write structured checkpoints for coding agents. No tools.' },
+					{ role: 'user', content: `Task: ${opts.task}\n\nOlder turns:\n${clipData(digestSource, 8000)}\n\n${prompt}` },
+					{ role: 'assistant', content: summary || '(empty)' },
+					{ role: 'user', content: COMPACTION_NUDGE },
+				],
+				1200,
+				tools,
+				'none'
+			);
+			if (retry.ok) {
+				summary = coerceMessageContent(retry.data.choices?.[0]?.message?.content).trim();
+			}
+		}
+		if (!looksLikeStructuredSummary(summary)) return undefined;
+		const system =
+			previous.find(m => m.role === 'system') ??
+			({ role: 'system' as const, content: systemContent });
+		const preferFrom = Math.max(1, previous.length - 14);
+		const tailStart = safeMidCompactTailStart(
+			previous as Parameters<typeof safeMidCompactTailStart>[0],
+			preferFrom
+		);
+		const tail = previous.slice(tailStart);
+		const next: ChatMessage[] = [
+			{
+				role: 'system',
+				content: typeof system.content === 'string' ? system.content : systemContent,
+			},
+			{ role: 'user', content: formatCheckpointUserMessage(summary, readLedger) },
+			...tail.filter(m => m.role !== 'system'),
+		];
+		normalizeToolProtocolHistory(next as Parameters<typeof normalizeToolProtocolHistory>[0]);
+		return next;
+	} catch {
+		return undefined;
+	}
+}
+
 async function compactWithLlm(
 	opts: AgentLoopOptions,
 	system: string,
@@ -3816,7 +4364,7 @@ async function compactWithLlm(
 ): Promise<ChatMessage[]> {
 	const trace = getTrace();
 	trace?.record({ type: 'compact', label: 'rolling summary' });
-	opts.onActivity?.({ kind: 'compact', label: 'Building rolling summary…' });
+	opts.onActivity?.({ kind: 'compact', label: 'Building structured checkpoint…' });
 
 	const recentTools = previous
 		.filter(m => m.role === 'tool')
@@ -3827,6 +4375,7 @@ async function compactWithLlm(
 	let rolling = '';
 	try {
 		const base = (opts.baseUrl || defaultBase(opts.provider)).replace(/\/$/, '');
+		const prompt = buildCompactionPrompt({ update: false });
 		const res = await fetch(`${base}/chat/completions`, {
 			method: 'POST',
 			headers: {
@@ -3838,16 +4387,13 @@ async function compactWithLlm(
 				model: opts.model,
 				temperature: 0.1,
 				stream: false,
-				max_tokens: 1024,
+				max_tokens: 1200,
 				...llmContextOptions(getContextBudget(opts.numCtx)),
 				...llmJsonOptions(opts.forceJson),
 				messages: [
 					{
 						role: 'system',
-						content:
-							'Summarize the agent progress in under 300 words as narrative only. ' +
-							'Preserve objective, decisions, changed files, errors, blockers. ' +
-							'Mention only paths that appear in the input; canonical paths are provided separately.',
+						content: 'You write structured checkpoints for coding agents. No tools.',
 					},
 					{
 						role: 'user',
@@ -3857,6 +4403,8 @@ async function compactWithLlm(
 							summarizeActionsForLlm(actions),
 							recentTools,
 							readLedger ? `### FILES ALREADY READ\n${readLedger}` : '',
+							'',
+							prompt,
 						]
 							.filter(Boolean)
 							.join('\n'),
@@ -3867,6 +4415,9 @@ async function compactWithLlm(
 		if (res.ok) {
 			const data = await readChatCompletionResponse(res);
 			rolling = data.choices?.[0]?.message?.content?.trim() ?? '';
+			if (!looksLikeStructuredSummary(rolling)) {
+				/* keep narrative fallback below */
+			}
 		}
 	} catch (err) {
 		if (opts.abortSignal?.aborted || (err instanceof Error && err.name === 'AbortError')) {
@@ -3980,7 +4531,9 @@ async function postAgentRound(
 	openaiUrl: string,
 	messages: ChatMessage[],
 	maxTokens = 8192,
-	tools: typeof AGENT_TOOLS = AGENT_TOOLS
+	tools: typeof AGENT_TOOLS = AGENT_TOOLS,
+	/** Keep tool schemas but forbid calls (prefix-cache friendly wrap-up). */
+	toolChoice: 'auto' | 'none' = 'auto'
 ): Promise<{
 	ok: boolean;
 	status: number;
@@ -3988,10 +4541,32 @@ async function postAgentRound(
 	data: ChatCompletionData;
 }> {
 	if (isNativeAnthropic(opts)) {
-		return postAnthropicRound(opts, messages, maxTokens, tools);
+		return postAnthropicRound(opts, messages, maxTokens, tools, toolChoice);
 	}
 
-	const response = await fetch(openaiUrl, {
+	const withTools = !opts.proseToolsOnly && tools.length > 0 && toolChoice !== 'none';
+	const thinkInput: ThinkingRoundInput & { tools?: typeof AGENT_TOOLS } = {
+		model: opts.model,
+		planMode: !!opts.planMode,
+		withTools,
+		proseToolsOnly: !!opts.proseToolsOnly,
+		tools,
+	};
+	const sampling = llmSamplingOptions(thinkInput);
+	const cappedTokens = toolAwareMaxTokens(maxTokens, thinkInput);
+	const disableThink = shouldDisableThinking(thinkInput);
+	const enableThink = shouldEnableThinking(thinkInput);
+	let outbound = stripReasoningFromMessages(messages) as ChatMessage[];
+	if (disableThink || enableThink) {
+		outbound = applySoftThinkSwitch(outbound, disableThink) as ChatMessage[];
+	}
+
+	const toolPayload =
+		opts.proseToolsOnly || tools.length === 0
+			? {}
+			: { tools, tool_choice: toolChoice as 'auto' | 'none' };
+
+	let response = await fetch(openaiUrl, {
 		method: 'POST',
 		headers: {
 			'Content-Type': 'application/json',
@@ -4001,18 +4576,52 @@ async function postAgentRound(
 		signal: opts.abortSignal,
 		body: JSON.stringify({
 			model: opts.model,
-			messages,
-			temperature: 0.2,
-			max_tokens: maxTokens,
+			messages: outbound,
+			temperature: sampling.temperature,
+			top_p: sampling.top_p,
+			max_tokens: cappedTokens,
 			stream: true,
 			stream_options: { include_usage: true },
-			...(opts.proseToolsOnly
-				? {}
-				: { tools, tool_choice: 'auto' as const }),
+			...toolPayload,
 			...llmContextOptions(getContextBudget(opts.numCtx)),
 			...llmJsonOptions(opts.forceJson),
+			...llmThinkingRequestFields(thinkInput),
 		}),
 	});
+	// Some gateways reject tool_choice:none — fall back to empty tools once.
+	if (!response.ok && toolChoice === 'none' && tools.length > 0) {
+		const errText = await response.text();
+		if (/tool_choice|invalid|unsupported/i.test(errText) || response.status === 400) {
+			response = await fetch(openaiUrl, {
+				method: 'POST',
+				headers: {
+					'Content-Type': 'application/json',
+					Accept: 'text/event-stream, application/json',
+					...(opts.apiKey ? { Authorization: `Bearer ${opts.apiKey}` } : {}),
+				},
+				signal: opts.abortSignal,
+				body: JSON.stringify({
+					model: opts.model,
+					messages: outbound,
+					temperature: sampling.temperature,
+					top_p: sampling.top_p,
+					max_tokens: cappedTokens,
+					stream: true,
+					stream_options: { include_usage: true },
+					...llmContextOptions(getContextBudget(opts.numCtx)),
+					...llmJsonOptions(opts.forceJson),
+					...llmThinkingRequestFields({
+						model: opts.model,
+						planMode: !!opts.planMode,
+						withTools: false,
+						proseToolsOnly: !!opts.proseToolsOnly,
+					}),
+				}),
+			});
+		} else {
+			return { ok: false, status: response.status, errorText: errText, data: {} };
+		}
+	}
 	if (!response.ok) {
 		return { ok: false, status: response.status, errorText: await response.text(), data: {} };
 	}
@@ -4035,7 +4644,13 @@ async function postAgentRound(
 
 type ChatCompletionData = {
 	choices?: Array<{
-		message?: { content?: string | null; tool_calls?: ToolCall[] };
+		message?: {
+			content?: string | null;
+			tool_calls?: ToolCall[];
+			reasoning_content?: string | null;
+			reasoning?: string | null;
+			thinking?: string | null;
+		};
 		finish_reason?: string | null;
 		stop_reason?: string | null;
 	}>;
@@ -4093,6 +4708,7 @@ async function streamSseChatCompletion(
 	const decoder = new TextDecoder();
 	let buffer = '';
 	let content = '';
+	let reasoning = '';
 	const toolMap = new Map<
 		number,
 		{ id: string; type: 'function'; function: { name: string; arguments: string } }
@@ -4101,6 +4717,10 @@ async function streamSseChatCompletion(
 	let finishReason: string | null | undefined;
 	let stopReason: string | null | undefined;
 	let sawToolDelta = false;
+
+	const appendReasoning = (raw: unknown) => {
+		if (typeof raw === 'string' && raw) reasoning += raw;
+	};
 
 	const applyChunk = (payload: string) => {
 		if (!payload || payload === '[DONE]') return;
@@ -4111,6 +4731,9 @@ async function streamSseChatCompletion(
 				stop_reason?: string | null;
 				delta?: {
 					content?: string | null;
+					reasoning_content?: string | null;
+					reasoning?: string | null;
+					thinking?: string | null;
 					tool_calls?: Array<{
 						index?: number;
 						id?: string;
@@ -4118,7 +4741,13 @@ async function streamSseChatCompletion(
 						function?: { name?: string; arguments?: string };
 					}>;
 				};
-				message?: { content?: string | null; tool_calls?: ToolCall[] };
+				message?: {
+					content?: string | null;
+					tool_calls?: ToolCall[];
+					reasoning_content?: string | null;
+					reasoning?: string | null;
+					thinking?: string | null;
+				};
 			}>;
 		};
 		try {
@@ -4136,6 +4765,9 @@ async function streamSseChatCompletion(
 				content += choice.message.content;
 				if (!sawToolDelta) onDelta?.(content);
 			}
+			appendReasoning(choice.message.reasoning_content);
+			appendReasoning(choice.message.reasoning);
+			appendReasoning(choice.message.thinking);
 			if (choice.message.tool_calls?.length) {
 				sawToolDelta = true;
 				for (let i = 0; i < choice.message.tool_calls.length; i++) {
@@ -4158,6 +4790,9 @@ async function streamSseChatCompletion(
 			content += delta.content;
 			if (!sawToolDelta) onDelta?.(content);
 		}
+		appendReasoning(delta.reasoning_content);
+		appendReasoning(delta.reasoning);
+		appendReasoning(delta.thinking);
 		for (const tc of delta.tool_calls ?? []) {
 			sawToolDelta = true;
 			const idx = tc.index ?? 0;
@@ -4217,6 +4852,7 @@ async function streamSseChatCompletion(
 				message: {
 					content: content || null,
 					tool_calls: tool_calls.length ? tool_calls : undefined,
+					...(reasoning ? { reasoning_content: reasoning } : {}),
 				},
 				finish_reason: finishReason,
 				stop_reason: stopReason,
@@ -4286,6 +4922,7 @@ function liftProseToolsFromCompletion(data: ChatCompletionData): ChatCompletionD
 
 function aggregateSseChatCompletion(raw: string): ChatCompletionData {
 	let content = '';
+	let reasoning = '';
 	const toolMap = new Map<
 		number,
 		{ id: string; type: 'function'; function: { name: string; arguments: string } }
@@ -4293,6 +4930,10 @@ function aggregateSseChatCompletion(raw: string): ChatCompletionData {
 	let usage: ChatCompletionData['usage'];
 	let finishReason: string | null | undefined;
 	let stopReason: string | null | undefined;
+
+	const appendReasoning = (rawField: unknown) => {
+		if (typeof rawField === 'string' && rawField) reasoning += rawField;
+	};
 
 	for (const line of raw.split(/\r?\n/)) {
 		const trimmed = line.trim();
@@ -4306,6 +4947,9 @@ function aggregateSseChatCompletion(raw: string): ChatCompletionData {
 				stop_reason?: string | null;
 				delta?: {
 					content?: string | null;
+					reasoning_content?: string | null;
+					reasoning?: string | null;
+					thinking?: string | null;
 					tool_calls?: Array<{
 						index?: number;
 						id?: string;
@@ -4313,7 +4957,13 @@ function aggregateSseChatCompletion(raw: string): ChatCompletionData {
 						function?: { name?: string; arguments?: string };
 					}>;
 				};
-				message?: { content?: string | null; tool_calls?: ToolCall[] };
+				message?: {
+					content?: string | null;
+					tool_calls?: ToolCall[];
+					reasoning_content?: string | null;
+					reasoning?: string | null;
+					thinking?: string | null;
+				};
 			}>;
 		};
 		try {
@@ -4331,6 +4981,9 @@ function aggregateSseChatCompletion(raw: string): ChatCompletionData {
 		// Rare non-streaming chunk shaped as full message inside SSE
 		if (choice.message) {
 			if (choice.message.content) content += choice.message.content;
+			appendReasoning(choice.message.reasoning_content);
+			appendReasoning(choice.message.reasoning);
+			appendReasoning(choice.message.thinking);
 			if (choice.message.tool_calls?.length) {
 				for (let i = 0; i < choice.message.tool_calls.length; i++) {
 					const tc = choice.message.tool_calls[i];
@@ -4351,6 +5004,9 @@ function aggregateSseChatCompletion(raw: string): ChatCompletionData {
 		if (typeof delta.content === 'string') {
 			content += delta.content;
 		}
+		appendReasoning(delta.reasoning_content);
+		appendReasoning(delta.reasoning);
+		appendReasoning(delta.thinking);
 		for (const tc of delta.tool_calls ?? []) {
 			const idx = tc.index ?? 0;
 			const prev = toolMap.get(idx) ?? {
@@ -4393,6 +5049,7 @@ function aggregateSseChatCompletion(raw: string): ChatCompletionData {
 				message: {
 					content: content || null,
 					tool_calls: tool_calls.length ? tool_calls : undefined,
+					...(reasoning ? { reasoning_content: reasoning } : {}),
 				},
 				finish_reason: finishReason,
 				stop_reason: stopReason,
@@ -4406,7 +5063,8 @@ async function postAnthropicRound(
 	opts: AgentLoopOptions,
 	messages: ChatMessage[],
 	maxTokens = 8192,
-	activeTools: typeof AGENT_TOOLS = AGENT_TOOLS
+	activeTools: typeof AGENT_TOOLS = AGENT_TOOLS,
+	toolChoice: 'auto' | 'none' = 'auto'
 ): Promise<{
 	ok: boolean;
 	status: number;
@@ -4497,7 +5155,12 @@ async function postAnthropicRound(
 			max_tokens: maxTokens,
 			system: system || undefined,
 			messages: safeConverted,
-			tools,
+			...(activeTools.length
+				? {
+						tools,
+						tool_choice: toolChoice === 'none' ? { type: 'none' } : { type: 'auto' },
+					}
+				: {}),
 		}),
 	});
 
@@ -4567,11 +5230,13 @@ function ensureToolResultsForCalls(
 	}
 }
 
-/** Gateway (llama-server) rejected tool call because arguments JSON was cut mid-stream. */
+/** Gateway (llama-server) rejected tool call because arguments JSON was cut mid-stream or malformed. */
 function isTruncatedToolCallError(status: number, errText: string): boolean {
 	if (status < 400) return false;
-	return /invalid tool call arguments|unexpected end of json|tool call arguments/i.test(
-		errText
+	return (
+		/invalid tool call arguments|unexpected end of json|tool call arguments|failed to parse tool call|missing closing quote|json\.exception\.parse_error|parse error at line/i.test(
+			errText
+		) || /<\/?new_string>|<parameter\s*=/i.test(errText)
 	);
 }
 
@@ -4604,13 +5269,17 @@ function parseToolArguments(raw: string): Record<string, unknown> {
 }
 
 function sanitizeMessages(messages: ChatMessage[]): ChatMessage[] {
-	return messages.map(m => {
-		const next: ChatMessage = { role: m.role, content: m.content ?? '' };
-		if (m.tool_call_id) next.tool_call_id = m.tool_call_id;
-		if (m.name) next.name = m.name;
-		if (m.tool_calls?.length) next.tool_calls = m.tool_calls;
-		return next;
-	});
+	return stripReasoningFromMessages(
+		messages.map(m => {
+			const content =
+				typeof m.content === 'string' ? stripThinkBlocks(m.content) : (m.content ?? '');
+			const next: ChatMessage = { role: m.role, content };
+			if (m.tool_call_id) next.tool_call_id = m.tool_call_id;
+			if (m.name) next.name = m.name;
+			if (m.tool_calls?.length) next.tool_calls = m.tool_calls;
+			return next;
+		})
+	);
 }
 
 function buildUserContent(
@@ -4781,7 +5450,9 @@ function summarizeActionsForLlm(actions: string[]): string {
 	if (!actions.length) {
 		return 'Progress: (no tools yet)';
 	}
-	const writes = actions.filter(a => a.startsWith('write ') || a.startsWith('edit '));
+	const writes = actions.filter(
+		a => a.startsWith('write ') || a.startsWith('edit ') || a.startsWith('apply_patch ')
+	);
 	const deletes = actions.filter(a => a.startsWith('delete '));
 	const shellsOk = actions.filter(
 		a => a.startsWith('shell ') && a !== 'shell failed' && !/blocked|denied|threw/.test(a)
@@ -5185,11 +5856,19 @@ function parseProseToolCalls(text: string): ToolCall[] {
 		];
 	}
 
+	// Qwen/Hermes XML tool markup → native tool_calls
+	const fromXml = parseXmlToolCalls(cleaned);
+	if (fromXml.length) return fromXml;
+
 	return [];
 }
 
 function looksLikeToolJson(text: string): boolean {
-	return /"tool_calls"\s*:/i.test(text) || /"name"\s*:\s*"(write|shell|read|list)"/i.test(text);
+	return (
+		/"tool_calls"\s*:/i.test(text) ||
+		/"name"\s*:\s*"(write|shell|read|list|edit)"/i.test(text) ||
+		looksLikeXmlToolMarkup(text)
+	);
 }
 
 /** Empty / `{}` / tiny JSON that local models emit under forceJson instead of tools. */
@@ -5209,6 +5888,8 @@ function describeMutation(name: string, args: Record<string, unknown>): string {
 			return `Write file ${args.path}`;
 		case 'edit':
 			return `Edit ${args.path}`;
+		case 'apply_patch':
+			return `Apply patch${args.path ? ` ${args.path}` : ''}`;
 		case 'dotnet':
 			return `Run: ${dotnetCommandLine(args) || `dotnet ${String(args.action ?? '')}`}`;
 		case 'delete':
@@ -5241,6 +5922,14 @@ function summarizeArgs(name: string, args: Record<string, unknown>): Record<stri
 			old_string: clip(args.old_string),
 			new_string: clip(args.new_string),
 			...(args.replace_all ? { replace_all: true } : {}),
+		};
+	}
+	if (name === 'apply_patch') {
+		const patch = String(args.patch ?? args.patchText ?? '');
+		return {
+			path: args.path,
+			patchPreview: patch.length > 400 ? `${patch.slice(0, 400)}…` : patch,
+			bytes: patch.length,
 		};
 	}
 	return args;
@@ -5338,7 +6027,12 @@ function cleanToolDetailForUi(output: string): string {
 
 /** Shell exit≠0 must not be cached as success / treated as OK progress. */
 function isToolSuccess(name: string, output: string): boolean {
-	if (output.startsWith('Error:')) {
+	if (
+		/^(Error:|FAILED:|Not run:)/i.test(output.trim()) ||
+		/old_string was not found/i.test(output) ||
+		/hunk \d+:|apply_patch:/i.test(output) ||
+		/^FILE_NOT_FOUND:/i.test(output.trim())
+	) {
 		return false;
 	}
 	if (name.startsWith('git_') && /Git is unavailable|Git tool failed/i.test(output)) {

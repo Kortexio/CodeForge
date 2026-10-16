@@ -70,15 +70,30 @@ Classes:
 | Retrieve without rerank / mid-text context truncation | replace | done — LLM rerank + `ContextSource.items` (drop whole hits/lessons); status `noTruncate` |
 | Compact erases what was already read | replace | done — `FILES ALREADY READ` ledger in mid/hard compact |
 | Explore via many serial list/read steps | replace | done — packet retrieve + optional explore subagent (`exploreSubagent`) |
+| Full tool surface thrash in Agent code turns | replace | done — stage machine at **execution** (explore/act/verify); schemas stay identical for prefix cache; refuse list/search/retrieve in act/verify |
+| Brittle exact `edit` / truncated tool JSON | replace | done — tolerant `edit` (Unicode + LF view + strip read line nums); `apply_patch` only for gpt-* non-OSS |
+| Soft edit-miss nudges | remove | done — hard `readThisTurn` gate before edit/overwrite |
+| Identical failed `edit`/`write`/`apply_patch` retries burn step budget then prose wrap-up | replace | done — block same fingerprint after first fail (incl. duplicates in one step); clear `readThisTurn` on miss |
+| Model retries `edit` whose `new_string` is already on disk (fake "missing brace") | replace | done — `applyEdit` returns `alreadyApplied` success so the 35B moves on |
+| Intent/continue enrich, thin-final/stuck soft nudges, write-count continue | remove | done — model works from system+tool contract; harness keeps protocol (length/JSON/budget) + tool gates only |
+| Stuck wrap used MAX_STEPS_PROMPT (wrong situation) / PT status labels | replace | done — `STUCK_WRAP_PROMPT` vs `MAX_STEPS_PROMPT`; status/activity strings English |
+| Stale internal plan injection | replace | done — `internalPlans.ts` scoped to session/taskHash; archive on done/unrelated task |
+| Mechanical mid-compact digest | replace | done — structured LLM checkpoint (Objective / Work State / Next Move) with mechanical fallback |
+| Final round sends `tools: []` (breaks prefix cache) | replace | done — keep tools + `tool_choice: none` + `MAX_STEPS_PROMPT` |
+| Clipped tool output with no path to full body | replace | done — spill to `.CodeForge/tool-output/` with marker |
 
 ## Modules
 
 | Module | Contents |
 |---|---|
 | `clip.ts` | data clipping with markers |
+| `toolOutputSpill.ts` | full clipped output under `.CodeForge/tool-output/` |
 | `readMemory.ts` | read cache, canonicalization, soft reads |
 | `nudges.ts` | claims (green / blocked) and every text the loop injects |
-| `editTool.ts` | `edit` with useful errors |
+| `editTool.ts` | tolerant `edit` with useful errors |
+| `applyPatch.ts` | `apply_patch` parser/applier (gpt-* only) |
+| `internalPlans.ts` | model-only scaffold slices under `.CodeForge/plans/` |
+| `structuredCompaction.ts` | Objective / Work State / Next Move checkpoint template |
 | `oracle.ts` | build/test detection and parsing |
 | `toolsets.ts` | phase labels (telemetry), `dotnet` tool, status-question tool filter |
 | `orchestrator.ts` / `orchestratorRun.ts` | card plan and per-item execution |
