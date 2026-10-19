@@ -18,6 +18,7 @@ VSCode-linux-*/
 
 # IDE and editor
 .vscode/
+.vs/
 .idea/
 *.swp
 *.swo
@@ -60,6 +61,9 @@ resources/binaries/
 
 # Electron builder output
 release/
+
+# Packaged extensions
+*.vsix
 
 # Local development
 .opencodeide/
