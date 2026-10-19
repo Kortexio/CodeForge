@@ -39,59 +39,6 @@ export function isReviewableSource(rel: string): boolean {
 	return SOURCE_EXT.test(p) && !SKIP_PATH.test(p) && !TEST_PATH.test(p);
 }
 
-export const DATA_EXT = /\.(json|ya?ml|xml|csv|toml|ini|config)$/i;
-const DATA_SKIP = /(^|\/)(package(-lock)?\.json|tsconfig[\w.-]*\.json|[\w.-]*\.(csproj|sln|slnx)|global\.json|launchSettings\.json)$/i;
-
-export function isReviewableData(rel: string): boolean {
-	const p = rel.replace(/\\/g, '/');
-	return DATA_EXT.test(p) && !SKIP_PATH.test(p) && !DATA_SKIP.test(p);
-}
-
-/** Data files a source file reads: its text names the path or file name, or the file shares its base name. */
-export function referencedDataFiles(source: { rel: string; text: string }, dataFiles: string[], max = 3): string[] {
-	const text = source.text.replace(/\\/g, '/').toLowerCase();
-	const stem = source.rel.split('/').pop()!.replace(/\.\w+$/, '').toLowerCase();
-	const scored = dataFiles
-		.map(d => {
-			const p = d.replace(/\\/g, '/').toLowerCase();
-			const base = p.split('/').pop()!;
-			const score = text.includes(p) ? 3 : text.includes(base) ? 2 : stem.length >= 3 && base.replace(/\.\w+$/, '') === stem ? 1 : 0;
-			return { d, score };
-		})
-		.filter(x => x.score > 0);
-	return scored
-		.sort((a, b) => b.score - a.score || a.d.localeCompare(b.d))
-		.slice(0, max)
-		.map(x => x.d);
-}
-
-const BUG_HUNT =
-	/\b(find|hunt|list|look\s+for|search\s+for|encontr\w*|procur\w*|ach\w*|list\w*)\b[^.\n]{0,30}\bbugs\b|\bbugs\.md\b|\bcode\s+review\b|\brevis(?:ão|ao|ar|e|a)\s+(?:d[eo]\s+|o\s+)?código\b/i;
-
-/** The user asked for a bug hunt over code (a report), not for a fix. */
-export function asksForBugHunt(task: string): boolean {
-	return BUG_HUNT.test(task) && !/\b(fix|corrig\w*|implement\w*)\b/i.test(task);
-}
-
-/** Paths named in the task that exist in the workspace (`src/Billing`, `` `lib` ``). */
-export function scopeFromTask(task: string, exists: (rel: string) => boolean): string[] {
-	const out = new Set<string>();
-	for (const m of task.matchAll(/`([^`\s]+)`|[\w.-]+(?:[/\\][\w.-]+)+/g)) {
-		const rel = (m[1] ?? m[0]).replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, '');
-		if (rel && rel !== '.' && exists(rel)) out.add(rel);
-	}
-	return [...out];
-}
-
-export function inScope(rel: string, scope: string[]): boolean {
-	if (!scope.length) return true;
-	const p = rel.toLowerCase();
-	return scope.some(s => {
-		const q = s.toLowerCase();
-		return p === q || p.startsWith(`${q}/`);
-	});
-}
-
 /** `path(12,5): warning CS8602: ... [proj]` lines grouped by relative file. */
 export function parseCompilerSignals(output: string, root: string, source: FileSignal['source']): Map<string, FileSignal[]> {
 	const byFile = new Map<string, FileSignal[]>();
@@ -153,8 +100,6 @@ export function mapPrompt(opts: {
 	totalLines: number;
 	signals: FileSignal[];
 	docs: string[];
-	/** Data files this code reads, with their (possibly clipped) content. */
-	data?: Array<{ path: string; text: string }>;
 }): string {
 	const parts = [
 		`Review \`${opts.file}\` for bugs (${opts.totalLines} lines, shown below with line numbers).`,
@@ -164,10 +109,6 @@ export function mapPrompt(opts: {
 	];
 	if (opts.docs.length) {
 		parts.push('', `Specs to compare against (read them): ${opts.docs.map(d => `\`${d}\``).join(', ')}`);
-	}
-	if (opts.data?.length) {
-		parts.push('', 'Data files this code reads (check keys, casing and values against how the code binds them):');
-		for (const d of opts.data) parts.push('', `\`${d.path}\``, '```', d.text, '```');
 	}
 	if (opts.signals.length) {
 		parts.push('', 'Compiler/test signals for this file:', ...opts.signals.map(s => `- L${s.line} ${s.code} ${s.msg} (${s.source})`));
@@ -179,8 +120,6 @@ export function mapPrompt(opts: {
 		'```',
 		'',
 		'Report only real defects (wrong behavior), not style. For each, quote the exact code of that line as evidence.',
-		`Report defects of \`${opts.file}\` only: calling a function defined in another file is not a defect here, even if that function is wrong.`,
-		'Each finding must name the written spec rule it breaks or a concrete input with its wrong output; leave out guesses about what the spec might want.',
 		'Reply with JSON only:',
 		'{"findings":[{"file":"<path>","line":<n>,"kind":"<checklist item>","evidence":"<exact code>","description":"<what is wrong and what is expected>","confidence":<0..1>}]}',
 		'Use {"findings":[]} when the file has no defects.'

@@ -24,83 +24,14 @@ import {
 	type Plan,
 } from '../../extensions/codeforge/src/agent/orchestrator';
 import {
-	asksForBugHunt,
 	confirmFinding,
 	dedupeFindings,
 	formatBugsMd,
-	inScope,
-	isReviewableData,
 	isReviewableSource,
-	mapPrompt,
 	parseCompilerSignals,
 	parseFindings,
 	pickCandidateFiles,
-	referencedDataFiles,
-	scopeFromTask,
 } from '../../extensions/codeforge/src/agent/reviewCore';
-import { shouldRunReview } from '../../extensions/codeforge/src/agent/taskRouter';
-
-describe('review routing decisions', () => {
-	it('recognizes bug-hunt requests, not single-bug debugging or fixes', () => {
-		expect(asksForBugHunt('Review the code in `src/Acme.Billing` against `docs/pricing.md` and find the bugs.')).toBe(true);
-		expect(asksForBugHunt('encontra os bugs em src/billing e escreve um relatório')).toBe(true);
-		expect(asksForBugHunt('faz uma revisão de código do módulo de faturação')).toBe(true);
-		expect(asksForBugHunt('write BUGS.md for this repo')).toBe(true);
-		expect(asksForBugHunt('analisa este erro do build')).toBe(false);
-		expect(asksForBugHunt('procura o erro no log')).toBe(false);
-		expect(asksForBugHunt('find the bugs in src and fix them')).toBe(false);
-		expect(asksForBugHunt('encontra os bugs e corrige')).toBe(false);
-	});
-
-	it('auto review only in a mode that may write the report', () => {
-		const task = 'find the bugs in src';
-		expect(shouldRunReview({ task })).toBe(true);
-		expect(shouldRunReview({ task, askMode: true })).toBe(false);
-		expect(shouldRunReview({ task, planMode: true })).toBe(false);
-		expect(shouldRunReview({ task }, 'cards')).toBe(false);
-		expect(shouldRunReview({ task: 'add a login page' }, 'review')).toBe(true);
-	});
-
-	it('attaches the data files a source reads by path, file name or shared base name', () => {
-		const data = ['config/coupons.json', 'config/rates.yaml', 'config/settings.json', 'tests/fixtures/orders.csv'];
-		const coupons = { rel: 'src/Billing/Coupons.cs', text: '// Resolve config/coupons.json from the root\nLoad("x");' };
-		expect(referencedDataFiles(coupons, data)).toEqual(['config/coupons.json']);
-		const rates = { rel: 'src/Billing/Tax.cs', text: 'var f = Path.Combine(dir, "rates.yaml");' };
-		expect(referencedDataFiles(rates, data)).toEqual(['config/rates.yaml']);
-		const settings = { rel: 'src/Settings.cs', text: 'public sealed class Settings {}' };
-		expect(referencedDataFiles(settings, data)).toEqual(['config/settings.json']);
-		expect(referencedDataFiles({ rel: 'src/Money.cs', text: 'decimal Round2' }, data)).toEqual([]);
-		expect(isReviewableData('config/coupons.json')).toBe(true);
-		expect(isReviewableData('package-lock.json')).toBe(false);
-		expect(isReviewableData('src/App/App.csproj')).toBe(false);
-		expect(isReviewableData('src/bin/Debug/app.json')).toBe(false);
-	});
-
-	it('puts data file content in the per-file review prompt', () => {
-		const prompt = mapPrompt({
-			file: 'src/Coupons.cs',
-			numbered: '   1|x',
-			totalLines: 1,
-			signals: [],
-			docs: [],
-			data: [{ path: 'config/coupons.json', text: '[{"code":"SAVE10"}]' }],
-		});
-		expect(prompt).toMatch(/Data files this code reads/);
-		expect(prompt).toMatch(/Report defects of `src\/Coupons\.cs` only: calling a function defined in another file is not a defect here/);
-		expect(prompt).toMatch(/name the written spec rule it breaks or a concrete input with its wrong output/);
-		expect(prompt).toMatch(/`config\/coupons\.json`\n```\n\[\{"code":"SAVE10"\}\]\n```/);
-		expect(mapPrompt({ file: 'a.cs', numbered: '', totalLines: 0, signals: [], docs: [] })).not.toMatch(/Data files/);
-	});
-
-	it('scopes to existing paths named in the task', () => {
-		const existing = new Set(['src/Acme.Billing', 'docs/pricing.md', 'src']);
-		const scope = scopeFromTask('Review `src/Acme.Billing` against docs/pricing.md, see src\\Missing too', r => existing.has(r));
-		expect(scope.sort()).toEqual(['docs/pricing.md', 'src/Acme.Billing']);
-		expect(inScope('src/Acme.Billing/Tax.cs', scope)).toBe(true);
-		expect(inScope('src/Acme.BillingExtra/Tax.cs', scope)).toBe(false);
-		expect(inScope('lib/x.cs', [])).toBe(true);
-	});
-});
 
 const card = (id: string, deps: string): CardDoc => ({
 	id,
