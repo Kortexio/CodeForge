@@ -18,8 +18,7 @@ import {
 	llamaSlotsProbed,
 	refreshLlamaSlots,
 } from '../agent/llamaSlots';
-import { runOrchestrated } from '../agent/orchestratorRun';
-import { runReviewPipeline } from '../agent/reviewPipeline';
+import { runRouted, type RunKind } from '../agent/taskRouter';
 import { SessionStore, type MessageTimings } from '../sessions/sessionStore';
 import { getApprovalPolicy, PermissionLevel } from '../policy/approvalPolicy';
 import { ensureWorkspaceIndex, getIndexedCount } from '../intelligence/workspaceIndex';
@@ -139,7 +138,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 	private _running = false;
 	private _queue: Array<{ id: string; text: string; mode?: AgentMode }> = [];
 	/** Set by /cards, /plan-run and /review for the next run only. */
-	private _runKind?: 'cards' | 'plan-run' | 'review';
+	private _runKind?: RunKind;
 	private _currentTurn = 0;
 	private _openSessionIds: string[] = [];
 	private _turnReasoning = '';
@@ -1322,15 +1321,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			hardCap: cfgAgent.get<number>('agentHardCap') ?? 100,
 			weakProfile,
 		};
-		if (runKind === 'review') {
-			const reviewed = await runReviewPipeline(agentOpts, { forced: true });
-			if (reviewed) return reviewed;
-		}
-		if (runKind !== 'review') {
-			const orchestrated = await runOrchestrated(agentOpts, { forced: !!runKind });
-			if (orchestrated) return orchestrated;
-		}
-		return runAgentWithTools(agentOpts);
+		return runRouted(agentOpts, runKind);
 	}
 
 	private _onTaskUpdate?: (update: {

@@ -32,7 +32,8 @@ Score (0–100): hidden 60 · visible 15 · protected untouched 10 · checks 10 
 
 - **CS5 (review)**: 6 bugs planted in `billing-bugs` (visible tests still pass). The agent writes
   `BUGS.md` with `path:line` references; the manifest lives in `tasks/CS5-review-billing-bugs/bugs.manifest.json`
-  (outside the fixture). Score: F1 × 80 · protected 10 · `BUGS.md` exists 10 (±3 line tolerance).
+  (outside the fixture). Score: F1 × 80 · protected 10 · `BUGS.md` exists 10 (±3 line tolerance; a bug
+  spread over two places lists the second one in `alsoLines`).
 - **CS6 (long)**: cards C01–C05 with "Depends on:" lines. Hidden tests run **per card** (only that
   card's tests are compiled in); the hidden ratio is the average over cards.
 

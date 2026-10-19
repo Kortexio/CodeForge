@@ -25,6 +25,8 @@ export type RunLoopOptions = {
 	planMode?: boolean;
 	askMode?: boolean;
 	isolated?: boolean;
+	/** Run through `runRouted` (review pipeline / orchestrator / loop), like the chat view. */
+	routed?: boolean;
 	maxSteps?: number;
 	hardCap?: number;
 	numCtx?: number;
@@ -183,13 +185,15 @@ export async function runLoop(opts: RunLoopOptions): Promise<RunLoopResult> {
 		const { runAgentWithTools } = await import(
 			'../../../../extensions/codeforge/src/agent/agentLoop'
 		);
+		const { runRouted } = await import('../../../../extensions/codeforge/src/agent/taskRouter');
 
 		const bridge = new VSCodeAIBridge(
 			vscodeMock.window.createOutputChannel() as import('vscode').OutputChannel
 		);
 		bridge.setFallbackWorkspaceRoot(workspaceRoot);
 
-		const reply = await runAgentWithTools({
+		const run = opts.routed ? (o: Parameters<typeof runAgentWithTools>[0]) => runRouted(o) : runAgentWithTools;
+		const reply = await run({
 			bridge,
 			provider: opts.provider ?? 'openai',
 			apiKey: opts.apiKey ?? 'test-key',

@@ -456,7 +456,10 @@ function scoreReview(dir, task) {
 		return { file: k.slice(0, i), line: Number(k.slice(i + 1)) };
 	});
 	const sameFile = (a, b) => a === b || a.endsWith(`/${b}`) || b.endsWith(`/${a}`) || a.split('/').pop() === b.split('/').pop();
-	const hits = r => manifest.filter(b => sameFile(r.file, b.file.toLowerCase()) && Math.abs(r.line - b.line) <= tol);
+	const hits = r =>
+		manifest.filter(
+			b => sameFile(r.file, b.file.toLowerCase()) && [b.line, ...(b.alsoLines ?? [])].some(l => Math.abs(r.line - l) <= tol)
+		);
 	const found = manifest.filter(b => refs.some(r => hits(r).includes(b)));
 	const truePositives = refs.filter(r => hits(r).length > 0).length;
 	const precision = refs.length ? truePositives / refs.length : 0;

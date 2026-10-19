@@ -1,6 +1,6 @@
 /**
  * Headless agent runner for benchmarks.
- * Loads the compiled extension, mocks vscode with disk FS, calls runAgentWithTools.
+ * Loads the compiled extension, mocks vscode with disk FS, calls runRouted (same path as chat).
  *
  * Usage (usually via bench.mjs run):
  *   node benchmarks/headlessAgent.mjs --workspace <dir> --task <text> [--label x] [--server id] [--model id] [--weak on|off]
@@ -242,8 +242,7 @@ async function main() {
 	const { initApprovalPolicy } = require(path.join(EXT_OUT, 'policy', 'approvalPolicy.js'));
 	const { initGovernanceStore } = require(path.join(EXT_OUT, 'governance', 'governanceStore.js'));
 	const { VSCodeAIBridge } = require(path.join(EXT_OUT, 'bridge', 'vscodeBridge.js'));
-	const { runAgentWithTools } = require(path.join(EXT_OUT, 'agent', 'agentLoop.js'));
-	const { runOrchestrated } = require(path.join(EXT_OUT, 'agent', 'orchestratorRun.js'));
+	const { runRouted } = require(path.join(EXT_OUT, 'agent', 'taskRouter.js'));
 
 	const ctx = fakeExtensionContext(runHome);
 	initApprovalPolicy(ctx);
@@ -345,12 +344,11 @@ async function main() {
 				else if (/length|truncat/i.test(text)) loopExit = 'length';
 			},
 		};
-		// Same path as chat: multi-card tasks run one isolated sub-run per card.
-		const orchestrated = await runOrchestrated(agentOpts, { forced: false });
-		reply = orchestrated ?? (await runAgentWithTools(agentOpts));
-		// Orchestrator report wins over a sub-run's length/budget status line.
+		// Same path as chat: bug hunts run the review pipeline, multi-card tasks one sub-run per card.
+		reply = await runRouted(agentOpts);
+		// Orchestrator/review report wins over a sub-run's length/budget status line.
 		const planDone = /Progress\s*\((\d+)\/\1\s+done\)/i.exec(String(reply || ''));
-		if (planDone && !/\bis blocked\b/i.test(String(reply || ''))) {
+		if ((planDone && !/\bis blocked\b/i.test(String(reply || ''))) || /^Review done:/.test(String(reply || ''))) {
 			loopExit = 'done';
 		} else if (loopExit === 'unknown') {
 			loopExit = 'done';
