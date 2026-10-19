@@ -44,13 +44,13 @@ Classes:
 
 | Item | Class | Status |
 |---|---|---|
-| Re-read refusal ("already read") | replace | done — `readMemory.ts`: returns the remembered content with a marker |
+| Re-read refusal ("already read") | replace | done — `read`/`list` always hit disk; identical window prefixed `(unchanged since earlier read)`; `readThisTurn` set on every successful read |
 | Retrieve-repeat refusal | remove | done |
-| `list` quota / anti-explore / exploreBudget | remove | done — full tool surface for all models (`toolsets.ts`); status questions still limited to `update_status` |
+| `list` quota / anti-explore / exploreBudget | remove | done — Agent build profile is CORE (+ optional `codeforge.ai.toolGroups`); status questions still limited to `update_status` |
 | VERIFY / CONTINUE nudges, `evaluateProgress`, replan | replace | done — the oracle decides when it is done (`oracle.ts`), `blocked:` is a legitimate exit |
 | "N writes without build" (text) | replace | done — the oracle runs automatically after the batch |
 | "mass rewrite" (text) | replace | done — gate: partial write on a file > 60 lines → `edit` (when small-model harness is **on**) |
-| BUILD-FIX MODE (text) | replace | done — gate on reads outside the files with errors (when harness is **on**) |
+| BUILD-FIX MODE / red-build read cap | remove | done — no read cap while build is red; oracle still runs after write batches |
 | Command circuit breaker | replace | done — only refuses the same failed command when no files changed |
 | EXTENDED MEMORY in every packet | replace | done — a lesson is recorded from the failure text (no fixed tag list) and attached to that command; later turns include it only when the task matches |
 | Shell `### ADVICE` | remove | done — neutral line with cwd/command |
@@ -58,7 +58,11 @@ Classes:
 | Stable facts cleared by any `exit 0` | remove | done — only build/test clear `openErrors` |
 | TDD tips / @page stack warning | keep | off by default; can be enabled by guardrail |
 | Step budget | keep | silent extension when progress changes |
-| Checkpoints every N steps / `progressReview.ts` / REPLAN | replace | done — orchestrator (`orchestrator.ts`): one item per card, ~25 steps, 2 attempts, then `blocked` |
+| Checkpoints every N steps / `progressReview.ts` / REPLAN | replace | done — orchestrator (`orchestrator.ts`): one item per card, ~25 steps, 2 attempts, then `blocked`; auto when task mentions cards and ≥2 exist (slash `/cards` forces); headless uses `runOrchestrated` |
+| Spec self-check "confirm each rule" — model confirms boundaries by reading and is wrong | replace | done — `specSelfCheckNote` requires executing the code at each boundary value (inclusive bounds, date-only = midnight, caps, rounding); one-off commands, temporary files deleted, existing tests untouched |
+| Reply that only echoes the `/no_think` soft switch accepted as the final answer | replace | done — `splitThinkContent` drops lines that are only `/think` or `/no_think`, so the empty-turn retry applies |
+| Windows shell mangles inner `"` (`node -e "…"` exits 0 without running) | replace | done — `cmdExeSpawn`: outer quotes + `windowsVerbatimArguments` in bridge, sandbox runtime and `bgShell` |
+| Multi-card single-loop hits length before later cards | replace | done — isolated sub-runs + `selectCards` range for `` docs/C01.md to docs/C05.md ``; prose length retries (3) under short `max_tokens` (1024) |
 | Plan requested from the model (task-plan in the wiki) | replace | done — `plan.json` is harness state; planning with a JSON schema only when there are no cards |
 | Tool history across cards | remove | done — `isolated` sub-runs (no history, no prior transcript) |
 | Previous-session read memory after writes | remove | done — preload invalidates paths written later; the hot set skips stale reads |
@@ -70,17 +74,23 @@ Classes:
 | Retrieve without rerank / mid-text context truncation | replace | done — LLM rerank + `ContextSource.items` (drop whole hits/lessons); status `noTruncate` |
 | Compact erases what was already read | replace | done — `FILES ALREADY READ` ledger in mid/hard compact |
 | Explore via many serial list/read steps | replace | done — packet retrieve + optional explore subagent (`exploreSubagent`) |
-| Full tool surface thrash in Agent code turns | replace | done — stage machine at **execution** (explore/act/verify); schemas stay identical for prefix cache; refuse list/search/retrieve in act/verify |
-| Brittle exact `edit` / truncated tool JSON | replace | done — tolerant `edit` (Unicode + LF view + strip read line nums); `apply_patch` only for gpt-* non-OSS |
-| Soft edit-miss nudges | remove | done — hard `readThisTurn` gate before edit/overwrite |
-| Identical failed `edit`/`write`/`apply_patch` retries burn step budget then prose wrap-up | replace | done — block same fingerprint after first fail (incl. duplicates in one step); clear `readThisTurn` on miss |
+| Full tool surface thrash in Agent code turns | remove | done — stage machine and plan path gate removed; Agent defaults to CORE tools (groups via `toolGroups`); `delegate_task` explore uses `exploreOnly` profile |
+| Periodic context-packet rewrite of `messages[0]` | remove | done — system string frozen for the run; packet only in hard-compact user summary; plan advances as user message |
+| Floor-model tool protocol (aliases, bad JSON, XML) | replace | done — `toolCallNormalizer` + stronger content parsers; `AiServer.sampling` overrides; diagnostics appended after edit/write/apply_patch |
+| Brittle exact `edit` / truncated tool JSON | replace | done — tolerant `edit` (Unicode + LF view + indent-tolerant single match + `closestWindow` on miss); `apply_patch` only for gpt-* non-OSS |
+| Soft edit-miss nudges | remove | done — hard `readThisTurn` gate before edit/overwrite; refuse delivers numbered excerpt and marks path as read |
+| Identical failed `edit`/`write`/`apply_patch` retries burn step budget then prose wrap-up | replace | done — block same fingerprint after first fail (incl. duplicates in one step); keep `readThisTurn`; include closest window in refusal |
 | Model retries `edit` whose `new_string` is already on disk (fake "missing brace") | replace | done — `applyEdit` returns `alreadyApplied` success so the 35B moves on |
 | Intent/continue enrich, thin-final/stuck soft nudges, write-count continue | remove | done — model works from system+tool contract; harness keeps protocol (length/JSON/budget) + tool gates only |
-| Stuck wrap used MAX_STEPS_PROMPT (wrong situation) / PT status labels | replace | done — `STUCK_WRAP_PROMPT` vs `MAX_STEPS_PROMPT`; status/activity strings English |
+| Stuck wrap used MAX_STEPS_PROMPT (wrong situation) / PT status labels | replace | done — `stuckWrapPrompt(cause)` vs `MAX_STEPS_PROMPT` vs `LENGTH_EXHAUSTED_PROMPT`; `loopExit` is `budget`/`stuck`/`length`; status/activity strings English |
+| Soft cache / noop-step stuck heuristics | replace | done — `loopDetector.ts` (identical call+result for 3 steps, explore-only ≥20, UI unchanged ≥3) |
 | Stale internal plan injection | replace | done — `internalPlans.ts` scoped to session/taskHash; archive on done/unrelated task |
 | Mechanical mid-compact digest | replace | done — structured LLM checkpoint (Objective / Work State / Next Move) with mechanical fallback |
-| Final round sends `tools: []` (breaks prefix cache) | replace | done — keep tools + `tool_choice: none` + `MAX_STEPS_PROMPT` |
+| Final round sends `tools: []` (breaks prefix cache) | replace | done — budget/stuck/length wraps use `postAgentRound` with tools + `tool_choice: none` |
 | Clipped tool output with no path to full body | replace | done — spill to `.CodeForge/tool-output/` with marker |
+| Diagnose-only finish (bug list, no mutate) burns trust on weak models | replace | done — `TOOL_SYSTEM_CONTRACT` finish rule + `shouldRefuseDiagFinish` / `DIAG_ONLY_FINISH_NOTE` (tool counts only) |
+| Checkpoint extends budget on reads alone | replace | done — `progressMarker` uses writes + `uiChangeCount` + build, not `readPathsSeen` |
+| Browser click success with UI UNCHANGED loops to hard cap | replace | done — After-state in tool result + `unchangedStreak >= 3` → stuck wrap |
 
 ## Modules
 
@@ -88,8 +98,9 @@ Classes:
 |---|---|
 | `clip.ts` | data clipping with markers |
 | `toolOutputSpill.ts` | full clipped output under `.CodeForge/tool-output/` |
-| `readMemory.ts` | read cache, canonicalization, soft reads |
+| `readMemory.ts` | path canonicalization, read ledger helpers, invalidate on write |
 | `nudges.ts` | claims (green / blocked) and every text the loop injects |
+| `loopDetector.ts` | identical call+result streak and related stop causes |
 | `editTool.ts` | tolerant `edit` with useful errors |
 | `applyPatch.ts` | `apply_patch` parser/applier (gpt-* only) |
 | `internalPlans.ts` | model-only scaffold slices under `.CodeForge/plans/` |

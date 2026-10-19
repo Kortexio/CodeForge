@@ -17,7 +17,14 @@ npm run bench -- setup CS1 --label bonsai --open   # or CS2 / CS3 / CS4
 npm run bench -- check latest
 npm run bench -- report
 npm run bench -- selftest CS                       # validates fixtures + solutions
+
+# Headless (uses active server/model from ~/.CodeForge/ai/settings.json)
+npm run build:extensions
+node benchmarks/bench.mjs run T1 --label baseline-qwen35b
+# Optional: --server <id> --model <id> --weak off
 ```
+
+Headless results include `loopExit`, `steps`, `refusals`, `protocol` (parse/tool-name failures), and `toolCallMode` (`native` | `content` | `none`).
 
 Score (0–100): hidden 60 · visible 15 · protected untouched 10 · checks 10 · no junk files 5.
 

@@ -7,8 +7,10 @@
  *   node benchmarks/bench.mjs check latest
  *   node benchmarks/bench.mjs report
  *   node benchmarks/bench.mjs selftest
+ *   node benchmarks/bench.mjs run T1 --label baseline-qwen35b [--server id] [--model id] [--weak on|off]
  *
  * Runs live in %USERPROFILE%/codeforge-bench (override with CODEFORGE_BENCH_DIR).
+ * Headless `run` uses the active server/model from ~/.CodeForge/ai/settings.json.
  */
 
 import fs from 'node:fs';
@@ -655,6 +657,82 @@ function applySolution(dir, taskDir) {
 	}
 }
 
+function cmdRun(taskKey, flags) {
+	const label = String(flags.label || 'headless').replace(/[^\w.-]+/g, '_');
+	const meta = cmdSetup(taskKey, { ...flags, label, quiet: true });
+	const prompt = fs.readFileSync(path.join(RUNS_ROOT, `${meta.name}.prompt.txt`), 'utf8');
+	const samplesDir = path.join(RESULTS_DIR, meta.name, 'protocol-samples');
+	fs.mkdirSync(samplesDir, { recursive: true });
+	const outJson = path.join(RESULTS_DIR, `${meta.name}.headless.json`);
+	fs.mkdirSync(RESULTS_DIR, { recursive: true });
+
+	const compile = spawnSync('npm', ['run', 'build:extensions'], {
+		cwd: path.join(HERE, '..'),
+		encoding: 'utf8',
+		shell: true,
+		timeout: 300_000,
+	});
+	if (compile.status !== 0) {
+		die(`build:extensions failed:\n${compile.stdout}\n${compile.stderr}`);
+	}
+
+	const args = [
+		path.join(HERE, 'headlessAgent.mjs'),
+		'--workspace',
+		meta.dir,
+		'--task',
+		prompt,
+		'--out',
+		outJson,
+		'--samplesDir',
+		samplesDir,
+		'--weak',
+		String(flags.weak ?? 'on'),
+	];
+	if (flags.server) args.push('--server', String(flags.server));
+	if (flags.model) args.push('--model', String(flags.model));
+	if (flags.maxSteps) args.push('--maxSteps', String(flags.maxSteps));
+	if (flags.hardCap) args.push('--hardCap', String(flags.hardCap));
+
+	console.log(`Headless run ${meta.name}…`);
+	const agent = spawnSync(process.execPath, args, {
+		cwd: path.join(HERE, '..'),
+		encoding: 'utf8',
+		timeout: 1_800_000,
+	});
+	if (agent.status === 2) {
+		process.stdout.write(agent.stdout || '');
+		process.stderr.write(agent.stderr || '');
+		process.exit(2);
+	}
+	if (agent.status !== 0) {
+		console.error(agent.stdout);
+		console.error(agent.stderr);
+		die(`headless agent exited ${agent.status}`);
+	}
+	process.stdout.write(agent.stdout || '');
+
+	const headless = readJson(outJson) || {};
+	const scored = cmdCheck(meta.name, { save: true, print: true });
+	const merged = {
+		...scored,
+		runtime: 'headless',
+		model: headless.model,
+		server: headless.server,
+		loopExit: headless.loopExit,
+		steps: headless.steps,
+		refusals: headless.refusals,
+		protocol: headless.protocol,
+		toolCallMode: headless.toolCallMode,
+		elapsedMs: headless.elapsedMs,
+		headlessReply: headless.replyPreview,
+	};
+	const resultPath = path.join(RESULTS_DIR, `${meta.name}.json`);
+	fs.writeFileSync(resultPath, JSON.stringify(merged, null, 2));
+	console.log(`Merged headless metrics → results/${meta.name}.json`);
+	return merged;
+}
+
 function cmdSelftest(filter) {
 	RUNS_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'cf-bench-selftest-'));
 	let ok = true;
@@ -788,8 +866,11 @@ switch (pos[0]) {
 	case 'selftest':
 		cmdSelftest(pos[1]);
 		break;
+	case 'run':
+		cmdRun(pos[1], flags);
+		break;
 	default:
 		console.log(
-			'Usage: node benchmarks/bench.mjs <list | setup <task> --label <name> [--open] | check [run|latest] | report | selftest [CS]>'
+			'Usage: node benchmarks/bench.mjs <list | setup <task> --label <name> [--open] | check [run|latest] | report | selftest [CS] | run <task> --label <name>>'
 		);
 }
