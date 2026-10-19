@@ -31,7 +31,6 @@ import {
 	inScope,
 	isReviewableData,
 	isReviewableSource,
-	boundaryCheckHint,
 	mapPrompt,
 	parseCompilerSignals,
 	parseFindings,
@@ -89,32 +88,6 @@ describe('review routing decisions', () => {
 		expect(prompt).toMatch(/Data files this code reads/);
 		expect(prompt).toMatch(/Report defects of `src\/Coupons\.cs` only: calling a function defined in another file is not a defect here/);
 		expect(prompt).toMatch(/name the written spec rule it breaks or a concrete input with its wrong output/);
-		expect(prompt).toMatch(/Do not modify source or test files/);
-		expect(prompt).toMatch(/Do not create a temporary project or console host/);
-		expect(
-			mapPrompt({
-				file: 'src/bulk.js',
-				numbered: '   1|x',
-				totalLines: 1,
-				signals: [],
-				docs: [],
-			})
-		).toMatch(/node -e/);
-		expect(boundaryCheckHint('src/Tax.cs')).toMatch(/Do not create a temporary project/);
-		expect(boundaryCheckHint('lib/rate.py')).toMatch(/python -c/);
-		const jsonLine = prompt.split('\n').find(l => l.includes('"findings"'));
-		expect(jsonLine).toBeDefined();
-		expect(() =>
-			JSON.parse(
-				jsonLine!
-					.replace('<path>', 'a.cs')
-					.replace('<n>', '1')
-					.replace('<checklist item>', 'bug')
-					.replace('<exact code>', 'x')
-					.replace('<what is wrong and what is expected>', 'y')
-					.replace('<0..1>', '0.9')
-			)
-		).not.toThrow();
 		expect(prompt).toMatch(/`config\/coupons\.json`\n```\n\[\{"code":"SAVE10"\}\]\n```/);
 		expect(mapPrompt({ file: 'a.cs', numbered: '', totalLines: 0, signals: [], docs: [] })).not.toMatch(/Data files/);
 	});

@@ -178,11 +178,11 @@ export async function runReviewPipeline(opts: AgentLoopOptions, o: ReviewOptions
 			}),
 			history: [],
 			isolated: true,
-			reviewMode: true,
-			basePhase: 'review',
+			planMode: true,
+			basePhase: 'explore',
 			depth: 1,
-			maxSteps: 10,
-			hardCap: 12,
+			maxSteps: 8,
+			hardCap: 10,
 		});
 		all.push(...parseFindings(reply, file).map(f => ({ ...f, file: f.file.includes('/') ? f.file : file })));
 		reviewed = i + 1;

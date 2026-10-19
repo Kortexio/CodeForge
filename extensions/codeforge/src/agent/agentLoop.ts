@@ -146,7 +146,6 @@ import {
 	isStatusQuestion,
 	LARGE_FILE_LINES,
 	PLAN_ALLOWED_TOOLS,
-	REVIEW_ALLOWED_TOOLS,
 	profileForTurn,
 	toolNamesFor,
 	type AgentPhase,
@@ -1305,11 +1304,6 @@ export interface AgentLoopOptions {
 	 */
 	askMode?: boolean;
 	/**
-	 * Review mode: read/search + shell/dotnet to execute boundary checks (no writes).
-	 * Used by the bug-hunt pipeline; the pipeline writes BUGS.md itself.
-	 */
-	reviewMode?: boolean;
-	/**
 	 * Explore-only sub-run (delegate_task mode explore): read/search tools only.
 	 */
 	exploreOnly?: boolean;
@@ -1326,7 +1320,6 @@ export interface AgentLoopOptions {
 
 const PLAN_MODE_TOOLS = new Set<string>(PLAN_ALLOWED_TOOLS);
 const ASK_MODE_TOOLS = new Set<string>(ASK_ALLOWED_TOOLS);
-const REVIEW_MODE_TOOLS = new Set<string>(REVIEW_ALLOWED_TOOLS);
 
 export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string> {
 	const checkpointSize = opts.maxSteps ?? 30;
@@ -1417,7 +1410,6 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 		planMode: opts.planMode,
 		coachMode: opts.coachMode,
 		askMode: opts.askMode,
-		reviewMode: opts.reviewMode,
 		exploreOnly: opts.exploreOnly,
 		mcpAvailable: mcpAvailableEarly,
 		toolGroups: enabledToolGroups,
@@ -1440,12 +1432,6 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 			]
 				.filter(Boolean)
 				.join('\n')
-		: opts.reviewMode
-		? [
-				'### REVIEW MODE (active)',
-				'Find defects; do not edit source or tests.',
-				'When the review prompt asks for a one-liner (node/python), use shell. Do not invent a temporary console project for class libraries.',
-			].join('\n')
 		: opts.planMode && opts.isolated
 		? 'Only exploration tools are available in this run.'
 		: opts.planMode
@@ -1636,8 +1622,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 	const MAX_ORACLE_REJECTIONS = 6;
 	let gateFinishRejections = 0;
 	const MAX_GATE_FINISH_REJECTIONS = 2;
-	const oracleCfg =
-		opts.planMode || opts.askMode || opts.reviewMode ? undefined : detectOracle(opts.workspaceRoot, nodeOracleFs);
+	const oracleCfg = opts.planMode || opts.askMode ? undefined : detectOracle(opts.workspaceRoot, nodeOracleFs);
 	let lastProgressMarker = '';
 	const progressMarker = () =>
 		`${successfulWriteCount}|${uiChangeCount}|${gates.buildRed ? 'red' : 'ok'}|${gates.lastBuildErrors.length}`;
@@ -2054,20 +2039,15 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 				planMode: opts.planMode,
 				coachMode: opts.coachMode,
 				askMode: opts.askMode,
-				reviewMode: opts.reviewMode,
 				exploreOnly: opts.exploreOnly,
 			});
-			toolCap = toolResultCharCap(
-				contextBudget,
-				toolProfile === 'explore' || toolProfile === 'ask' || toolProfile === 'review'
-			);
+			toolCap = toolResultCharCap(contextBudget, toolProfile === 'explore' || toolProfile === 'ask');
 			activeToolNames = toolNamesFor(phase, opts.task, {
 				weakProfile,
 				allNames: allAgentToolNames(agentMode),
 				planMode: opts.planMode,
 				coachMode: opts.coachMode,
 				askMode: opts.askMode,
-				reviewMode: opts.reviewMode,
 				exploreOnly: opts.exploreOnly,
 				mcpAvailable,
 				exploreSubagent: exploreSubagentOn,
@@ -2487,7 +2467,6 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					shouldRefuseDiagFinish({
 						planMode: opts.planMode,
 						askMode: opts.askMode,
-						reviewMode: opts.reviewMode,
 						coachMode: opts.coachMode,
 						statusQuestion,
 						blocked: !!blocked,
@@ -2591,7 +2570,6 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					shouldRequestSpecSelfCheck({
 						planMode: opts.planMode,
 						askMode: opts.askMode,
-						reviewMode: opts.reviewMode,
 						coachMode: opts.coachMode,
 						statusQuestion,
 						blocked: !!blocked,
@@ -3517,18 +3495,6 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 						content: `Not run: "${name}" is not available in Ask mode (read/search/web only).`,
 					});
 					actions.push(`${name} blocked (ask mode)`);
-					continue;
-				}
-
-				if (opts.reviewMode && !REVIEW_MODE_TOOLS.has(name)) {
-					await flushLane();
-					messages.push({
-						role: 'tool',
-						tool_call_id: call.id,
-						name,
-						content: `Not run: "${name}" is not available in Review mode (read/search/shell only; do not edit files).`,
-					});
-					actions.push(`${name} blocked (review mode)`);
 					continue;
 				}
 
