@@ -14,7 +14,7 @@ export interface PermissionRule {
 
 export type PermissionRuleset = PermissionRule[];
 
-export type ToolPermissionProfile = 'build' | 'explore' | 'plan' | 'status' | 'coach' | 'ask';
+export type ToolPermissionProfile = 'build' | 'explore' | 'plan' | 'status' | 'coach' | 'ask' | 'review';
 
 /** edit/write/apply_patch share the OpenCode `edit` permission key. */
 const EDIT_TOOLS = new Set(['edit', 'write', 'apply_patch']);
@@ -86,6 +86,17 @@ export const ASK_ALLOWED_TOOLS = [
 	'skill',
 	'update_status',
 	'todo_write',
+] as const;
+
+/**
+ * Bug-hunt sub-runs: read/search plus shell/dotnet to execute boundary checks.
+ * No write/edit — the pipeline writes BUGS.md itself.
+ */
+export const REVIEW_ALLOWED_TOOLS = [
+	...ASK_ALLOWED_TOOLS,
+	'shell',
+	'await_shell',
+	'dotnet',
 ] as const;
 
 /** Plan-mode allow-list (same surface as legacy PLAN_MODE_TOOLS). */
@@ -235,6 +246,8 @@ export function rulesetForProfile(
 			return merge(denyAll(), allow('update_status'));
 		case 'ask':
 			return merge(denyAll(), allow(...ASK_ALLOWED_TOOLS));
+		case 'review':
+			return merge(denyAll(), allow(...REVIEW_ALLOWED_TOOLS));
 		case 'plan':
 			return merge(denyAll(), allow(...PLAN_ALLOWED_TOOLS));
 		case 'coach':

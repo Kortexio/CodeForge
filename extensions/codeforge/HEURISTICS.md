@@ -72,6 +72,7 @@ Classes:
 | Review pipeline only behind `/review`; a plain "find the bugs" ran one loop | replace | done — `taskRouter.ts` (`runRouted`) used by chat and headless: `asksForBugHunt` on the user request (not with fix/corrige, not in ask/plan mode); scope = existing paths named in the task; per-file progress |
 | Review sub-run never opened the data the code binds (`config/coupons.json`) | replace | done — `referencedDataFiles`: data files named by path/file name in the source, or sharing its base name, inlined in the per-file prompt |
 | Review findings repeated at call sites / rules not in the spec | replace | done — per-file contract: defects of this file only; each finding names the written rule or a concrete wrong output |
+| Review sub-runs had no shell (plan mode), so threshold bugs stayed unread | replace | done — `reviewMode` profile: read/search + shell/dotnet, no write/edit; `boundaryCheckHint` requires `node -e` / `python -c` for JS/TS/Py and forbids inventing a console host for class libraries (C#/Java/…) |
 | Extended memory lessons in every packet | remove | done (see above) |
 | Index embeddings as fixed 800-char prefixes (manual command only) | replace | done — symbol/blank-line chunker, incremental hash, vectors.f32, auto watcher (`semanticIndex`) |
 | Retrieve without rerank / mid-text context truncation | replace | done — LLM rerank + `ContextSource.items` (drop whole hits/lessons); status `noTruncate` |

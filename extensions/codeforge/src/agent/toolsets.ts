@@ -11,6 +11,7 @@ import {
 	type ProfileOptions,
 	PLAN_ALLOWED_TOOLS,
 	ASK_ALLOWED_TOOLS,
+	REVIEW_ALLOWED_TOOLS,
 } from './toolPermissions';
 import { toolDescription } from './toolContracts';
 
@@ -18,7 +19,7 @@ export { ASK_ALLOWED_TOOLS };
 
 export type AgentPhase = 'explore' | 'implement' | 'fix' | 'review';
 
-export { PLAN_ALLOWED_TOOLS };
+export { PLAN_ALLOWED_TOOLS, REVIEW_ALLOWED_TOOLS };
 
 /** A question about where the work stopped. Not a request to continue or change code. */
 export function isStatusQuestion(task: string): boolean {
@@ -55,11 +56,18 @@ export function currentPhase(task: string, state: { buildRed: boolean }): AgentP
 export function profileForTurn(
 	phase: AgentPhase,
 	task: string,
-	opts: { planMode?: boolean; coachMode?: boolean; askMode?: boolean; exploreOnly?: boolean }
+	opts: {
+		planMode?: boolean;
+		coachMode?: boolean;
+		askMode?: boolean;
+		reviewMode?: boolean;
+		exploreOnly?: boolean;
+	}
 ): ToolPermissionProfile {
 	void phase; // phase stays for telemetry / activity labels; tools follow mode below
 	if (opts.coachMode) return 'coach';
 	if (opts.askMode) return 'ask';
+	if (opts.reviewMode) return 'review';
 	if (opts.exploreOnly) return 'explore';
 	if (isStatusQuestion(task)) return 'status';
 	if (opts.planMode) return 'plan';
@@ -81,6 +89,7 @@ export function toolNamesFor(
 		planMode?: boolean;
 		coachMode?: boolean;
 		askMode?: boolean;
+		reviewMode?: boolean;
 		exploreOnly?: boolean;
 		mcpAvailable?: boolean;
 		exploreSubagent?: boolean;
@@ -94,6 +103,7 @@ export function toolNamesFor(
 		planMode: opts.planMode,
 		coachMode: opts.coachMode,
 		askMode: opts.askMode,
+		reviewMode: opts.reviewMode,
 		exploreOnly: opts.exploreOnly,
 	});
 	const profileOpts: ProfileOptions = {

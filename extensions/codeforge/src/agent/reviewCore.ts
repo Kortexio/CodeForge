@@ -23,6 +23,7 @@ export interface FileSignal {
 export const REVIEW_CHECKLIST = [
 	'null / missing values',
 	'boundaries and off-by-one (loops, ranges, >= vs >)',
+	'ordered tables: first-match vs best-match (bulk tiers, rate ladders scanned ascending)',
 	'money and rounding (decimal, rounding mode, order of operations)',
 	'exceptions (swallowed, wrong type, wrong message)',
 	'async (missing await, fire-and-forget)',
@@ -147,6 +148,18 @@ export function numberLines(text: string): string {
 		.join('\n');
 }
 
+/** How to check limit rules for this source language (extension → runner). */
+export function boundaryCheckHint(file: string): string {
+	const p = file.replace(/\\/g, '/');
+	if (/\.(js|jsx|mjs|cjs|ts|tsx)$/i.test(p)) {
+		return 'For every rule with a limit (thresholds, inclusive/exclusive bounds, rates, dates, rounding), run a one-off `node -e "..."` (or `npx tsx -e` for TypeScript) at the exact boundary value and compare the output with the spec. If you create a temporary file, delete it before finishing.';
+	}
+	if (/\.py$/i.test(p)) {
+		return 'For every rule with a limit (thresholds, inclusive/exclusive bounds, rates, dates, rounding), run a one-off `python -c "..."` at the exact boundary value and compare the output with the spec. If you create a temporary file, delete it before finishing.';
+	}
+	return 'For every rule with a limit (thresholds, inclusive/exclusive bounds, rates, dates, rounding), walk the exact boundary value against the code and the written spec (e.g. 60 units → which tier?). Do not create a temporary project or console host just to run one value — report from the code and finish.';
+}
+
 export function mapPrompt(opts: {
 	file: string;
 	numbered: string;
@@ -181,6 +194,8 @@ export function mapPrompt(opts: {
 		'Report only real defects (wrong behavior), not style. For each, quote the exact code of that line as evidence.',
 		`Report defects of \`${opts.file}\` only: calling a function defined in another file is not a defect here, even if that function is wrong.`,
 		'Each finding must name the written spec rule it breaks or a concrete input with its wrong output; leave out guesses about what the spec might want.',
+		boundaryCheckHint(opts.file),
+		'Do not modify source or test files.',
 		'Reply with JSON only:',
 		'{"findings":[{"file":"<path>","line":<n>,"kind":"<checklist item>","evidence":"<exact code>","description":"<what is wrong and what is expected>","confidence":<0..1>}]}',
 		'Use {"findings":[]} when the file has no defects.'

@@ -76,6 +76,14 @@ assert(
 	profileForTurn('explore', 'what does this repo do?', { askMode: true }) === 'ask',
 	'Ask mode profile'
 );
+assert(
+	profileForTurn('review', 'find the bugs', { reviewMode: true }) === 'review',
+	'Review mode profile'
+);
+const review = filterToolsByProfile(ALL, 'review');
+assert(review.has('read') && review.has('shell') && review.has('dotnet'), 'review keeps read/shell/dotnet');
+assert(!review.has('write') && !review.has('edit'), 'review denies write/edit');
+assert(review.has('web_search'), 'review keeps web from ask surface');
 
 const buildCore = filterToolsByProfile(ALL, 'build', {});
 assert(buildCore.has('write') && buildCore.has('shell'), 'build keeps write/shell');

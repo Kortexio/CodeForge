@@ -24,6 +24,7 @@ export function isEffectfulTool(name: string): boolean {
 export type DiagFinishGateInput = {
 	planMode?: boolean;
 	askMode?: boolean;
+	reviewMode?: boolean;
 	coachMode?: boolean;
 	statusQuestion?: boolean;
 	/** Model claimed blocked: <reason>. */
@@ -43,7 +44,9 @@ export type DiagFinishGateInput = {
  * (or blocked:) instead of accepting a diagnosis-only wrap-up.
  */
 export function shouldRefuseDiagFinish(input: DiagFinishGateInput): boolean {
-	if (input.planMode || input.askMode || input.coachMode || input.statusQuestion) return false;
+	if (input.planMode || input.askMode || input.reviewMode || input.coachMode || input.statusQuestion) {
+		return false;
+	}
 	if (input.blocked) return false;
 	if (input.effectfulCount > 0) return false;
 	if (input.anyToolCount < 1) return false;
@@ -55,6 +58,7 @@ export function shouldRefuseDiagFinish(input: DiagFinishGateInput): boolean {
 export type SpecSelfCheckInput = {
 	planMode?: boolean;
 	askMode?: boolean;
+	reviewMode?: boolean;
 	coachMode?: boolean;
 	statusQuestion?: boolean;
 	blocked?: boolean;
@@ -75,7 +79,9 @@ export type SpecSelfCheckInput = {
  * or no tests were touched. Path/oracle state only — not reply-text sniffing.
  */
 export function shouldRequestSpecSelfCheck(input: SpecSelfCheckInput): boolean {
-	if (input.planMode || input.askMode || input.coachMode || input.statusQuestion) return false;
+	if (input.planMode || input.askMode || input.reviewMode || input.coachMode || input.statusQuestion) {
+		return false;
+	}
 	if (input.blocked) return false;
 	if (!input.verifiedGreen) return false;
 	if (input.specCheckNudges >= 1) return false;
