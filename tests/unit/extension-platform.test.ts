@@ -13,6 +13,7 @@ import {
 	isBlockedCommand,
 	isSafeLocalCommand,
 	pickSandboxLevel,
+	runSandboxed,
 } from '../../extensions/codeforge/src/sandbox/runtime';
 import { parseMergeConflicts } from '../../extensions/codeforge/src/intelligence/gitTools';
 import { AgentStateMachine } from '../../extensions/codeforge/src/agent/stateMachine';
@@ -139,5 +140,33 @@ describe('ArtifactStore', () => {
 		expect(artifact).toBeTruthy();
 		expect(text.length).toBeLessThan(big.length);
 		expect(text).toContain('artifact');
+	});
+});
+
+describe('sandbox shell quoting', () => {
+	it('runs node -e with inner double quotes (the command must take effect)', async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'cf-quote-'));
+		const target = path.join(dir, 'x.txt');
+		await fs.writeFile(target, 'hi');
+		const r = await runSandboxed({
+			cwd: dir,
+			level: 'unrestricted',
+			command: `node -e "require('fs').unlinkSync('x.txt'); console.log('deleted')"`,
+		});
+		expect(r.exitCode).toBe(0);
+		expect(r.stdout).toContain('deleted');
+		await expect(fs.stat(target)).rejects.toThrow();
+	});
+
+	it('keeps && chaining with quoted arguments', async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'cf-quote-'));
+		const r = await runSandboxed({
+			cwd: dir,
+			level: 'unrestricted',
+			command: `node -e "console.log('a b')" && node -e "console.log(1 + 1)"`,
+		});
+		expect(r.exitCode).toBe(0);
+		expect(r.stdout).toContain('a b');
+		expect(r.stdout).toContain('2');
 	});
 });

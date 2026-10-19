@@ -298,6 +298,7 @@ export class VSCodeAIBridge {
         } catch {
             // parent may already exist
         }
+        const beforeFp = this.diagnosticsFingerprint(uri);
         await vscode.workspace.fs.writeFile(uri, Buffer.from(content, 'utf8'));
         try {
             const doc = await vscode.workspace.openTextDocument(uri);
@@ -305,7 +306,8 @@ export class VSCodeAIBridge {
         } catch {
             // open is best-effort
         }
-        return `Wrote ${filePath} (${content.length} chars)`;
+        const base = `Wrote ${filePath} (${content.length} chars)`;
+        return `${base}\n${await this.pollDiagnosticsAfterEdit(uri, filePath, beforeFp)}`;
     }
 
     /** Current text of a workspace file, or undefined when it does not exist. */
@@ -345,10 +347,13 @@ export class VSCodeAIBridge {
                 excerpt,
             ].join('\n');
         }
-        await vscode.workspace.fs.writeFile(this.resolveUri(filePath), Buffer.from(result.text, 'utf8'));
+        const uri = this.resolveUri(filePath);
+        const beforeFp = this.diagnosticsFingerprint(uri);
+        await vscode.workspace.fs.writeFile(uri, Buffer.from(result.text, 'utf8'));
         const excerpt = clipData(excerptAround(result.text, result.firstLine, newString), 4000);
         const total = result.text.split(/\r?\n/).length;
-        return `Edited ${filePath} (${result.count} replacement${result.count > 1 ? 's' : ''}; file now ${total} lines)\n${excerpt}`;
+        const base = `Edited ${filePath} (${result.count} replacement${result.count > 1 ? 's' : ''}; file now ${total} lines)\n${excerpt}`;
+        return `${base}\n${await this.pollDiagnosticsAfterEdit(uri, filePath, beforeFp)}`;
     }
 
 	private async applyPatchFile(patchText: string, fallbackPath?: string): Promise<string> {
@@ -361,6 +366,7 @@ export class VSCodeAIBridge {
 			throw new Error(`apply_patch: ${parsed.error}`);
 		}
 		const applied: string[] = [];
+		const diagPaths: string[] = [];
 		for (const hunk of parsed.hunks) {
 			const pathForHunk =
 				hunk.type === 'update' ? hunk.movePath || hunk.path : hunk.path;
@@ -370,11 +376,13 @@ export class VSCodeAIBridge {
 				/* best-effort */
 			}
 			if (hunk.type === 'add') {
-				await vscode.workspace.fs.writeFile(
-					this.resolveUri(hunk.path),
-					Buffer.from(hunk.contents, 'utf8')
-				);
+				const uri = this.resolveUri(hunk.path);
+				const beforeFp = this.diagnosticsFingerprint(uri);
+				await vscode.workspace.fs.writeFile(uri, Buffer.from(hunk.contents, 'utf8'));
 				applied.push(`A ${hunk.path}`);
+				diagPaths.push(
+					await this.pollDiagnosticsAfterEdit(uri, hunk.path, beforeFp)
+				);
 				continue;
 			}
 			if (hunk.type === 'delete') {
@@ -392,13 +400,17 @@ export class VSCodeAIBridge {
 				throw new Error(`apply_patch: ${updated.error}`);
 			}
 			const dest = hunk.movePath || hunk.path;
-			await vscode.workspace.fs.writeFile(this.resolveUri(dest), Buffer.from(updated.text, 'utf8'));
+			const uri = this.resolveUri(dest);
+			const beforeFp = this.diagnosticsFingerprint(uri);
+			await vscode.workspace.fs.writeFile(uri, Buffer.from(updated.text, 'utf8'));
 			if (hunk.movePath && hunk.movePath !== hunk.path) {
 				await vscode.workspace.fs.delete(this.resolveUri(hunk.path));
 			}
 			applied.push(`M ${dest}`);
+			diagPaths.push(await this.pollDiagnosticsAfterEdit(uri, dest, beforeFp));
 		}
-		return `Success. Updated the following files:\n${applied.join('\n')}`;
+		const diagBlock = diagPaths.length ? `\n${diagPaths.join('\n')}` : '';
+		return `Success. Updated the following files:\n${applied.join('\n')}${diagBlock}`;
 	}
 
     private async listDirectory(dirPath: string, recursive: boolean): Promise<string> {
@@ -648,6 +660,49 @@ export class VSCodeAIBridge {
         return lines.length ? lines.join('\n') : 'No diagnostics';
     }
 
+    private diagnosticsFingerprint(uri: vscode.Uri): string {
+        const diags = vscode.languages.getDiagnostics(uri) ?? [];
+        return diags
+            .map(
+                d =>
+                    `${d.range.start.line}:${d.severity}:${d.message}`
+            )
+            .sort()
+            .join('|');
+    }
+
+    private formatDiagnosticsBlock(uri: vscode.Uri, displayPath: string): string {
+        const diags = (vscode.languages.getDiagnostics(uri) ?? [])
+            .filter(d => d.severity === vscode.DiagnosticSeverity.Error)
+            .slice(0, 10);
+        if (!diags.length) {
+            return `No errors reported by the language server within 1.5s.`;
+        }
+        const lines = diags.map(
+            d => `${d.range.start.line + 1}: ${d.message}`
+        );
+        return `Diagnostics for ${displayPath} (errors, max 10):\n${lines.join('\n')}`;
+    }
+
+    /**
+     * After a successful mutate, poll LSP diagnostics every 150ms up to 1.5s
+     * until the set differs from the pre-edit fingerprint (or the deadline).
+     */
+    private async pollDiagnosticsAfterEdit(
+        uri: vscode.Uri,
+        displayPath: string,
+        beforeFingerprint: string
+    ): Promise<string> {
+        const deadline = Date.now() + 1500;
+        let last = this.diagnosticsFingerprint(uri);
+        while (Date.now() < deadline) {
+            if (last !== beforeFingerprint) break;
+            await new Promise(r => setTimeout(r, 150));
+            last = this.diagnosticsFingerprint(uri);
+        }
+        return this.formatDiagnosticsBlock(uri, displayPath);
+    }
+
     private agentPty: {
         write: (text: string) => void;
         ready: Promise<void>;
@@ -830,10 +885,11 @@ export class VSCodeAIBridge {
         }
 
         const { spawn } = await import('child_process');
-        const { scrubEnv } = await import('../sandbox/runtime');
+        const { scrubEnv, cmdExeSpawn } = await import('../sandbox/runtime');
         const isWin = process.platform === 'win32';
         const shell = isWin ? 'cmd.exe' : '/bin/bash';
-        const args = isWin ? ['/d', '/s', '/c', prepared.command] : ['-lc', prepared.command];
+        const cmdSpawn = isWin ? cmdExeSpawn(prepared.command) : undefined;
+        const args = cmdSpawn ? cmdSpawn.args : ['-lc', prepared.command];
         const childEnv =
             level === 'unrestricted' || level === 'safe-local'
                 ? { ...process.env }
@@ -882,6 +938,7 @@ export class VSCodeAIBridge {
                 cwd: prepared.cwd,
                 env: childEnv,
                 windowsHide: true,
+                windowsVerbatimArguments: !!cmdSpawn,
             });
             this.activeShellChild = child;
 

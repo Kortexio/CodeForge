@@ -4,6 +4,7 @@
 
 import { spawn } from 'child_process';
 import * as path from 'path';
+import { cmdExeSpawn } from '../sandbox/runtime';
 
 export interface BgShellJob {
 	id: string;
@@ -48,9 +49,11 @@ export function startBgShell(command: string, cwd?: string): BgShellJob {
 	};
 	jobs.set(id, job);
 
-	const child = spawn('cmd.exe', ['/d', '/s', '/c', command], {
+	const cmd = cmdExeSpawn(command);
+	const child = spawn('cmd.exe', cmd.args, {
 		cwd: workDir,
 		windowsHide: true,
+		windowsVerbatimArguments: cmd.windowsVerbatimArguments,
 		env: process.env,
 	});
 	child.stdout?.on('data', (b: Buffer) => {

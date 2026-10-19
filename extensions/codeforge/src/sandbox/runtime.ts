@@ -21,6 +21,15 @@ export const SANDBOX_LEVELS: SandboxLevel[] = [
 	'unrestricted',
 ];
 
+/**
+ * cmd.exe spawn args that keep inner double quotes intact.
+ * Without verbatim args Node escapes `"` as `\"`, which cmd passes through literally,
+ * so `node -e "..."` evaluates a string literal and exits 0 without running anything.
+ */
+export function cmdExeSpawn(command: string): { args: string[]; windowsVerbatimArguments: true } {
+	return { args: ['/d', '/s', '/c', `"${command}"`], windowsVerbatimArguments: true };
+}
+
 export function isSandboxLevel(value: unknown): value is SandboxLevel {
 	return typeof value === 'string' && (SANDBOX_LEVELS as string[]).includes(value);
 }
@@ -140,12 +149,12 @@ export function resolveSandboxLevel(
 	opts?: {
 		requested?: SandboxLevel;
 		risk?: 'low' | 'medium' | 'high';
-		configured?: SandboxLevel | string | null;
+		configured?: string | null;
 		fullFreedom?: boolean;
 	}
 ): SandboxLevel {
 	if (opts?.fullFreedom) return 'unrestricted';
-	const configured = isSandboxLevel(opts?.configured) ? opts!.configured : undefined;
+	const configured = isSandboxLevel(opts?.configured) ? opts.configured : undefined;
 	// Tool hint wins over configured default (except unrestricted setting forces floor).
 	if (configured === 'unrestricted') return 'unrestricted';
 	return pickSandboxLevel(command, opts?.requested ?? configured, opts?.risk ?? 'medium');
@@ -178,7 +187,8 @@ export async function runSandboxed(opts: SandboxOptions): Promise<SandboxResult>
 
 	const isWin = process.platform === 'win32';
 	const shell = opts.shell ?? (isWin ? 'cmd.exe' : '/bin/bash');
-	const args = opts.args ?? (isWin ? ['/d', '/s', '/c', opts.command] : ['-lc', opts.command]);
+	const cmdDefault = isWin && !opts.shell && !opts.args ? cmdExeSpawn(opts.command) : undefined;
+	const args = opts.args ?? cmdDefault?.args ?? (isWin ? ['/d', '/s', '/c', opts.command] : ['-lc', opts.command]);
 	const env =
 		level === 'safe-local' || level === 'unrestricted'
 			? { ...process.env, ...(opts.env ?? {}) }
@@ -188,6 +198,7 @@ export async function runSandboxed(opts: SandboxOptions): Promise<SandboxResult>
 		cwd: opts.cwd,
 		env,
 		windowsHide: true,
+		...(cmdDefault ? { windowsVerbatimArguments: true } : {}),
 	};
 
 	// isolated: attempt platform helpers; fall back to restricted semantics
@@ -199,7 +210,7 @@ export async function runSandboxed(opts: SandboxOptions): Promise<SandboxResult>
 	return spawnOnce(shell, args, spawnOpts, level, opts);
 }
 
-async function tryIsolatedHelper(
+function tryIsolatedHelper(
 	opts: SandboxOptions,
 	env: NodeJS.ProcessEnv
 ): Promise<SandboxResult | null> {
@@ -209,7 +220,7 @@ async function tryIsolatedHelper(
 	void binariesRoot;
 	void env;
 	void opts;
-	return null;
+	return Promise.resolve(null);
 }
 
 async function runDocker(opts: SandboxOptions): Promise<SandboxResult> {
