@@ -1,9 +1,11 @@
 /**
  * Optional Playwright-based browser agent.
+ * Cursor-style: mutate actions return post-action page state (observe after act).
  */
 
 import * as fs from 'fs/promises';
 import { getArtifactStore } from '../storage/artifacts';
+import { formatActionWithObservation, formatPageState, type PageState } from './observe';
 
 export interface BrowserSnapshot {
 	url: string;
@@ -37,18 +39,20 @@ interface PageLike {
 let browser: BrowserLike | null = null;
 let page: PageLike | null = null;
 
-async function loadPlaywright(): Promise<PlaywrightModule> {
+function loadPlaywright(): Promise<PlaywrightModule> {
 	try {
 		// Optional dependency — not bundled by default
-		// eslint-disable-next-line @typescript-eslint/no-require-imports
-		return require('playwright') as PlaywrightModule;
+		// eslint-disable-next-line @typescript-eslint/no-var-requires -- optional runtime dependency
+		return Promise.resolve(require('playwright') as PlaywrightModule);
 	} catch {
 		try {
-			// eslint-disable-next-line @typescript-eslint/no-require-imports
-			return require('playwright-core') as PlaywrightModule;
+			// eslint-disable-next-line @typescript-eslint/no-var-requires -- optional runtime dependency
+			return Promise.resolve(require('playwright-core') as PlaywrightModule);
 		} catch {
-			throw new Error(
-				'Playwright is not installed. Run `npm i playwright` in the extension folder, or use an MCP browser server.'
+			return Promise.reject(
+				new Error(
+					'Playwright is not installed. Run `npm i playwright` in the extension folder, or use an MCP browser server.'
+				)
 			);
 		}
 	}
@@ -62,10 +66,29 @@ async function ensurePage(headless = true): Promise<PageLike> {
 	return page;
 }
 
+function delay(ms: number): Promise<void> {
+	return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function captureState(): Promise<PageState> {
+	const snap = await browserSnapshot();
+	return { url: snap.url, title: snap.title, text: snap.text };
+}
+
 export async function browserNavigate(url: string): Promise<string> {
 	const p = await ensurePage();
+	const before = await captureState().catch(
+		(): PageState => ({ url: '', title: '', text: '' })
+	);
 	await p.goto(url, { waitUntil: 'domcontentloaded', timeout: 45_000 });
-	return `Navigated to ${p.url()} — title: ${await p.title()}`;
+	await delay(200);
+	const after = await captureState();
+	return formatActionWithObservation({
+		actionLine: `Navigated to ${after.url} — title: ${after.title}`,
+		before,
+		after,
+		warnIfUnchanged: false,
+	});
 }
 
 export async function browserSnapshot(): Promise<BrowserSnapshot> {
@@ -85,14 +108,30 @@ export async function browserSnapshot(): Promise<BrowserSnapshot> {
 
 export async function browserClick(selector: string): Promise<string> {
 	const p = await ensurePage();
+	const before = await captureState();
 	await p.click(selector);
-	return `Clicked ${selector}`;
+	await delay(350);
+	const after = await captureState();
+	return formatActionWithObservation({
+		actionLine: `Clicked ${selector}.`,
+		before,
+		after,
+		warnIfUnchanged: true,
+	});
 }
 
 export async function browserType(selector: string, text: string): Promise<string> {
 	const p = await ensurePage();
+	const before = await captureState();
 	await p.fill(selector, text);
-	return `Typed into ${selector}`;
+	await delay(200);
+	const after = await captureState();
+	return formatActionWithObservation({
+		actionLine: `Typed into ${selector}.`,
+		before,
+		after,
+		warnIfUnchanged: true,
+	});
 }
 
 export async function browserScreenshot(sessionId?: string): Promise<string> {
@@ -104,7 +143,13 @@ export async function browserScreenshot(sessionId?: string): Promise<string> {
 		buf,
 		sessionId
 	);
-	return `Screenshot saved as artifact ${artifact.id} (${artifact.bytes} bytes) at ${artifact.path}`;
+	const after = await captureState();
+	return [
+		`Screenshot saved as artifact ${artifact.id} (${artifact.bytes} bytes) at ${artifact.path}`,
+		'',
+		'### After (page state)',
+		formatPageState(after, 4000),
+	].join('\n');
 }
 
 export async function browserClose(): Promise<void> {
