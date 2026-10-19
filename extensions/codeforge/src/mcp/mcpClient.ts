@@ -7,7 +7,8 @@
 
 import * as vscode from 'vscode';
 import * as path from 'path';
-import { spawn, ChildProcessWithoutNullStreams } from 'child_process';
+import { spawn, execFileSync, ChildProcessWithoutNullStreams } from 'child_process';
+import { accessSync, constants } from 'fs';
 import { McpServerConfig } from '../settings/aiSettingsStore';
 import { parseEnvFile } from './mcpJsonFile';
 
@@ -302,7 +303,7 @@ export class McpClientManager {
 		return formatMcpResult(data.result);
 	}
 
-	async dispose(): Promise<void> {
+	dispose(): Promise<void> {
 		for (const [, proc] of this.processes) {
 			try {
 				proc.kill();
@@ -316,6 +317,7 @@ export class McpClientManager {
 		this.buffers.clear();
 		this.tools = [];
 		this.httpMeta.clear();
+		return Promise.resolve();
 	}
 
 	private async connectStdio(server: McpServerConfig): Promise<void> {
@@ -460,7 +462,7 @@ export class McpClientManager {
 		const framing = this.framing.get(serverId) ?? 'content-length';
 
 		if (framing === 'ndjson') {
-			while (true) {
+			for (;;) {
 				const nl = buf.indexOf(0x0a);
 				if (nl < 0) {
 					this.buffers.set(serverId, buf);
@@ -474,7 +476,7 @@ export class McpClientManager {
 			}
 		}
 
-		while (true) {
+		for (;;) {
 			const headerEnd = indexOfDoubleCrlf(buf);
 			if (headerEnd < 0) {
 				// Fallback: NDJSON line (some servers mix)
@@ -600,7 +602,6 @@ function findNodeExecutable(): string {
 		return process.execPath;
 	}
 	try {
-		const { execFileSync } = require('child_process') as typeof import('child_process');
 		if (process.platform === 'win32') {
 			const out = execFileSync('where.exe', ['node'], {
 				encoding: 'utf8',
@@ -627,7 +628,6 @@ function findNodeExecutable(): string {
 	];
 	for (const c of candidates) {
 		try {
-			const { accessSync, constants } = require('fs') as typeof import('fs');
 			accessSync(c, constants.X_OK);
 			return c;
 		} catch {

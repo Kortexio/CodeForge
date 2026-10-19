@@ -26,7 +26,7 @@ import {
 	mentionsErrorFile,
 	toolNamesFor,
 } from '../../extensions/codeforge/src/agent/toolsets';
-import { claimsBuildOrTestGreen, parseBlockedClaim, STATUS_UPDATE_NOTE } from '../../extensions/codeforge/src/agent/nudges';
+import { claimsBuildOrTestGreen, parseBlockedClaim, specSelfCheckNote } from '../../extensions/codeforge/src/agent/nudges';
 import {
 	appendProjectStatus,
 	buildDigest,
@@ -61,7 +61,7 @@ import {
 	parseFrontmatter,
 	type SkillDoc,
 } from '../../extensions/codeforge/src/skills/skillsRulesLoader';
-import { projectMemoryDir } from '../../extensions/codeforge/src/storage/paths';
+import { homeRoot, projectMemoryDir } from '../../extensions/codeforge/src/storage/paths';
 import * as os from 'os';
 import * as fs from 'fs';
 
@@ -338,12 +338,23 @@ describe('toolsets', () => {
 		expect(currentPhase('o que faz este projeto?', { buildRed: false })).toBe('explore');
 	});
 
-	it('returns the full tool surface; status questions only get update_status', () => {
-		const explore = toolNamesFor('explore', 'o que faz?', { weakProfile: true, allNames: all });
-		expect(explore.size).toBe(all.length);
-		expect(explore.has('write')).toBe(true);
-		expect(toolNamesFor('explore', 'x', { weakProfile: false, allNames: all }).size).toBe(all.length);
-		const withGit = toolNamesFor('implement', 'faz commit no git', { weakProfile: true, allNames: all });
+	it('returns CORE (+ groups/mcp); status questions only get update_status', () => {
+		const coreOnly = toolNamesFor('explore', 'o que faz?', {
+			weakProfile: true,
+			allNames: all,
+			mcpAvailable: true,
+		});
+		expect(coreOnly.has('write')).toBe(true);
+		expect(coreOnly.has('shell')).toBe(true);
+		expect(coreOnly.has('mcp_call')).toBe(true);
+		expect(coreOnly.has('git_status')).toBe(false);
+		expect(coreOnly.has('wiki_read')).toBe(false);
+		const withGit = toolNamesFor('implement', 'faz commit no git', {
+			weakProfile: true,
+			allNames: all,
+			mcpAvailable: true,
+			toolGroups: ['git'],
+		});
 		expect(withGit.has('git_status')).toBe(true);
 		expect(withGit.has('mcp_call')).toBe(true);
 		const statusOnly = toolNamesFor('explore', 'onde paramos no projeto?', {
@@ -393,6 +404,21 @@ describe('nudges', () => {
 		expect(parseBlockedClaim('Resumo...\nblocked: falta o SDK .NET 9')).toBe('falta o SDK .NET 9');
 		expect(parseBlockedClaim('bloqueado: sem acesso à rede')).toBe('sem acesso à rede');
 		expect(parseBlockedClaim('not blocked here')).toBeUndefined();
+	});
+
+	it('spec self-check requires executing boundary values, not re-reading', () => {
+		const note = specSelfCheckNote({
+			sourcePaths: ['src/pricing/coupons.js'],
+			specPaths: ['docs/pricing.md'],
+			testPaths: [],
+		});
+		expect(note).toContain('src/pricing/coupons.js');
+		expect(note).toContain('docs/pricing.md');
+		expect(note).toMatch(/Reading the code is not proof/);
+		expect(note).toMatch(/execute the code at the exact boundary value/);
+		expect(note).toMatch(/parse to midnight/);
+		expect(note).toMatch(/delete it before finishing; do not modify existing test files/);
+		expect(note).not.toMatch(/update tests if needed/);
 	});
 });
 
@@ -453,8 +479,8 @@ describe('project status', () => {
 		expect(block).toContain('Stopped at: Cart total is implemented');
 		expect(block).toContain('src/Cart.cs');
 		expect(block).toContain('Digest');
-		expect(STATUS_UPDATE_NOTE).toContain('update_status');
-		expect(shouldRequireStatusUpdate({ alreadyUpdated: false, nudges: 0 })).toBe(true);
+		// Soft preference only — harness no longer hard-requires update_status before finish.
+		expect(shouldRequireStatusUpdate({ alreadyUpdated: false, nudges: 0 })).toBe(false);
 		expect(shouldRequireStatusUpdate({ alreadyUpdated: true, nudges: 0 })).toBe(false);
 		expect(shouldRequireStatusUpdate({ isolated: true, alreadyUpdated: false, nudges: 0 })).toBe(false);
 		expect(shouldRequireStatusUpdate({ alreadyUpdated: false, nudges: 1 })).toBe(false);
@@ -830,5 +856,24 @@ describe('explore mode', () => {
 		expect(EXPLORE_MODE.id).toBe('explore');
 		expect(EXPLORE_MODE.systemPrompt).toMatch(/read-only/i);
 		expect(EXPLORE_MODE.systemPrompt).toMatch(/path:startLine-endLine/);
+	});
+});
+
+describe('homeRoot', () => {
+	const prev = process.env.CODEFORGE_HOME;
+	afterEach(() => {
+		if (prev === undefined) delete process.env.CODEFORGE_HOME;
+		else process.env.CODEFORGE_HOME = prev;
+	});
+
+	it('respects CODEFORGE_HOME override', () => {
+		const override = path.join(os.tmpdir(), 'cf-home-override-test');
+		process.env.CODEFORGE_HOME = override;
+		expect(homeRoot()).toBe(override);
+	});
+
+	it('trims CODEFORGE_HOME and falls back when empty', () => {
+		process.env.CODEFORGE_HOME = '  ';
+		expect(homeRoot()).toBe(path.join(os.homedir(), '.CodeForge'));
 	});
 });

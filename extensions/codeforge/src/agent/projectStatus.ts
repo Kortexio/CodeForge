@@ -269,10 +269,6 @@ function statusPath(workspaceRoot?: string): string {
 	return path.join(projectMemoryDir(workspaceRoot), STATUS_FILENAME);
 }
 
-function statusMdPath(workspaceRoot?: string): string {
-	return path.join(projectMemoryDir(workspaceRoot), STATUS_MD_FILENAME);
-}
-
 export async function loadProjectStatus(workspaceRoot?: string): Promise<ProjectStatusFile | null> {
 	try {
 		const raw = await fs.readFile(statusPath(workspaceRoot), 'utf8');

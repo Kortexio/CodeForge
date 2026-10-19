@@ -88,6 +88,20 @@ interface ChatMessage {
 	liveStatus?: string;
 }
 
+interface WebviewMessage {
+	type: string;
+	text?: unknown;
+	mode?: unknown;
+	level?: unknown;
+	action?: unknown;
+	uriList?: unknown;
+	blobs?: unknown;
+	url?: unknown;
+	id?: unknown;
+	messageIndex?: unknown;
+	code?: unknown;
+}
+
 export class ChatViewProvider implements vscode.WebviewViewProvider {
 	private _view?: vscode.WebviewView;
 	private _extensionUri: vscode.Uri;
@@ -238,12 +252,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
 	async loadSession(sessionId: string): Promise<void> {
 		if (this._running && this._currentSessionId && this._currentSessionId !== sessionId) {
-			vscode.window.showWarningMessage('Stop the agent before switching chats.');
+			void vscode.window.showWarningMessage('Stop the agent before switching chats.');
 			return;
 		}
 		const session = this._sessions.get(sessionId);
 		if (!session) {
-			vscode.window.showWarningMessage('Session not found');
+			void vscode.window.showWarningMessage('Session not found');
 			return;
 		}
 		this.stopPython();
@@ -259,7 +273,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		const userTurns = session.messages.filter(m => m.role === 'user').length;
 		const lastTurn = Math.max(0, userTurns - 1);
 		this._timeline = (session.toolTraces || []).slice(-80).map(t => {
-			const args = (t.arguments || {}) as Record<string, unknown>;
+			const args = (t.arguments || {});
 			const primary = String(
 				args.path ?? args.command ?? args.pattern ?? args.query ?? ''
 			)
@@ -291,7 +305,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 					.slice(0, 400),
 				tool: t.name,
 				toolCallId: t.id,
-				toolStatus: (t.success ? 'ok' : 'failed') as 'ok' | 'failed',
+				toolStatus: (t.success ? 'ok' : 'failed'),
 				success: t.success,
 				turn: t.turn ?? lastTurn,
 				ts: Date.parse(t.timestamp) || Date.now(),
@@ -321,7 +335,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 	async pickSessionHistory(): Promise<void> {
 		const sessions = this._sessions.list({ workspaceOnly: true });
 		if (!sessions.length) {
-			vscode.window.showInformationMessage('No chat sessions yet.');
+			void vscode.window.showInformationMessage('No chat sessions yet.');
 			return;
 		}
 		const picked = await vscode.window.showQuickPick(
@@ -357,7 +371,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
 		webviewView.webview.html = this._getHtmlContent();
 
-		webviewView.webview.onDidReceiveMessage(async message => {
+		webviewView.webview.onDidReceiveMessage(async (message: WebviewMessage) => {
 			switch (message.type) {
 				case 'ready':
 					this.pushConfig();
@@ -383,7 +397,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 					if (String(message.action) === 'start') {
 						await this.setMode('agent');
 						await this.focus();
-						this._view?.webview.postMessage({ type: 'focusInput' });
+						void this._view?.webview.postMessage({ type: 'focusInput' });
 					} else if (String(message.action) === 'instructions') {
 						await this.runGenerateInstructions();
 					}
@@ -474,7 +488,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
 	newChat() {
 		if (this._running) {
-			vscode.window.showWarningMessage('Stop the agent before opening a new chat.');
+			void vscode.window.showWarningMessage('Stop the agent before opening a new chat.');
 			return;
 		}
 		this.stopPython();
@@ -720,7 +734,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 	}
 
 	private pushQueue(): void {
-		this._view?.webview.postMessage({
+		void this._view?.webview.postMessage({
 			type: 'queue',
 			items: this._queue.map(item => ({ id: item.id, text: item.text })),
 			running: this._running,
@@ -742,7 +756,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		} catch {
 			/* ignore */
 		}
-		vscode.window.showInformationMessage('Task cancelled');
+		void vscode.window.showInformationMessage('Task cancelled');
 		this.updateLastMessage('assistant', 'Cancelled.');
 		this.pushActivity({
 			kind: 'checkpoint',
@@ -781,7 +795,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		this.pushConfig();
 	}
 
-	private async attachFromBlobs(
+	private attachFromBlobs(
 		blobs: Array<{ name: string; mime?: string; base64: string }>
 	): Promise<void> {
 		const next: PendingAttachment[] = [];
@@ -789,9 +803,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			const att = attachmentFromBlob(blob);
 			if (att) next.push(att);
 		}
-		if (!next.length) return;
+		if (!next.length) return Promise.resolve();
 		this._pendingAttachments = mergeAttachments(this._pendingAttachments, next);
 		this.pushConfig();
+		return Promise.resolve();
 	}
 
 	private attachHttpUrl(url: string): void {
@@ -833,7 +848,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 				this.pushConfig();
 			}
 		} catch (err) {
-			vscode.window.showWarningMessage(
+			void vscode.window.showWarningMessage(
 				`Could not set permissions: ${err instanceof Error ? err.message : String(err)}`
 			);
 			this.pushConfig();
@@ -914,7 +929,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		const configured = Boolean(server);
 		this._weakHarness = this.detectWeakHarness(server, model);
 		this._view.description = this.getModelLabel();
-		this._view.webview.postMessage({
+		void this._view.webview.postMessage({
 			type: 'config',
 			mode: this._mode,
 			permissions: this._permissions,
@@ -1041,7 +1056,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
 	private async undoAllEdits(): Promise<void> {
 		if (this._running) {
-			vscode.window.showWarningMessage('Stop the agent before undoing edits.');
+			void vscode.window.showWarningMessage('Stop the agent before undoing edits.');
 			return;
 		}
 		const n = await getEditJournal().undoAllPending({
@@ -1050,7 +1065,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			readRaw: p => this._bridge.readRaw(p),
 		});
 		await this.refreshEditSummary();
-		vscode.window.showInformationMessage(
+		void vscode.window.showInformationMessage(
 			n > 0 ? `Reverted ${n} file(s).` : 'No pending edits to undo.'
 		);
 	}
@@ -1058,7 +1073,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 	private async reviewPendingEdits(): Promise<void> {
 		const pending = getEditJournal().listPending();
 		if (!pending.length) {
-			vscode.window.showInformationMessage('No pending edits to review.');
+			void vscode.window.showInformationMessage('No pending edits to review.');
 			return;
 		}
 		const byPath = new Map<string, (typeof pending)[0]>();
@@ -1080,16 +1095,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
 	private async restoreCheckpoint(messageIndex: number): Promise<void> {
 		if (this._running) {
-			vscode.window.showWarningMessage('Stop the agent before restoring a checkpoint.');
+			void vscode.window.showWarningMessage('Stop the agent before restoring a checkpoint.');
 			return;
 		}
 		if (!Number.isFinite(messageIndex) || messageIndex < 0 || messageIndex >= this._messages.length) {
-			vscode.window.showWarningMessage('Could not find that message to restore.');
+			void vscode.window.showWarningMessage('Could not find that message to restore.');
 			return;
 		}
 		const msg = this._messages[messageIndex];
 		if (msg.role !== 'user') {
-			vscode.window.showWarningMessage('Restore checkpoint only works on your messages.');
+			void vscode.window.showWarningMessage('Restore checkpoint only works on your messages.');
 			return;
 		}
 
@@ -1112,7 +1127,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 				readRaw: p => this._bridge.readRaw(p),
 			});
 		} catch (err) {
-			vscode.window.showErrorMessage(
+			void vscode.window.showErrorMessage(
 				`Could not revert files: ${err instanceof Error ? err.message : String(err)}`
 			);
 		}
@@ -1130,8 +1145,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		await this.refreshEditSummary();
 		this.updateView();
 		this.pushConfig();
-		this._view?.webview.postMessage({ type: 'restorePrompt', text: promptText });
-		vscode.window.showInformationMessage('Checkpoint restored — prompt is back in the input box.');
+		void this._view?.webview.postMessage({ type: 'restorePrompt', text: promptText });
+		void vscode.window.showInformationMessage('Checkpoint restored — prompt is back in the input box.');
 	}
 
 	private async executeLocalAgent(
@@ -1190,6 +1205,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 				abortSignal: this._abort?.signal,
 				numCtx,
 				forceJson: server.forceJson === true,
+				sampling: server.sampling,
 				onStatus: text => this.setPendingLiveStatus(text),
 				onActivity: ev => this.pushActivity(ev),
 				onContextBadge: badge => {
@@ -1231,6 +1247,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 				abortSignal: this._abort?.signal,
 				numCtx,
 				forceJson: server.forceJson === true,
+				sampling: server.sampling,
 				onStatus: text => this.setPendingLiveStatus(text),
 				onActivity: ev => this.pushActivity(ev),
 				onContextBadge: badge => {
@@ -1285,6 +1302,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			abortSignal: this._abort?.signal,
 			numCtx,
 			forceJson: server.forceJson === true,
+			sampling: server.sampling,
 			onStatus: text => this.setPendingLiveStatus(text),
 			onActivity: ev => this.pushActivity(ev),
 			onContextBadge: badge => {
@@ -1410,13 +1428,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		const limit = effectiveContextBudget(configured, slots) ?? 0;
 
 		if (response.body && (ctype.includes('event-stream') || ctype.includes('octet-stream') || !ctype.includes('json'))) {
-			const reader = response.body.getReader();
+			const reader = (response.body as ReadableStream<Uint8Array>).getReader();
 			const decoder = new TextDecoder();
 			let buffer = '';
 			let content = '';
 			let lastUi = 0;
 			let usage: { prompt_tokens?: number; input_tokens?: number } | undefined;
-			while (true) {
+			for (;;) {
 				const { done, value } = await reader.read();
 				if (done) break;
 				buffer += decoder.decode(value, { stream: true });
@@ -1738,7 +1756,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			const collapseToolCards =
 				vscode.workspace.getConfiguration('codeforge.ai').get<boolean>('collapseToolCards') !==
 				false;
-			this._view.webview.postMessage({
+			void this._view.webview.postMessage({
 				type: 'updateMessages',
 				messages: this._messages,
 				timeline: this._timeline,
@@ -1776,7 +1794,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			.filter((t): t is { id: string; title: string } => !!t);
 		this._openSessionIds = open.map(t => t.id);
 		this.persistOpenTabs();
-		this._view.webview.postMessage({
+		void this._view.webview.postMessage({
 			type: 'tabs',
 			open,
 			active: this._currentSessionId,
@@ -1787,7 +1805,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 	private async switchTab(id: string): Promise<void> {
 		if (!id || id === this._currentSessionId) return;
 		if (this._running) {
-			vscode.window.showWarningMessage('Stop the agent before switching chats.');
+			void vscode.window.showWarningMessage('Stop the agent before switching chats.');
 			this.pushTabs();
 			return;
 		}
@@ -1797,7 +1815,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 	private async closeTab(id: string): Promise<void> {
 		if (!id) return;
 		if (this._running && id === this._currentSessionId) {
-			vscode.window.showWarningMessage('Stop the agent before closing this chat.');
+			void vscode.window.showWarningMessage('Stop the agent before closing this chat.');
 			return;
 		}
 		const idx = this._openSessionIds.indexOf(id);
@@ -1818,26 +1836,26 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
 	private async branchAt(messageIndex: number): Promise<void> {
 		if (this._running) {
-			vscode.window.showWarningMessage('Stop the agent before branching.');
+			void vscode.window.showWarningMessage('Stop the agent before branching.');
 			return;
 		}
 		if (!this._currentSessionId) {
-			vscode.window.showWarningMessage('Nothing to branch yet.');
+			void vscode.window.showWarningMessage('Nothing to branch yet.');
 			return;
 		}
 		const forked = await this._sessions.forkFrom(this._currentSessionId, messageIndex);
 		if (!forked) {
-			vscode.window.showWarningMessage('Could not branch at that message.');
+			void vscode.window.showWarningMessage('Could not branch at that message.');
 			return;
 		}
 		this.ensureOpenTab(forked.id);
 		await this.loadSession(forked.id);
-		vscode.window.showInformationMessage(`Opened branch: ${forked.title}`);
+		void vscode.window.showInformationMessage(`Opened branch: ${forked.title}`);
 	}
 
 	private async regenerateAt(messageIndex: number): Promise<void> {
 		if (this._running) {
-			vscode.window.showWarningMessage('Stop the agent before regenerating.');
+			void vscode.window.showWarningMessage('Stop the agent before regenerating.');
 			return;
 		}
 		if (
@@ -1881,7 +1899,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		this.stopPython();
 		const trimmed = code.trim();
 		if (!trimmed) {
-			this._view?.webview.postMessage({
+			void this._view?.webview.postMessage({
 				type: 'pythonResult',
 				ok: false,
 				output: 'No code to run.',
@@ -1892,7 +1910,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		try {
 			await fs.writeFile(tmp, trimmed, 'utf8');
 		} catch (err) {
-			this._view?.webview.postMessage({
+			void this._view?.webview.postMessage({
 				type: 'pythonResult',
 				ok: false,
 				output: err instanceof Error ? err.message : String(err),
@@ -1915,7 +1933,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 					env: process.env,
 				});
 			} catch (err) {
-				this._view?.webview.postMessage({
+				void this._view?.webview.postMessage({
 					type: 'pythonResult',
 					ok: false,
 					output: err instanceof Error ? err.message : String(err),
@@ -1926,20 +1944,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		}
 
 		this._pythonProc = proc;
-		this._view?.webview.postMessage({ type: 'pythonStatus', running: true });
+		void this._view?.webview.postMessage({ type: 'pythonStatus', running: true });
 		let output = '';
 		proc.stdout.on('data', (chunk: Buffer) => {
 			output += chunk.toString();
-			this._view?.webview.postMessage({ type: 'pythonChunk', text: chunk.toString() });
+			void this._view?.webview.postMessage({ type: 'pythonChunk', text: chunk.toString() });
 		});
 		proc.stderr.on('data', (chunk: Buffer) => {
 			output += chunk.toString();
-			this._view?.webview.postMessage({ type: 'pythonChunk', text: chunk.toString() });
+			void this._view?.webview.postMessage({ type: 'pythonChunk', text: chunk.toString() });
 		});
 		proc.on('close', code => {
 			this._pythonProc = undefined;
 			void fs.unlink(tmp).catch(() => undefined);
-			this._view?.webview.postMessage({
+			void this._view?.webview.postMessage({
 				type: 'pythonResult',
 				ok: code === 0,
 				output: output || `(exit ${code ?? '?'})`,
@@ -1949,7 +1967,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		proc.on('error', err => {
 			this._pythonProc = undefined;
 			void fs.unlink(tmp).catch(() => undefined);
-			this._view?.webview.postMessage({
+			void this._view?.webview.postMessage({
 				type: 'pythonResult',
 				ok: false,
 				output: err.message,
@@ -1965,7 +1983,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 				/* ignore */
 			}
 			this._pythonProc = undefined;
-			this._view?.webview.postMessage({
+			void this._view?.webview.postMessage({
 				type: 'pythonResult',
 				ok: false,
 				output: 'Stopped.',

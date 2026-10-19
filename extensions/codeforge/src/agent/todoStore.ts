@@ -43,7 +43,7 @@ export function writeTodos(
 		const content = String(raw.content ?? '').trim();
 		if (!content) continue;
 		const id = String(raw.id ?? '').trim() || `t${++i}`;
-		const status = (raw.status ?? byId.get(id)?.status ?? 'pending') as TodoStatus;
+		const status = (raw.status ?? byId.get(id)?.status ?? 'pending');
 		byId.set(id, { id, content, status });
 	}
 	const next = [...byId.values()];

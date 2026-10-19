@@ -7,6 +7,7 @@
 
 import * as vscode from 'vscode';
 import { randomUUID } from 'crypto';
+import { readFileSync } from 'fs';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { aiSettingsFile, ensureDir, homeRoot } from '../storage/paths';
@@ -22,6 +23,16 @@ export type ServerKind =
 	| 'vllm'
 	| 'lmstudio'
 	| 'custom';
+
+/** Optional sampling overrides for an AI server (applied over llmSamplingOptions). */
+export interface AiServerSampling {
+	temperature?: number;
+	top_p?: number;
+	top_k?: number;
+	presence_penalty?: number;
+	repeat_penalty?: number;
+	dry_multiplier?: number;
+}
 
 export interface AiServer {
 	id: string;
@@ -43,6 +54,8 @@ export interface AiServer {
 	forceJson?: boolean;
 	/** Optional embedding model id for semantic retrieve. */
 	embeddingModel?: string;
+	/** Optional sampling overrides for this server. */
+	sampling?: AiServerSampling;
 	enabled: boolean;
 }
 
@@ -147,6 +160,10 @@ export function getAiSettingsStore(): AiSettingsStore | undefined {
 	return boundStore;
 }
 
+function bindStore(store: AiSettingsStore): void {
+	boundStore = store;
+}
+
 export class AiSettingsStore {
 	private readonly _onDidChange = new vscode.EventEmitter<AiSettingsState>();
 	readonly onDidChange = this._onDidChange.event;
@@ -155,7 +172,7 @@ export class AiSettingsStore {
 	private activeProfileOverlay: SettingsProfile | undefined;
 
 	constructor(private readonly context: vscode.ExtensionContext) {
-		boundStore = this;
+		bindStore(this);
 	}
 
 	/** Point the AI panel at a tenant profile; pass undefined to restore global settings. */
@@ -266,7 +283,6 @@ export class AiSettingsStore {
 	private readDiskSync(): AiSettingsState | undefined {
 		try {
 			// sync read — getState is sync today
-			const { readFileSync } = require('fs') as typeof import('fs');
 			const raw = readFileSync(aiSettingsFile(), 'utf8');
 			const parsed = JSON.parse(raw) as AiSettingsState;
 			if (parsed && Array.isArray(parsed.servers)) {
@@ -693,7 +709,7 @@ export function mergeSettingsStates(a: AiSettingsState, b: AiSettingsState): AiS
 	// Prefer current profile active (a), then b, then first usable.
 	const fromA = preferActive(a);
 	const fromB = preferActive(b);
-	let activeServerId = fromA.serverId || fromB.serverId || list[0]?.id || null;
+	const activeServerId = fromA.serverId || fromB.serverId || list[0]?.id || null;
 	let activeModel = fromA.model || fromB.model || list[0]?.models[0] || null;
 	if (activeServerId) {
 		const srv = list.find(s => s.id === activeServerId);

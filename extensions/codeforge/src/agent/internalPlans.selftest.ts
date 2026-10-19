@@ -10,7 +10,7 @@ import {
 	pathAllowedByPlan,
 	type InternalPlan,
 } from './internalPlans';
-import { MAX_STEPS_PROMPT, STUCK_WRAP_PROMPT } from './nudges';
+import { stuckWrapPrompt } from './nudges';
 
 function assert(cond: boolean, msg: string): void {
 	if (!cond) throw new Error(msg);
@@ -55,7 +55,9 @@ const parsed = parseScaffoldPlanJson(
 assert(!!parsed && parsed.length === 2 && parsed[0].paths?.[0] === 'package.json', 'parse scaffold json');
 assert(parseScaffoldPlanJson('not json') === undefined, 'reject bad json');
 
-assert(/MAXIMUM STEPS/i.test(MAX_STEPS_PROMPT) && !/STUCK WITHOUT PROGRESS/i.test(MAX_STEPS_PROMPT), 'max-steps distinct');
-assert(/STUCK WITHOUT PROGRESS/i.test(STUCK_WRAP_PROMPT) && !/MAXIMUM STEPS/i.test(STUCK_WRAP_PROMPT), 'stuck wrap distinct');
+const stuck = stuckWrapPrompt('identical tool calls and results for 3 consecutive steps');
+assert(/STUCK WITHOUT PROGRESS/i.test(stuck) && !/MAXIMUM STEPS/i.test(stuck), 'stuck wrap distinct');
+assert(/State the stop reason above/i.test(stuck), 'stuck wrap asks for stop reason');
+assert(stuck.includes('identical tool calls and results for 3 consecutive steps'), 'stuck wrap includes cause');
 
 console.log('internalPlans.selftest: ok');

@@ -112,7 +112,7 @@ export function buildPriorAgentTranscript(
 		).slice(0, 100);
 		const start =
 			t.arguments.startLine !== undefined || t.arguments.offset !== undefined
-				? ` startLine=${t.arguments.startLine ?? t.arguments.offset}`
+				? ` startLine=${String(t.arguments.startLine ?? t.arguments.offset)}`
 				: '';
 		const bodyCap =
 			t.name === 'read'

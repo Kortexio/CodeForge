@@ -1,7 +1,7 @@
 /**
- * Soft read memory: a re-read of lines already returned in this run is answered from memory
- * (same content, marked as already in context) instead of being refused or re-fetched.
- * Pure — no vscode.
+ * Read path helpers: canonicalize keys, parse coverage, rebuild remembered windows for
+ * unchanged comparison / ledger, and invalidate after writes. Pure — no vscode.
+ * The agent loop always reads from disk; it may prefix `(unchanged since earlier read)`.
  */
 
 /** Canonical relative path key (slash-normalized, lowercased). */

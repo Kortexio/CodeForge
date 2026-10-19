@@ -2,10 +2,13 @@
  * Unit checks for OpenCode-style tool permission filtering (no test runner wired — run via node).
  */
 import {
+	CORE,
+	TOOL_GROUPS,
 	disabled,
 	filterToolsByProfile,
 	merge,
 	rulesetForProfile,
+	toolsForGroups,
 	type PermissionRuleset,
 } from './toolPermissions';
 import { profileForTurn } from './toolsets';
@@ -39,6 +42,13 @@ const ALL = [
 	'list',
 	'search',
 	'retrieve',
+	'diagnostics',
+	'apply_patch',
+	'dotnet',
+	'delete',
+	'rename',
+	'open',
+	'symbols',
 ];
 
 const denyWrite: PermissionRuleset = [
@@ -67,17 +77,30 @@ assert(
 	'Ask mode profile'
 );
 
-const build = filterToolsByProfile(ALL, 'build', { mcpAvailable: true });
-assert(build.has('write') && build.has('shell'), 'build keeps write/shell');
-assert(build.has('web_search') && build.has('web_fetch'), 'build keeps web tools');
-assert(build.has('todo_write') && build.has('await_shell'), 'build keeps todo/await');
-assert(build.has('delegate_task') && build.has('git_commit'), 'build keeps delegate/git write');
-assert(build.has('mcp_call'), 'build extras when mcp on');
-assert(build.has('browser_navigate'), 'build exposes browser');
+const buildCore = filterToolsByProfile(ALL, 'build', {});
+assert(buildCore.has('write') && buildCore.has('shell'), 'build keeps write/shell');
+assert(buildCore.has('todo_write') && buildCore.has('await_shell'), 'build keeps todo/await');
+assert(buildCore.has('delegate_task'), 'delegate always in build');
+assert(!buildCore.has('mcp_call'), 'build omits mcp by default');
+assert(!buildCore.has('web_search'), 'build CORE omits web by default');
+assert(!buildCore.has('browser_navigate'), 'build CORE omits browser by default');
+assert(!buildCore.has('git_commit'), 'build CORE omits git by default');
+for (const name of CORE) {
+	if (ALL.includes(name)) assert(buildCore.has(name), `CORE includes ${name}`);
+}
 
-const buildLean = filterToolsByProfile(ALL, 'build', {});
-assert(!buildLean.has('mcp_call'), 'build omits mcp by default');
-assert(buildLean.has('delegate_task'), 'delegate always in build');
+const buildGit = filterToolsByProfile(ALL, 'build', { toolGroups: ['git'] });
+assert(buildGit.has('git_commit') && buildGit.has('gh_pr_create'), 'git group enables git tools');
+assert(!buildGit.has('web_search'), 'git group does not enable web');
+
+const buildWeb = filterToolsByProfile(ALL, 'build', { toolGroups: ['web', 'browser'] });
+assert(buildWeb.has('web_search') && buildWeb.has('browser_navigate'), 'web+browser groups');
+
+assert(toolsForGroups(['git']).includes('git_status'), 'toolsForGroups git');
+assert(TOOL_GROUPS.files.includes('delete'), 'files group');
+
+const buildMcp = filterToolsByProfile(ALL, 'build', { mcpAvailable: true });
+assert(buildMcp.has('mcp_call'), 'build extras when mcp on');
 
 const plan = filterToolsByProfile(ALL, 'plan');
 assert(plan.has('read') && plan.has('wiki_fact'), 'plan allows wiki_fact');

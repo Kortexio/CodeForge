@@ -21,6 +21,7 @@ import {
 	runPlan,
 	savePlan,
 	selectCards,
+	shouldOrchestrateCards,
 	wantsNewApp,
 	type Plan,
 } from './orchestrator';
@@ -75,19 +76,30 @@ export async function runOrchestrated(
 	const root = opts.workspaceRoot;
 	if (!root) return undefined;
 	const forced = o.forced === true;
-	// Orchestrate only when explicitly forced (slash / multi-item). No auto-trigger from model size.
-	if (!forced) return undefined;
+	const cards = orderCards(selectCards(opts.task, findCards(root, nodeOracleFs)));
+	// Cards: auto when the task names them and ≥2 exist; slash forces even a single card.
+	// New-app multi-item planning still goes through buildPlan (forced or wantsNewApp).
+	const cardJob = shouldOrchestrateCards(opts.task, cards.length, forced);
+	if (!cardJob && !forced && !wantsNewApp(opts.task)) return undefined;
 
 	const oracleCfg = detectOracle(root, nodeOracleFs);
-	const plan = await buildPlan(opts, root, forced, !!oracleCfg);
+	const plan = await buildPlan(opts, root, forced || cardJob, !!oracleCfg);
 	if (!plan) return undefined;
 
 	const conventions = conventionsPath(root);
 	const planTaskId = `plan-${plan.createdAt}`;
+	const total = plan.items.length;
 	const publish = (p: Plan) => {
+		const done = p.items.filter(i => i.status === 'done').length;
+		const current = p.items.find(i => i.status === 'running');
+		const label = current
+			? `${done + 1} of ${p.items.length} — ${current.title}`
+			: done === p.items.length
+				? `Done — ${done} of ${p.items.length}`
+				: `${done} of ${p.items.length} complete`;
 		opts.onTaskUpdate?.({
 			id: planTaskId,
-			name: `Plan: ${p.items.length} items`,
+			name: label,
 			status: p.items.every(i => i.status === 'done')
 				? 'completed'
 				: p.items.some(i => i.status === 'blocked')
@@ -95,13 +107,18 @@ export async function runOrchestrated(
 					: 'running',
 			subtasks: p.items.map(i => ({
 				id: i.id,
-				name: `${i.id} ${i.title}`,
+				name: i.title,
 				status:
 					i.status === 'done' ? 'completed' : i.status === 'blocked' ? 'failed' : i.status === 'running' ? 'running' : 'pending',
 			})),
 		});
 	};
 	publish(plan);
+	opts.onStatus?.(`Working through ${total} parts…`);
+	opts.onActivity?.({
+		kind: 'thinking',
+		label: `Working through ${total} parts…`,
+	});
 
 	const verify = async (): Promise<{ ok: boolean; text: string }> => {
 		if (!oracleCfg) return { ok: true, text: '' };
@@ -122,9 +139,16 @@ export async function runOrchestrated(
 		save: p => savePlan(root, p),
 		onUpdate: publish,
 		runItem: async (item, p) => {
+			const idx = p.items.indexOf(item) + 1;
 			const card = item.source ? nodeOracleFs.readText(path.join(root, item.source)) : undefined;
-			opts.onStatus?.(`${item.id} — ${item.title} (attempt ${item.attempts})`);
-			opts.onActivity?.({ kind: 'checkpoint', label: `Plan: ${item.id}`, detail: item.title });
+			const progress = `${idx} of ${total}`;
+			const retry = item.attempts > 1 ? ' — retrying' : '';
+			// Live status only — no "Plan:/attempt/sub-run" jargon in the stream.
+			opts.onStatus?.(`Working on ${item.title} (${progress})${retry}…`);
+			opts.onActivity?.({
+				kind: 'thinking',
+				label: `Working on ${item.title} (${progress})${retry}…`,
+			});
 			const reply = await runAgentWithTools({
 				...opts,
 				task: itemPrompt(p, item, {
@@ -141,6 +165,13 @@ export async function runOrchestrated(
 			const blocked = parseBlockedClaim(reply);
 			if (blocked) return { ok: false, reply, blocked };
 			const check = await verify();
+			if (check.ok) {
+				opts.onStatus?.(`Finished ${item.title} (${progress})…`);
+				opts.onActivity?.({
+					kind: 'thinking',
+					label: `Finished ${item.title} (${progress})…`,
+				});
+			}
 			return check.ok ? { ok: true, reply } : { ok: false, reply, error: check.text };
 		},
 	});

@@ -12,6 +12,11 @@ export interface AgentModeDefinition {
 	toolNamespaces?: string[];
 	/** Skill ids / trigger hints preferred in this mode. */
 	skillHints?: string[];
+	/**
+	 * Optional tool groups to enable on top of CORE in Agent (build) profile
+	 * (git | wiki | browser | web | media | notebook | navigation | files).
+	 */
+	toolGroups?: string[];
 }
 
 export interface Disposable {

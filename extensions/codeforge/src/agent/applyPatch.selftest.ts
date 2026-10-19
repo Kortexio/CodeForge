@@ -18,11 +18,11 @@ const parsed = parsePatch(`*** Begin Patch
 -const x = 1;
 +const x = 2;
 *** End Patch`);
-assert(parsed.ok && parsed.hunks.length === 1 && parsed.hunks[0]!.type === 'update', 'parse update');
+assert(parsed.ok && parsed.hunks.length === 1 && parsed.hunks[0].type === 'update', 'parse update');
 
 const file = 'const x = 1;\nconst y = 2;\n';
-if (parsed.ok && parsed.hunks[0]!.type === 'update') {
-	const r = applyUpdateToText(file, parsed.hunks[0]!.chunks);
+if (parsed.ok && parsed.hunks[0].type === 'update') {
+	const r = applyUpdateToText(file, parsed.hunks[0].chunks);
 	assert(r.ok && r.text.includes('const x = 2'), 'apply update');
 }
 
@@ -30,7 +30,7 @@ const add = parsePatch(`*** Begin Patch
 *** Add File: hi.ts
 +export const hi = 1;
 *** End Patch`);
-assert(add.ok && add.hunks[0]!.type === 'add', 'parse add');
+assert(add.ok && add.hunks[0].type === 'add', 'parse add');
 
 const bad = parsePatch('');
 assert(!bad.ok, 'empty fails');

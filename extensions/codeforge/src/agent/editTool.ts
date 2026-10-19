@@ -6,6 +6,7 @@
  * 1. Exact (after CRLF normalization / LF view)
  * 2. Unicode-normalized (smart quotes, dashes, NBSP)
  * 3. Line-wise ignoring trailing whitespace
+ * 4. Indent-tolerant (tabs vs spaces / indent depth) when exactly one match
  */
 
 export type EditResult =
@@ -74,6 +75,49 @@ export function closestLines(fileText: string, oldString: string, n = 3): string
 		.map(x => `${String(x.i + 1).padStart(4, ' ')}|${x.line}`);
 }
 
+/**
+ * Numbered window around the best-matching line (read-tool format: `  N|text`).
+ * Includes `radius` lines before the match and after the old_string span.
+ */
+export function closestWindow(fileText: string, oldString: string, radius = 15): string {
+	const lines = fileText.split(/\r?\n/);
+	if (!lines.length) return '';
+	const probe =
+		oldString.split('\n').find(l => l.trim().length >= 3)?.trim() ?? oldString.trim();
+	let bestIdx = 0;
+	if (probe) {
+		let bestScore = -1;
+		for (let i = 0; i < lines.length; i++) {
+			const line = lines[i].replace(/\r$/, '');
+			if (!line.trim()) continue;
+			const s = similarity(probe, line);
+			if (s > bestScore) {
+				bestScore = s;
+				bestIdx = i;
+			}
+		}
+	}
+	const span = Math.max(1, oldString.split('\n').length);
+	const from = Math.max(0, bestIdx - radius);
+	const to = Math.min(lines.length - 1, bestIdx + span - 1 + radius);
+	const out: string[] = [];
+	for (let i = from; i <= to; i++) {
+		out.push(`${String(i + 1).padStart(4, ' ')}|${lines[i].replace(/\r$/, '')}`);
+	}
+	return out.join('\n');
+}
+
+/** First `limit` lines of a file in read-tool numbered format. */
+export function numberedExcerpt(fileText: string, limit = 120): string {
+	const lines = fileText.split(/\r?\n/);
+	const end = Math.min(lines.length, Math.max(1, limit));
+	const out: string[] = [];
+	for (let i = 0; i < end; i++) {
+		out.push(`${String(i + 1).padStart(4, ' ')}|${lines[i].replace(/\r$/, '')}`);
+	}
+	return out.join('\n');
+}
+
 function findOccurrences(hay: string, needle: string): Match[] {
 	const result: Match[] = [];
 	if (!needle) return result;
@@ -86,24 +130,35 @@ function findOccurrences(hay: string, needle: string): Match[] {
 	}
 }
 
-/** Line-wise match ignoring trailing whitespace on each line. */
-function findLineOccurrences(content: string, search: string): Match[] {
-	const trailingNewline = search.endsWith('\n');
-	const expected = search.split('\n');
-	if (trailingNewline) expected.pop();
-	const lines = [...content.matchAll(/[^\n]*(?:\n|$)/g)]
+/** Split content into line records with offsets (LF view). */
+function lineRecords(content: string): Array<{
+	start: number;
+	end: number;
+	text: string;
+	contentEnd: number;
+	newline: boolean;
+}> {
+	return [...content.matchAll(/[^\n]*(?:\n|$)/g)]
 		.filter(match => match[0] !== '')
 		.map(match => {
 			const newline = match[0].endsWith('\n');
 			const text = newline ? match[0].slice(0, -1) : match[0];
 			return {
-				start: match.index!,
-				end: match.index! + match[0].length,
+				start: match.index,
+				end: match.index + match[0].length,
 				text,
-				contentEnd: match.index! + text.length - (text.endsWith('\r') ? 1 : 0),
+				contentEnd: match.index + text.length - (text.endsWith('\r') ? 1 : 0),
 				newline,
 			};
 		});
+}
+
+/** Line-wise match ignoring trailing whitespace on each line. */
+function findLineOccurrences(content: string, search: string): Match[] {
+	const trailingNewline = search.endsWith('\n');
+	const expected = search.split('\n');
+	if (trailingNewline) expected.pop();
+	const lines = lineRecords(content);
 	const candidates = lines.flatMap((line, index) => {
 		const actual = lines.slice(index, index + expected.length);
 		if (actual.length !== expected.length) return [];
@@ -114,7 +169,7 @@ function findLineOccurrences(content: string, search: string): Match[] {
 			)
 		)
 			return [];
-		const last = actual[actual.length - 1]!;
+		const last = actual[actual.length - 1];
 		if (trailingNewline && !last.newline) return [];
 		return [{ start: line.start, end: trailingNewline ? last.end : last.contentEnd }];
 	});
@@ -125,12 +180,99 @@ function findLineOccurrences(content: string, search: string): Match[] {
 	}, []);
 }
 
+/**
+ * Line-wise match ignoring leading indentation (tabs vs spaces / depth).
+ * Only used when it yields exactly one match.
+ */
+function findIndentTolerantOccurrences(content: string, search: string): Match[] {
+	const trailingNewline = search.endsWith('\n');
+	const expected = search.split('\n');
+	if (trailingNewline) expected.pop();
+	if (!expected.length || !expected.some(l => l.trim())) return [];
+	const lines = lineRecords(content);
+	const candidates = lines.flatMap((line, index) => {
+		const actual = lines.slice(index, index + expected.length);
+		if (actual.length !== expected.length) return [];
+		if (
+			!actual.every(
+				(item, lineIndex) =>
+					normalizeForMatch(item.text.trimStart().trimEnd()) ===
+					normalizeForMatch(expected[lineIndex].trimStart().trimEnd())
+			)
+		)
+			return [];
+		const last = actual[actual.length - 1];
+		if (trailingNewline && !last.newline) return [];
+		return [{ start: line.start, end: trailingNewline ? last.end : last.contentEnd }];
+	});
+	return candidates.reduce<Match[]>((result, candidate) => {
+		if (result.some(match => match.end > candidate.start && match.start < candidate.end)) return result;
+		result.push(candidate);
+		return result;
+	}, []);
+}
+
+function leadingWs(line: string): string {
+	return (/^[\t ]*/.exec(line) || [''])[0];
+}
+
+function expandTabs(indent: string, tabWidth = 4): string {
+	return indent.replace(/\t/g, ' '.repeat(tabWidth));
+}
+
+function detectIndentUnit(fileLines: string[]): { unit: string; usesTabs: boolean } {
+	const indents = fileLines.map(leadingWs).filter(i => i.length > 0);
+	if (indents.some(i => i.includes('\t'))) {
+		return { unit: '\t', usesTabs: true };
+	}
+	const lengths = indents.map(i => expandTabs(i).length).filter(n => n > 0);
+	if (!lengths.length) return { unit: '  ', usesTabs: false };
+	let g = lengths[0];
+	for (const n of lengths) {
+		let a = g;
+		let b = n;
+		while (b) {
+			const t = b;
+			b = a % b;
+			a = t;
+		}
+		g = a;
+	}
+	const width = g >= 2 && g <= 8 ? g : 2;
+	return { unit: ' '.repeat(width), usesTabs: false };
+}
+
+/**
+ * Re-indent new_string so its structure matches old_string but base indent matches the file region.
+ */
+export function reindentToFile(fileRegion: string, oldString: string, newString: string): string {
+	const fileLines = fileRegion.replaceAll(CRLF, '\n').split('\n');
+	const oldLines = oldString.replaceAll(CRLF, '\n').split('\n');
+	const newLines = newString.replaceAll(CRLF, '\n').split('\n');
+	const { usesTabs } = detectIndentUnit(fileLines);
+
+	const oldBaseSpaces = expandTabs(leadingWs(oldLines.find(l => l.trim()) ?? '')).length;
+	const fileBaseSpaces = expandTabs(leadingWs(fileLines.find(l => l.trim()) ?? '')).length;
+
+	return newLines
+		.map(line => {
+			if (!line.trim()) return '';
+			const lineSpaces = expandTabs(leadingWs(line)).length;
+			const targetSpaces = Math.max(0, fileBaseSpaces + (lineSpaces - oldBaseSpaces));
+			const prefix = usesTabs
+				? '\t'.repeat(Math.round(targetSpaces / 4))
+				: ' '.repeat(targetSpaces);
+			return prefix + line.trimStart();
+		})
+		.join('\n');
+}
+
 function countBefore(positions: number[], offset: number): number {
 	let low = 0;
 	let high = positions.length;
 	while (low < high) {
 		const middle = (low + high) >> 1;
-		if (positions[middle]! < offset) low = middle + 1;
+		if (positions[middle] < offset) low = middle + 1;
 		else high = middle;
 	}
 	return low;
@@ -152,7 +294,7 @@ function matchView(source: string, oldString: string, newString: string): {
 	replace: (match: Match) => string;
 } {
 	const view = source.replaceAll(CRLF, '\n');
-	const removed = [...source.matchAll(/\r\n/g)].map((match, index) => match.index! - index);
+	const removed = [...source.matchAll(/\r\n/g)].map((match, index) => match.index - index);
 	const fileEnding = lineEnding(source, '\n');
 	const search = oldString.replaceAll(CRLF, '\n');
 	const replacement = newString.replaceAll(CRLF, '\n');
@@ -164,8 +306,17 @@ function matchView(source: string, oldString: string, newString: string): {
 			: findOccurrences(normalizeForMatch(view), normalizeForMatch(search));
 	const trailing =
 		exact.length > 0 || unicode.length > 0 ? [] : findLineOccurrences(view, search);
+	const indentRaw =
+		exact.length > 0 || unicode.length > 0 || trailing.length > 0
+			? []
+			: findIndentTolerantOccurrences(view, search);
+	/** Indent tier only when it yields exactly one match. */
+	const indent = indentRaw.length === 1 ? indentRaw : [];
+	const useIndent = indent.length === 1;
 
-	const matches = (exact.length > 0 ? exact : unicode.length > 0 ? unicode : trailing).map(match => ({
+	const viewMatches = exact.length > 0 ? exact : unicode.length > 0 ? unicode : trailing.length > 0 ? trailing : indent;
+
+	const matches = viewMatches.map(match => ({
 		start: match.start + countBefore(removed, match.start),
 		end: match.end + countBefore(removed, match.end),
 	}));
@@ -175,7 +326,12 @@ function matchView(source: string, oldString: string, newString: string): {
 		replace: (match: Match) => {
 			const region = source.slice(match.start, match.end);
 			const ending = lineEnding(region, fileEnding);
-			const lines = replacement.split('\n');
+			let repl = replacement;
+			if (useIndent) {
+				const regionView = region.replaceAll(CRLF, '\n');
+				repl = reindentToFile(regionView, search, replacement);
+			}
+			const lines = repl.split('\n');
 			return lines
 				.map((line, i) => (i === lines.length - 1 ? line : line + ending))
 				.join('');
@@ -189,8 +345,8 @@ export function applyEdit(
 	newStringRaw: string,
 	replaceAll = false
 ): EditResult {
-	let oldString = stripReadLineNumbers(String(oldStringRaw ?? ''));
-	let newString = stripReadLineNumbers(String(newStringRaw ?? ''));
+	const oldString = stripReadLineNumbers(String(oldStringRaw ?? ''));
+	const newString = stripReadLineNumbers(String(newStringRaw ?? ''));
 	if (!oldString) {
 		return {
 			ok: false,
@@ -224,13 +380,13 @@ export function applyEdit(
 				alreadyApplied: true,
 			};
 		}
-		const near = closestLines(fileText, oldString);
+		const near = closestWindow(fileText, oldString);
 		return {
 			ok: false,
 			error: [
-				'old_string was not found in the file. It must match exactly (including whitespace and indentation), or match after Unicode/trailing-whitespace normalization.',
-				near.length ? 'Closest lines (copy the exact text from here or read the file again):' : '',
-				...near,
+				'old_string was not found in the file. It must match exactly (including whitespace and indentation), or match after Unicode/trailing-whitespace/indent-tolerant normalization.',
+				near ? 'Closest window (copy the exact text from here or read the file again):' : '',
+				near,
 			]
 				.filter(Boolean)
 				.join('\n'),
@@ -245,7 +401,7 @@ export function applyEdit(
 	}
 
 	const chosen = replaceAll ? matches : matches.slice(0, 1);
-	const first = chosen[0]!;
+	const first = chosen[0];
 	const firstLine = fileText.slice(0, first.start).split('\n').length;
 	let text = fileText;
 	for (const match of [...chosen].reverse()) {

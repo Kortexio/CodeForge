@@ -67,13 +67,14 @@ export function llmThinkingRequestFields(input: ThinkingRoundInput): Record<stri
 export function llmSamplingOptions(input: ThinkingRoundInput): {
 	temperature: number;
 	top_p: number;
+	presence_penalty?: number;
 } {
 	if (shouldEnableThinking(input)) {
 		return { temperature: 0.6, top_p: 0.95 };
 	}
 	if (shouldDisableThinking(input) || modelLikelySupportsThinking(input.model)) {
-		// Non-thinking / tool rounds
-		return { temperature: 0.7, top_p: 0.8 };
+		// Non-thinking / tool rounds — presence_penalty reduces degenerate repeats on Q2 quant.
+		return { temperature: 0.7, top_p: 0.8, presence_penalty: 1.0 };
 	}
 	// Non-reasoning models keep the historical deterministic default
 	return { temperature: 0.2, top_p: 1 };
@@ -105,6 +106,8 @@ export function toolAwareMaxTokens(
 const THINK_BLOCK_RE = /<think\b[^>]*>[\s\S]*?<\/think>/gi;
 const CHANNEL_THINK_RE =
 	/<\|channel\|>analysis<\|message\|>[\s\S]*?(?=<\|start\|>assistant<\|channel\|>final<\|message\|>|$)/gi;
+/** Lines that only echo the soft switch the harness appends to user turns. */
+const SOFT_SWITCH_LINE_RE = /^[ \t]*\/(?:no_)?think[ \t]*$/gim;
 
 /** Pull visible CoT out of assistant text for the UI; strip before history. */
 export function splitThinkContent(raw: string): { content: string; reasoning: string } {
@@ -123,6 +126,7 @@ export function splitThinkContent(raw: string): { content: string; reasoning: st
 		if (inner.trim()) parts.push(inner.trim());
 		return '';
 	});
+	without = without.replace(SOFT_SWITCH_LINE_RE, '');
 	return {
 		content: without.replace(/^\s+|\s+$/g, '').replace(/\n{3,}/g, '\n\n'),
 		reasoning: parts.join('\n\n').trim(),

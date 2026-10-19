@@ -10,10 +10,10 @@ import { getGovernanceStore } from '../governance/governanceStore';
 const AGENTS_FILE = 'AGENTS.md';
 const MAX_INJECT_CHARS = 12_000;
 
-export async function agentsMdUri(): Promise<vscode.Uri | undefined> {
+export function agentsMdUri(): Promise<vscode.Uri | undefined> {
 	const folder = vscode.workspace.workspaceFolders?.[0];
-	if (!folder) return undefined;
-	return vscode.Uri.joinPath(folder.uri, AGENTS_FILE);
+	if (!folder) return Promise.resolve(undefined);
+	return Promise.resolve(vscode.Uri.joinPath(folder.uri, AGENTS_FILE));
 }
 
 export async function agentsMdExists(): Promise<boolean> {

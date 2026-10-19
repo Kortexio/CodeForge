@@ -96,10 +96,10 @@ export async function gotoDefinition(filePath: string, line: number, character: 
 		.slice(0, 10)
 		.map(d => {
 			if ('targetUri' in d) {
-				const link = d as vscode.LocationLink;
+				const link = d;
 				return `${vscode.workspace.asRelativePath(link.targetUri)}:${(link.targetRange?.start.line ?? 0) + 1}`;
 			}
-			const loc = d as vscode.Location;
+			const loc = d;
 			return `${vscode.workspace.asRelativePath(loc.uri)}:${loc.range.start.line + 1}`;
 		})
 		.join('\n');

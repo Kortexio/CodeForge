@@ -100,7 +100,7 @@ export function extractFactsFromTool(
 		}
 		const base = pathArg ? toRel(String(pathArg), root) : '.';
 		const childPaths = children.map(c => {
-			const name = c.replace(/^[\[\]\w\s]+\s+/, '').trim() || c;
+			const name = c.replace(/^[[\]\w\s]+\s+/, '').trim() || c;
 			return base === '.' ? name : `${base.replace(/\\/g, '/')}/${name}`.replace(/\/+/g, '/');
 		});
 		facts = mergeStableFacts(facts, { keyPaths: childPaths });
@@ -125,7 +125,7 @@ export function extractFactsFromTool(
 		facts = mergeStableFacts(facts, {
 			keyPaths: [toRel(pathArg, root)],
 			decisions: [`wrote ${toRel(pathArg, root)}`],
-			openErrors: facts.openErrors.filter(e => !e.includes(toRel(pathArg!, root))),
+			openErrors: facts.openErrors.filter(e => !e.includes(toRel(pathArg, root))),
 		});
 	}
 

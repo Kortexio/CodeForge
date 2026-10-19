@@ -81,7 +81,7 @@ function readUpdateConfig() {
 	const cfg = vscode.workspace.getConfiguration('codeforge.update');
 	const ext = vscode.extensions.getExtension('kortexio.codeforge');
 	const pkgVersion =
-		(ext?.packageJSON?.version as string | undefined) ||
+		(ext?.packageJSON as { version?: string } | undefined)?.version ||
 		cfg.get<string>('currentVersion') ||
 		'0.0.0';
 	const currentVersion = (cfg.get<string>('currentVersion') || '').trim() || pkgVersion;

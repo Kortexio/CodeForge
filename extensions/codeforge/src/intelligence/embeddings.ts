@@ -48,6 +48,7 @@ function resolveEndpoint(): { base: string; apiKey: string; model: string } | nu
 	}
 	// Fallback to VS Code config without importing vscode at module top for tests
 	try {
+		// eslint-disable-next-line @typescript-eslint/no-var-requires -- vscode is absent outside the extension host
 		const vscode = require('vscode') as typeof import('vscode');
 		const cfg = vscode.workspace.getConfiguration('codeforge.ai');
 		const provider = cfg.get<string>('provider') || 'openai';

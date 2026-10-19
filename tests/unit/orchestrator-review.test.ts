@@ -16,6 +16,7 @@ import {
 	resumablePlan,
 	runPlan,
 	selectCards,
+	shouldOrchestrateCards,
 	summarizeReply,
 	wantsNewApp,
 	type CardDoc,
@@ -60,6 +61,17 @@ describe('orchestrator: cards', () => {
 		expect(selectCards('implementa os cards C02 a C04', cards).map(c => c.id)).toEqual(['C02', 'C03', 'C04']);
 		expect(selectCards('faz o C05 e o C01', cards).map(c => c.id)).toEqual(['C01', 'C05']);
 		expect(selectCards('implementa os cards', cards)).toHaveLength(5);
+		expect(
+			selectCards('Implement the cards `docs/C01.md` to `docs/C05.md` in order', cards).map(c => c.id)
+		).toEqual(['C01', 'C02', 'C03', 'C04', 'C05']);
+	});
+
+	it('auto-orchestrates multi-card tasks; slash forces a single card', () => {
+		expect(shouldOrchestrateCards('Implement cards docs/C01.md to docs/C05.md', 5, false)).toBe(true);
+		expect(shouldOrchestrateCards('fix the typo in RouteId.cs', 5, false)).toBe(false);
+		expect(shouldOrchestrateCards('Implement cards C01-C05', 1, false)).toBe(false);
+		expect(shouldOrchestrateCards('Implement the cards', 1, true)).toBe(true);
+		expect(shouldOrchestrateCards('anything', 0, true)).toBe(false);
 	});
 
 	it('finds cards in docs/ with an injected fs', () => {

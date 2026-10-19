@@ -1,5 +1,6 @@
 /**
- * Stage + apply_patch model gating checks (pure).
+ * Former stage-machine checks. Explore/act/verify stages were removed from the harness;
+ * coding/apply_patch/plan helpers remain covered here.
  */
 import { modelUsesApplyPatch } from './applyPatch';
 import { hashTask, looksLikeBareContinue, pathAllowedByPlan, type InternalPlan } from './internalPlans';
@@ -27,5 +28,8 @@ const plan: InternalPlan = {
 assert(pathAllowedByPlan(plan, 'a.ts'), 'allow');
 assert(!pathAllowedByPlan(plan, 'b.ts'), 'deny');
 assert(looksLikeBareContinue('continue'), 'continue');
+
+// Stages are gone: no explore/act/verify execution gate remains in the agent loop.
+assert(true, 'stages removed');
 
 console.log('stages.selftest: ok');

@@ -1,7 +1,13 @@
 /**
  * Ensures every agent tool has a non-empty contract description.
  */
-import { TOOL_DESCRIPTIONS, TOOL_SYSTEM_CONTRACT, toolDescription } from './toolContracts';
+import {
+	TOOL_DESCRIPTIONS,
+	TOOL_SYSTEM_CONTRACT,
+	buildToolSystemContract,
+	toolDescription,
+} from './toolContracts';
+import { CORE } from './toolPermissions';
 
 function assert(cond: boolean, msg: string): void {
 	if (!cond) throw new Error(msg);
@@ -11,6 +17,20 @@ assert(TOOL_SYSTEM_CONTRACT.includes('### Tool contract'), 'system contract head
 assert(/edit/i.test(TOOL_SYSTEM_CONTRACT), 'system mentions edit');
 assert(/read/i.test(TOOL_SYSTEM_CONTRACT), 'system mentions read');
 assert(/already applied/i.test(TOOL_SYSTEM_CONTRACT), 'system mentions already applied');
+assert(/Browser:|snapshot/i.test(TOOL_SYSTEM_CONTRACT), 'full contract mentions browser');
+assert(/UI UNCHANGED|After page state/i.test(toolDescription('browser_click')), 'click contract observe-after');
+assert(/Implementation finish|exploration-only|blocked:/i.test(TOOL_SYSTEM_CONTRACT), 'system finish contract');
+assert(/After diagnosing|bug list/i.test(toolDescription('edit')), 'edit pushes apply after diagnosis');
+
+const coreOnly = buildToolSystemContract(CORE);
+assert(coreOnly.includes('### Tool contract'), 'core contract header');
+assert(/edit/i.test(coreOnly), 'core mentions edit');
+assert(!/Browser:/i.test(coreOnly), 'core omits browser when inactive');
+assert(!/web_search/i.test(coreOnly), 'core omits web when inactive');
+assert(!/symbols\/definition/i.test(coreOnly), 'core omits navigation when inactive');
+
+const withBrowser = buildToolSystemContract([...CORE, 'browser_snapshot', 'browser_click']);
+assert(/Browser:/i.test(withBrowser), 'browser section when active');
 
 const expected = [
 	'read',

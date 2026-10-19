@@ -23,7 +23,7 @@ export function getOutboundMcpStatus(): OutboundMcpStatus {
 }
 
 function createOutboundHandler(fallbackPort: number): http.RequestListener {
-	return async (req, res) => {
+	const handle = async (req: http.IncomingMessage, res: http.ServerResponse): Promise<void> => {
 		res.setHeader('Access-Control-Allow-Origin', '*');
 		res.setHeader('Content-Type', 'application/json');
 
@@ -78,14 +78,14 @@ function createOutboundHandler(fallbackPort: number): http.RequestListener {
 			const body = await readBody(req);
 			let parsed: { tool?: string; arguments?: Record<string, unknown> };
 			try {
-				parsed = JSON.parse(body || '{}');
+				parsed = JSON.parse(body || '{}') as typeof parsed;
 			} catch {
 				res.writeHead(400);
 				res.end(JSON.stringify({ error: 'invalid JSON' }));
 				return;
 			}
 			try {
-				const result = await handleTool(parsed.tool ?? '', parsed.arguments ?? {});
+				const result = handleTool(parsed.tool ?? '', parsed.arguments ?? {});
 				res.writeHead(200);
 				res.end(JSON.stringify({ ok: true, result }));
 			} catch (err) {
@@ -97,6 +97,9 @@ function createOutboundHandler(fallbackPort: number): http.RequestListener {
 
 		res.writeHead(404);
 		res.end(JSON.stringify({ error: 'not found' }));
+	};
+	return (req, res) => {
+		void handle(req, res);
 	};
 }
 
@@ -159,7 +162,7 @@ export async function stopOutboundMcp(): Promise<void> {
 	listenPort = undefined;
 }
 
-async function handleTool(tool: string, args: Record<string, unknown>): Promise<unknown> {
+function handleTool(tool: string, args: Record<string, unknown>): unknown {
 	const wiki = getProjectWikiStore();
 	switch (tool) {
 		case 'wiki_list':
@@ -181,7 +184,7 @@ async function handleTool(tool: string, args: Record<string, unknown>): Promise<
 function readBody(req: http.IncomingMessage): Promise<string> {
 	return new Promise((resolve, reject) => {
 		const chunks: Buffer[] = [];
-		req.on('data', c => chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c)));
+		req.on('data', (c: Buffer | string) => chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c)));
 		req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
 		req.on('error', reject);
 	});

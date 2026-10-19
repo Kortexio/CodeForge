@@ -125,7 +125,7 @@ export class AiSettingsPanel {
 		this.postState();
 
 		this.disposables.push(
-			this.panel.webview.onDidReceiveMessage(async msg => {
+			this.panel.webview.onDidReceiveMessage(async (msg: { type: string; [k: string]: unknown }) => {
 				await this.onMessage(msg);
 			}),
 			this.store.onDidChange(() => this.postState()),
@@ -145,7 +145,7 @@ export class AiSettingsPanel {
 
 	private postState() {
 		const state = this.store.getState();
-		this.panel.webview.postMessage({
+		void this.panel.webview.postMessage({
 			type: 'state',
 			state: sanitizeForWebview(state),
 			governance: this.governance.getState(),
@@ -230,7 +230,7 @@ export class AiSettingsPanel {
 				state.servers[idx] = server;
 				await this.store.save(state);
 				if (msg.notify) {
-					vscode.window.showInformationMessage(`Saved "${server.name}"`);
+					void vscode.window.showInformationMessage(`Saved "${server.name}"`);
 				}
 				return;
 			}
@@ -255,7 +255,7 @@ export class AiSettingsPanel {
 
 			case 'setActive': {
 				await this.store.setActiveModel(String(msg.serverId), String(msg.model));
-				vscode.window.showInformationMessage(`Active model: ${msg.model}`);
+				void vscode.window.showInformationMessage(`Active model: ${String(msg.model)}`);
 				return;
 			}
 
@@ -268,13 +268,13 @@ export class AiSettingsPanel {
 					if (models.length) {
 						server.models = Array.from(new Set([...models, ...server.models]));
 						await this.store.save(state);
-						vscode.window.showInformationMessage(`Loaded ${models.length} models from ${server.name}`);
+						void vscode.window.showInformationMessage(`Loaded ${models.length} models from ${server.name}`);
 					} else {
-						vscode.window.showWarningMessage('No models returned. Check base URL / API key.');
+						void vscode.window.showWarningMessage('No models returned. Check base URL / API key.');
 					}
 				} catch (err) {
 					const message = err instanceof Error ? err.message : String(err);
-					vscode.window.showErrorMessage(`Fetch models failed: ${message}`);
+					void vscode.window.showErrorMessage(`Fetch models failed: ${message}`);
 				}
 				return;
 			}
@@ -289,11 +289,11 @@ export class AiSettingsPanel {
 				const { added, server } = await this.store.ensureAtlassianMcp();
 				await vscode.commands.executeCommand('codeforge.refreshMcp');
 				if (added) {
-					vscode.window.showInformationMessage(
+					void vscode.window.showInformationMessage(
 						`Added Atlassian MCP (${server.name}). Complete OAuth in the browser if prompted, then use the agent with Jira/Confluence.`
 					);
 				} else {
-					vscode.window.showInformationMessage(
+					void vscode.window.showInformationMessage(
 						`Atlassian MCP already configured (${server.name}).`
 					);
 				}
@@ -304,11 +304,11 @@ export class AiSettingsPanel {
 				const { added, server } = await this.store.ensureAzureMcp();
 				await vscode.commands.executeCommand('codeforge.refreshMcp');
 				if (added) {
-					vscode.window.showInformationMessage(
+					void vscode.window.showInformationMessage(
 						`Added Azure MCP (${server.name}). Sign in with "az login" if needed, then ask the agent about your Azure resources.`
 					);
 				} else {
-					vscode.window.showInformationMessage(
+					void vscode.window.showInformationMessage(
 						`Azure MCP already configured (${server.name}).`
 					);
 				}
@@ -319,12 +319,12 @@ export class AiSettingsPanel {
 				const { added, server } = await this.store.ensureGithubMcp();
 				await vscode.commands.executeCommand('codeforge.refreshMcp');
 				if (added) {
-					vscode.window.showInformationMessage(
+					void vscode.window.showInformationMessage(
 						`Added GitHub MCP (${server.name}). Paste a GitHub PAT in the MCP API key field, Save, then Refresh MCP.`
 					);
 					this.selectTab('mcp');
 				} else {
-					vscode.window.showInformationMessage(
+					void vscode.window.showInformationMessage(
 						`GitHub MCP already configured (${server.name}).`
 					);
 				}
@@ -336,12 +336,12 @@ export class AiSettingsPanel {
 				if (cancelled) return;
 				await vscode.commands.executeCommand('codeforge.refreshMcp');
 				if (added) {
-					vscode.window.showInformationMessage(
+					void vscode.window.showInformationMessage(
 						`Added Azure DevOps MCP (${server.name}). Sign in with az login / Entra if prompted, then Refresh MCP.`
 					);
 					this.selectTab('mcp');
 				} else {
-					vscode.window.showInformationMessage(
+					void vscode.window.showInformationMessage(
 						`Azure DevOps MCP already configured (${server.name}).`
 					);
 				}
@@ -372,7 +372,7 @@ export class AiSettingsPanel {
 					const preset = plugin.mcpPreset;
 					const already = isPluginInstalled(plugin, state.mcpServers);
 					if (already) {
-						vscode.window.showInformationMessage(`${plugin.name} is already installed.`);
+						void vscode.window.showInformationMessage(`${plugin.name} is already installed.`);
 						this.selectTab('mcp');
 						return;
 					}
@@ -391,7 +391,7 @@ export class AiSettingsPanel {
 					state.mcpServers.push(server);
 					await this.store.save(state);
 					await vscode.commands.executeCommand('codeforge.refreshMcp');
-					vscode.window.showInformationMessage(
+					void vscode.window.showInformationMessage(
 						preset.hint
 							? `Added ${plugin.name}. ${preset.hint}`
 							: `Added ${plugin.name}. Configure in MCP if needed, then Refresh MCP.`
@@ -400,7 +400,7 @@ export class AiSettingsPanel {
 					return;
 				}
 				if (plugin.kind === 'skill' || plugin.installAction === 'none') {
-					vscode.window.showInformationMessage(
+					void vscode.window.showInformationMessage(
 						`${plugin.name} ships with CodeForge — open Guardrails → Skills to review.`
 					);
 					this.selectTab('guardrails');
@@ -416,7 +416,7 @@ export class AiSettingsPanel {
 				state.mcpServers[idx] = mcp;
 				await this.store.save(state);
 				if (msg.notify) {
-					vscode.window.showInformationMessage(`Saved "${mcp.name}"`);
+					void vscode.window.showInformationMessage(`Saved "${mcp.name}"`);
 				}
 				return;
 			}
@@ -474,7 +474,7 @@ export class AiSettingsPanel {
 				try {
 					await this.governance.remove(kind, id);
 				} catch (err) {
-					vscode.window.showWarningMessage(
+					void vscode.window.showWarningMessage(
 						err instanceof Error ? err.message : String(err)
 					);
 				}
@@ -482,7 +482,7 @@ export class AiSettingsPanel {
 			}
 			case 'govReset': {
 				await this.governance.resetBuiltin(msg.kind as GovernanceKind, String(msg.id));
-				vscode.window.showInformationMessage('Reset to built-in defaults');
+				void vscode.window.showInformationMessage('Reset to built-in defaults');
 				return;
 			}
 		}

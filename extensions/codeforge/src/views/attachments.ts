@@ -6,7 +6,7 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 
 export type BuiltinAttachmentKind = 'text' | 'image' | 'uri';
-export type AttachmentKind = BuiltinAttachmentKind | string;
+export type AttachmentKind = BuiltinAttachmentKind | (string & Record<never, never>);
 
 export interface AttachmentKindDefinition {
 	id: string;
@@ -185,7 +185,7 @@ export async function attachmentsFromUris(uris: vscode.Uri[]): Promise<PendingAt
 			const ext = path.extname(uri.fsPath).toLowerCase();
 			if (IMAGE_EXT.has(ext) || looksLikeImage(bytes)) {
 				if (bytes.length > MAX_IMAGE_BYTES) {
-					vscode.window.showWarningMessage(`Image too large to attach (>${MAX_IMAGE_BYTES / 1024 / 1024}MB): ${rel}`);
+					void vscode.window.showWarningMessage(`Image too large to attach (>${MAX_IMAGE_BYTES / 1024 / 1024}MB): ${rel}`);
 					continue;
 				}
 				const mime = IMAGE_MIME[ext] || sniffImageMime(bytes) || 'image/png';
@@ -219,7 +219,7 @@ export async function attachmentsFromUris(uris: vscode.Uri[]): Promise<PendingAt
 				});
 			}
 		} catch (err) {
-			vscode.window.showWarningMessage(
+			void vscode.window.showWarningMessage(
 				`Could not attach ${uri.toString()}: ${err instanceof Error ? err.message : String(err)}`
 			);
 		}
@@ -236,7 +236,7 @@ export function attachmentFromBlob(input: {
 	const buf = Buffer.from(input.base64, 'base64');
 	if (looksLikeImageMime(mime) || IMAGE_EXT.has(path.extname(input.name).toLowerCase())) {
 		if (buf.length > MAX_IMAGE_BYTES) {
-			vscode.window.showWarningMessage(`Image too large to attach: ${input.name}`);
+			void vscode.window.showWarningMessage(`Image too large to attach: ${input.name}`);
 			return undefined;
 		}
 		const resolved = mime.startsWith('image/') ? mime : IMAGE_MIME[path.extname(input.name).toLowerCase()] || 'image/png';

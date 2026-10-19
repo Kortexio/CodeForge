@@ -41,7 +41,7 @@ export interface ToolContext {
 	extras?: Record<string, unknown>;
 }
 
-export interface ToolDefinition<A = any> {
+export interface ToolDefinition<A = unknown> {
 	name: string;
 	description: string;
 	parameters: JSONSchema7;

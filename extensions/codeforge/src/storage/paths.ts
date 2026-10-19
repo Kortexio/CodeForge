@@ -24,7 +24,7 @@ import * as os from 'os';
 import * as path from 'path';
 
 export function homeRoot(): string {
-	return path.join(os.homedir(), '.CodeForge');
+	return process.env.CODEFORGE_HOME?.trim() || path.join(os.homedir(), '.CodeForge');
 }
 
 export function workspaceRoot(workspaceFolder?: string): string | undefined {

@@ -67,7 +67,7 @@ export function builtinSkills(): SkillItem[] {
 			updatedAt: now(),
 			content: [
 				'1. One file and one concern per turn. Existing files: `edit` with an exact old_string. New files: `write`.',
-				'2. Confirm API signatures with symbols/definition/search before using them.',
+				'2. Confirm API signatures with search/retrieve before using them.',
 				'3. Read slices with startLine+limit. Content already in this chat does not need to be read again.',
 				'4. After two or three edits, build or test.',
 				'5. When the task comes from a card (docs/C*.md), its acceptance criteria are the plan.',
@@ -87,7 +87,7 @@ export function builtinRules(): RuleItem[] {
 			builtin: true,
 			updatedAt: now(),
 			content:
-				'Use relative workspace paths. Destructive shell commands need user approval. Use the project roots listed in STABLE FACTS; confirm APIs with search/symbols before using them.',
+				'Use relative workspace paths. Destructive shell commands need user approval. Use the project roots listed in STABLE FACTS; confirm APIs with search/retrieve before using them.',
 		},
 		{
 			id: 'rule.small-diffs',

@@ -8,7 +8,7 @@ function assert(cond: boolean, msg: string): void {
 	if (!cond) throw new Error(msg);
 }
 
-async function main(): Promise<void> {
+export async function run(): Promise<void> {
 	writeTodos('test-sess', [
 		{ id: '1', content: 'a', status: 'pending' },
 		{ id: '2', content: 'b', status: 'in_progress' },
@@ -23,11 +23,13 @@ async function main(): Promise<void> {
 		'await sees output'
 	);
 	assert(formatBgStart(job).includes(job.id), 'bg start message');
-
-	console.log('parityTools ok');
 }
 
-main().catch(err => {
-	console.error(err);
-	process.exit(1);
-});
+if (require.main === module) {
+	run()
+		.then(() => console.log('parityTools ok'))
+		.catch(err => {
+			console.error(err);
+			process.exit(1);
+		});
+}

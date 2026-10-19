@@ -67,19 +67,21 @@ export class NativeWikiMemoryProvider implements IMemoryProvider {
 		await wiki.upsertDocument(page || key, page || key, content, scope);
 	}
 
-	async search(query: string, _scopes?: string[]): Promise<MemoryHit[]> {
+	search(query: string, _scopes?: string[]): Promise<MemoryHit[]> {
 		try {
 			const wiki = getProjectWikiStore();
-			if (!wiki.isReady()) return [];
-			return wiki.search(query, 8).map(d => ({
-				scope: PROJECT_SCOPE,
-				key: d.id,
-				page: d.id,
-				title: d.title,
-				snippet: d.summary || d.content.slice(0, 300),
-			}));
+			if (!wiki.isReady()) return Promise.resolve([]);
+			return Promise.resolve(
+				wiki.search(query, 8).map(d => ({
+					scope: PROJECT_SCOPE,
+					key: d.id,
+					page: d.id,
+					title: d.title,
+					snippet: d.summary || d.content.slice(0, 300),
+				}))
+			);
 		} catch {
-			return [];
+			return Promise.resolve([]);
 		}
 	}
 

@@ -182,7 +182,7 @@ export class GovernanceStore {
 
 	async upsert(item: GovernanceItem): Promise<void> {
 		const state = this.getState();
-		const list = listFor(state, item.kind) as GovernanceItem[];
+		const list = listFor(state, item.kind);
 		const idx = list.findIndex(x => x.id === item.id);
 		const next = { ...item, updatedAt: new Date().toISOString() } as GovernanceItem;
 		if (idx >= 0) {

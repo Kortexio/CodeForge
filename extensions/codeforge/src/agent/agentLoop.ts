@@ -19,7 +19,8 @@ import {
 	parseOverflowTokens,
 	updateTokenCalibration,
 } from './contextOverflow';
-import { TOOL_SYSTEM_CONTRACT, toolDescription } from './toolContracts';
+import { buildToolSystemContract, toolDescription } from './toolContracts';
+import { normalizeToolCall, type JsonSchemaLike } from './toolCallNormalizer';
 import { looksLikeXmlToolMarkup, parseXmlToolCalls } from './xmlToolCalls';
 import {
 	filterAnthropicToolResults,
@@ -89,16 +90,22 @@ import { DEFAULT_BUDGET } from '../context/engine';
 import * as browser from '../browser/agent';
 import {
 	claimsBuildOrTestGreen,
+	DIAG_ONLY_FINISH_NOTE,
 	EMPTY_TURN_NOTE,
 	finalReplyNote,
 	LENGTH_CAP_NOTE,
+	LENGTH_CAP_SUMMARY_NOTE,
 	oracleRejectNote,
 	parseBlockedClaim,
+	specSelfCheckNote,
 	TRUNCATED_TOOL_JSON_FINAL_NOTE,
 	TRUNCATED_TOOL_JSON_NOTE,
+	LENGTH_EXHAUSTED_PROMPT,
 	MAX_STEPS_PROMPT,
-	STUCK_WRAP_PROMPT,
+	stuckWrapPrompt,
 } from './nudges';
+import { isEffectfulTool, shouldRefuseDiagFinish, shouldRequestSpecSelfCheck } from './finishGate';
+import { isTestFilePath } from '../governance/guardrailEngine';
 import {
 	advancePlanAfterWrites,
 	createInternalPlan,
@@ -106,7 +113,6 @@ import {
 	formatPlanForPrompt,
 	looksLikeScaffoldTask,
 	parseScaffoldPlanJson,
-	pathAllowedByPlan,
 	resolveCurrentPlan,
 	type InternalPlan,
 } from './internalPlans';
@@ -123,24 +129,28 @@ import {
 	invalidatePaths,
 	parseReadCoverage,
 	readAliasesFor,
-	rememberedReadWindow,
 } from './readMemory';
+import {
+	applyReadGateRemedy,
+	createReadGateState,
+	decideEditReadGate,
+	decideWriteReadGate,
+} from './readGate';
 import { detectOracle, exitCodeOf, formatOracleResult, nodeOracleFs, runOracle, type OracleResult } from './oracle';
 import {
 	ASK_ALLOWED_TOOLS,
 	buildDotnetCommand,
 	currentPhase,
 	DOTNET_TOOL,
-	isCodingTask,
 	isPartialRewrite,
 	isStatusQuestion,
 	LARGE_FILE_LINES,
-	mentionsErrorFile,
 	PLAN_ALLOWED_TOOLS,
 	profileForTurn,
 	toolNamesFor,
 	type AgentPhase,
 } from './toolsets';
+import { createLoopDetector, hashResult } from './loopDetector';
 import {
 	appendRoundResult,
 	coachTaskPrompt,
@@ -166,7 +176,7 @@ export function oracleNote(result: OracleResult, reason: string): string {
 	const hints = result.ok ? [] : getSkillsRules().cookbookHints(result.errors.map(e => e.code)).slice(0, 6);
 	return formatOracleResult(result, reason) + (hints.length ? `\n\nKnown fixes:\n${hints.map(h => `- ${h}`).join('\n')}` : '');
 }
-import { applyEdit } from './editTool';
+import { applyEdit, closestWindow, numberedExcerpt } from './editTool';
 import {
 	applyPatchHunk,
 	modelUsesApplyPatch,
@@ -254,7 +264,7 @@ function annotateRetrieveWithReadMemory(
 	readMaxEnd: Map<string, number>
 ): string {
 	if (!output.startsWith('### RETRIEVED') || !readPathsSeen.size) return output;
-	return output.replace(/^####\s+(\S+):(\d+)/gm, (full, filePath: string, line: string) => {
+	return output.replace(/^####\s+(\S+):(\d+)/gm, (full, filePath: string, _line: string) => {
 		const key = canonicalizePathKey(filePath);
 		const alt = key.startsWith('docs/') ? key.slice(5) : `docs/${key}`;
 		const seen = readPathsSeen.has(key) || readPathsSeen.has(alt);
@@ -1120,10 +1130,12 @@ function allAgentToolNames(mode?: AgentModeDefinition): string[] {
 function toolsForRound(
 	activeToolNames: Set<string>,
 	mode?: AgentModeDefinition,
-	modelId?: string
+	modelId?: string,
+	/** Frozen at run start so the tools array stays byte-identical across rounds. */
+	skillCatalog?: string
 ): typeof AGENT_TOOLS {
 	const registry = getToolRegistry();
-	const catalog = formatSkillCatalogForTool();
+	const catalog = skillCatalog ?? formatSkillCatalogForTool();
 	const usePatch = modelId ? modelUsesApplyPatch(modelId) : false;
 	const native = AGENT_TOOLS.filter(t => {
 		if (!activeToolNames.has(t.function.name)) return false;
@@ -1154,7 +1166,7 @@ function toolsForRound(
 				},
 			},
 		};
-	}) as typeof AGENT_TOOLS;
+	});
 	const ext = registry
 		.toOpenAiTools()
 		.filter(t => {
@@ -1194,7 +1206,7 @@ interface ToolCall {
 }
 
 export interface AgentActivityEvent {
-	kind: 'thinking' | 'tool' | 'compact' | 'checkpoint' | 'thought' | 'context';
+	kind: 'thinking' | 'tool' | 'compact' | 'checkpoint' | 'thought' | 'context' | 'protocol';
 	label: string;
 	detail?: string;
 	tool?: string;
@@ -1209,6 +1221,15 @@ export interface AgentHistoryMessage {
 	content: string;
 }
 
+export type AgentSamplingOptions = {
+	temperature?: number;
+	top_p?: number;
+	top_k?: number;
+	presence_penalty?: number;
+	repeat_penalty?: number;
+	dry_multiplier?: number;
+};
+
 export interface AgentLoopOptions {
 	bridge: VSCodeAIBridge;
 	provider: string;
@@ -1217,6 +1238,8 @@ export interface AgentLoopOptions {
 	baseUrl: string;
 	workspaceRoot?: string;
 	task: string;
+	/** Optional per-server sampling overrides (applied over llmSamplingOptions). */
+	sampling?: AgentSamplingOptions;
 	/** Optional vision parts (data URLs) attached to the user turn. */
 	images?: Array<{ mime: string; dataUrl: string; label?: string }>;
 	history?: AgentHistoryMessage[];
@@ -1281,6 +1304,10 @@ export interface AgentLoopOptions {
 	 */
 	askMode?: boolean;
 	/**
+	 * Explore-only sub-run (delegate_task mode explore): read/search tools only.
+	 */
+	exploreOnly?: boolean;
+	/**
 	 * Clean context (orchestrator items): no chat history, no prior-session transcript or read memory.
 	 * Stable facts and tool traces are still shared through the session.
 	 */
@@ -1305,7 +1332,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 	let turnPromptTokens: number | undefined;
 	let turnCompletionTokens = 0;
 	let turnDurationMs = 0;
-	let turnReasoningParts: string[] = [];
+	const turnReasoningParts: string[] = [];
 	const emitTurnMetrics = () => {
 		const hasTokens =
 			turnPromptTokens !== undefined || turnCompletionTokens > 0 || turnDurationMs > 0;
@@ -1364,6 +1391,31 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 	const lockedPaths = checksLock ? lockedScorePaths(checksLock) : [];
 	const experimentOn = !!checksLock && !opts.coachMode;
 
+	const configToolGroupsEarly =
+		vscode.workspace.getConfiguration('codeforge.ai').get<string[]>('toolGroups') ?? [];
+	const modeToolGroupsEarly = agentMode?.toolGroups ?? [];
+	const enabledToolGroups = [
+		...new Set(
+			[...configToolGroupsEarly, ...modeToolGroupsEarly]
+				.map(g => String(g).trim())
+				.filter(Boolean)
+		),
+	];
+	const mcpAvailableEarly = mcpTools.length > 0;
+	const seedPhase: AgentPhase =
+		opts.basePhase ?? currentPhase(opts.task, { buildRed: false });
+	const seedActiveTools = toolNamesFor(seedPhase, opts.task, {
+		weakProfile,
+		allNames: allAgentToolNames(agentMode),
+		planMode: opts.planMode,
+		coachMode: opts.coachMode,
+		askMode: opts.askMode,
+		exploreOnly: opts.exploreOnly,
+		mcpAvailable: mcpAvailableEarly,
+		toolGroups: enabledToolGroups,
+	});
+	const toolContract = buildToolSystemContract(seedActiveTools);
+
 	const planModeHint = opts.coachMode
 		? [
 				'### COACH MODE (active)',
@@ -1373,15 +1425,21 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 		: opts.askMode
 		? [
 				'### ASK MODE (active)',
-				'Answer questions using read/search/retrieve/web tools. Do not edit files or run shell.',
-				'Prefer web_search / web_fetch for public docs and APIs.',
-			].join('\n')
+				'Answer questions using read/search/retrieve tools. Do not edit files or run shell.',
+				seedActiveTools.has('web_search') || seedActiveTools.has('web_fetch')
+					? 'Prefer web_search / web_fetch for public docs and APIs.'
+					: '',
+			]
+				.filter(Boolean)
+				.join('\n')
 		: opts.planMode && opts.isolated
 		? 'Only exploration tools are available in this run.'
 		: opts.planMode
 		? [
 				'### PLAN MODE (active)',
-				'Explore the repo and write a plan to the wiki (wiki_write id=task-plan with checklist + Definition of Done).',
+				seedActiveTools.has('wiki_write')
+					? 'Explore the repo and write a plan to the wiki (wiki_write id=task-plan with checklist + Definition of Done).'
+					: 'Explore the repo and draft a plan (checklist + Definition of Done).',
 				'Draft the feature checks as test files and/or files under .CodeForge/loop/ (production app code stays read-only).',
 				'When you finish, the harness locks those check paths automatically for the next build turn — you do not write checks.lock yourself.',
 				'When the plan is saved, reply with a summary of it and the checks you wrote.',
@@ -1391,11 +1449,20 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 		'You are CodeForge Agent, a coding agent inside a VS Code-based IDE on Windows.',
 		`Workspace root: ${opts.workspaceRoot ?? '(none — ask user to open a folder)'}`,
 		'Paths are relative to the workspace root.',
-		TOOL_SYSTEM_CONTRACT,
+		toolContract,
 		'Do not ask the user for API keys already configured in CodeForge settings; never paste secrets into the chat.',
 		'Long-running servers hand off to the Agent Terminal after startup.',
-		'Call `skill` for playbooks. Use todo_write for multi-step work. Use delegate_task for parallel sub-work (modes: explore | general | plan).',
-		vscode.workspace.getConfiguration('codeforge.ai').get<boolean>('exploreSubagent')
+		[
+			seedActiveTools.has('skill') ? 'Call `skill` for playbooks.' : '',
+			seedActiveTools.has('todo_write') ? 'Use todo_write for multi-step work.' : '',
+			seedActiveTools.has('delegate_task')
+				? 'Use delegate_task for parallel sub-work (modes: explore | general | plan).'
+				: '',
+		]
+			.filter(Boolean)
+			.join(' '),
+		vscode.workspace.getConfiguration('codeforge.ai').get<boolean>('exploreSubagent') &&
+		seedActiveTools.has('delegate_task')
 			? 'For broad “where is X across the repo” questions, call delegate_task with mode explore (read-only). Prefer retrieve for focused lookups.'
 			: '',
 		'The IDE runs build/test (oracle) after writes and when you finish; done when green. If blocked, reply `blocked: <reason>`.',
@@ -1433,7 +1500,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 		.filter(m => m.content?.trim())
 		.slice(-16)
 		.map(m => ({
-			role: m.role as 'user' | 'assistant',
+			role: m.role,
 			content: clipData(m.content.trim(), 6000),
 		}));
 
@@ -1482,12 +1549,10 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 	const actions: string[] = [];
 	const recentFingerprints: string[] = [];
 	const resultCache = new Map<string, string>();
-	const readPathsSeen = new Set<string>();
-	/**
-	 * Paths read (or written) in THIS turn only — prior-session preload goes into
-	 * readPathsSeen but does not satisfy the read-before-mutate gate.
-	 */
-	const readThisTurn = new Set<string>();
+	const readGate = createReadGateState();
+	const readPathsSeen = readGate.readPathsSeen;
+	/** Paths read (or written) this turn — see readGate.readThisTurn. */
+	const readThisTurn = readGate.readThisTurn;
 	/** Highest end line already returned per path (1-based inclusive). */
 	const readMaxEnd = new Map<string, number>();
 	const readWindows = new Map<string, Array<{ start: number; end: number }>>();
@@ -1500,50 +1565,56 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 	/** successfulWriteCount at the time a fingerprint last failed (a later write allows a retry). */
 	const failedAtWriteCount = new Map<string, number>();
 	let successfulWriteCount = 0;
-	let consecutiveToolFails = 0;
+	const writtenSourcePaths = new Set<string>();
+	const writtenTestPaths = new Set<string>();
+	const readSpecPaths = new Set<string>();
+	let specCheckNudges = 0;
+	/** Disk body + step for identical-read markers: (unchanged since step N). */
+	const readWindowBodies = new Map<string, { body: string; step: number }>();
+	const emitProtocol = (label: string, detail?: string) => {
+		opts.onActivity?.({ kind: 'protocol', label, detail });
+	};
+	let protocolSizedOnce = false;
 	const touchedPaths = new Set<string>();
 	/** Paths successfully written/edited this turn — used for the project handoff. */
 	const writtenPaths = new Set<string>();
-	/**
-	 * Stage for code tasks: explore → act → verify.
-	 * Tool schemas stay identical every round (prefix cache); stage is enforced at execution.
-	 * Initialized after internal-plan resolution below.
-	 */
-	type LoopStage = 'explore' | 'act' | 'verify';
-	let useStages = false;
-	let loopStage: LoopStage = 'act';
-	let exploreReopens = 0;
-	const EXPLORE_TOOLS_STAGE = new Set(['list', 'search', 'retrieve']);
 	let emptyFinishNudges = 0;
+	/** Exploration-only prose finish refuses this run (cap 2). */
+	let diagFinishNudges = 0;
+	/** Successful effectful tools this run (edit/shell/browser act/…). */
+	let effectfulCount = 0;
+	/** Any tool executed this run (incl. explore-only). */
+	let anyToolCount = 0;
+	/** Browser actions that reported UI changed (checkpoint progress). */
+	let uiChangeCount = 0;
+	/** Consecutive browser act results with UI UNCHANGED. */
+	let unchangedStreak = 0;
 	let statusUpdated = false;
 	let turnOutcome: StatusOutcome = 'done';
 	let turnBlockedReason = '';
 	let handoffDone = false;
 	/** Extra retries when completion hits max_tokens (~8192) without a tool call. */
 	let lengthTruncationNudges = 0;
+	/** After a prose length hit, prefer a short completion budget so the finish fits. */
+	let preferShortCompletion = false;
+	const PROSE_LENGTH_RETRIES = 3;
+	const TOOL_LENGTH_RETRIES = 2;
+	const SHORT_COMPLETION_TOKENS = 1024;
 	/** Caps step-=1 refunds so repair/overflow paths cannot spin forever. */
 	let refundedSteps = 0;
 	const MAX_REFUNDED_STEPS = 12;
-	/** Tool steps that only hit cache / soft memory / blocks (no fresh I/O). */
-	let consecutiveNoopToolSteps = 0;
-	/** Identical tool fingerprint batches in a row. */
-	let consecutiveSameBatch = 0;
-	let lastToolBatchKey = '';
 	/** Explore-only steps without a write/shell since last mutate. */
 	let exploreOnlySteps = 0;
+	const loopDetector = createLoopDetector();
 	/** Retries when gateway rejects truncated tool-call JSON (common with large writes). */
 	let truncatedToolRetries = 0;
 	/** Retries when model dumps tool JSON in content but parse fails. */
 	let proseToolParseRetries = 0;
 	/** One-shot repair when Anthropic rejects orphan tool_use without tool_result. */
 	let toolHistoryRepairedOnce = false;
-	/** Soft-memory hits per path this run (UI only). */
-	const softReadHits = new Map<string, number>();
 	let phase: AgentPhase = 'implement';
 	let lastPhase: AgentPhase | undefined;
 	let activeToolNames = new Set(AGENT_TOOL_NAMES);
-	/** Consecutive explore calls while the build is red (weak-profile gate). */
-	let readsWhileRed = 0;
 	/** Successful write/edit calls since the oracle last ran. */
 	let writesSinceOracle = 0;
 	/** Finish attempts refused because the oracle was red. */
@@ -1554,7 +1625,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 	const oracleCfg = opts.planMode || opts.askMode ? undefined : detectOracle(opts.workspaceRoot, nodeOracleFs);
 	let lastProgressMarker = '';
 	const progressMarker = () =>
-		`${successfulWriteCount}|${readPathsSeen.size}|${gates.buildRed ? 'red' : 'ok'}|${gates.lastBuildErrors.length}`;
+		`${successfulWriteCount}|${uiChangeCount}|${gates.buildRed ? 'red' : 'ok'}|${gates.lastBuildErrors.length}`;
 	const runOracleNow = async (reason: string) => {
 		opts.onStatus?.(`Oracle: ${reason}…`);
 		const result = await runOracle(oracleCfg!, async command => {
@@ -1576,6 +1647,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 			});
 		} else {
 			facts = mergeStableFacts(facts, { openErrors: [] });
+			gates.markVerifiedGreen();
 		}
 		writesSinceOracle = 0;
 		trace?.info('oracle', `${result.ok ? 'green' : 'red'} ${reason} ${result.commands.join(' → ')}`);
@@ -1644,6 +1716,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 		}
 	}
 
+	let systemWithMemory = system;
 	if (readPathsSeen.size || listPathsSeen.size) {
 		const mem = [
 			'Paths opened earlier in this chat:',
@@ -1659,10 +1732,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 		]
 			.filter(Boolean)
 			.join('\n');
-		messages[0] = {
-			role: 'system',
-			content: `${system}\n\n${mem}`,
-		};
+		systemWithMemory = `${system}\n\n${mem}`;
 	}
 
 	// Cursor-style: light continuity — path index + few recent tool bodies (not the whole tour).
@@ -1676,12 +1746,11 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 		priorSession?.rollingSummary
 	);
 	if (priorTranscript) {
-		const sys = messages[0];
 		const rest = messages.slice(1);
 		const head = rest.slice(0, -1);
 		const latestUser = rest[rest.length - 1];
 		messages = [
-			sys,
+			{ role: 'system', content: systemWithMemory },
 			...head,
 			{
 				role: 'user',
@@ -1708,11 +1777,11 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 	} catch {
 		gitAvailable = false;
 	}
-	let systemBaseWithPacket =
-		typeof messages[0]?.content === 'string' ? messages[0].content : system;
 	// Model-only scaffold plan under .CodeForge/plans (not shown in chat).
 	// Scoped to session/task — never inject a stale plan from an unrelated task.
 	let activeInternalPlan: InternalPlan | undefined;
+	let pendingPlanAdvance: Promise<InternalPlan | undefined> | undefined;
+	let frozenSystem = systemWithMemory;
 	if (opts.workspaceRoot && !opts.planMode && !opts.askMode && !opts.isolated) {
 		try {
 			activeInternalPlan = await resolveCurrentPlan(opts.workspaceRoot, {
@@ -1760,44 +1829,29 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 				}
 			}
 			if (activeInternalPlan) {
-				const block = formatPlanForPrompt(activeInternalPlan);
-				systemBaseWithPacket = `${systemBaseWithPacket}\n\n${block}`;
-				if (messages[0]?.role === 'system') {
-					messages[0] = { role: 'system', content: systemBaseWithPacket };
-				}
+				frozenSystem = `${frozenSystem}\n\n${formatPlanForPrompt(activeInternalPlan)}`;
 			}
 		} catch {
 			/* best-effort */
 		}
 	}
+	// Freeze messages[0] for the whole run — never reassign (packet/plan/compact/nuke reuse this string).
+	messages[0] = { role: 'system', content: frozenSystem };
 	void cleanupToolOutputSpill(opts.workspaceRoot);
-	useStages =
-		!opts.planMode &&
-		!opts.askMode &&
-		!opts.coachMode &&
-		!opts.isolated &&
-		(isCodingTask(opts.task) || !!activeInternalPlan);
-	loopStage =
-		useStages &&
-		activeInternalPlan?.items.some(i => i.status === 'pending' && (i.paths?.length ?? 0) > 0)
-			? 'act'
-			: useStages
-				? 'explore'
-				: 'act';
 	const contextBudget = getContextBudget(opts.numCtx);
 	let toolCap = toolResultCharCap(contextBudget);
 	const exploreSubagentOn =
 		vscode.workspace.getConfiguration('codeforge.ai').get<boolean>('exploreSubagent') === true;
-	const mcpAvailable = mcpTools.length > 0;
+	const mcpAvailable = mcpAvailableEarly;
+	const frozenSkillCatalog = formatSkillCatalogForTool();
 	const compactEvery = compactEveryNSteps(contextBudget);
 	const softCompactAt = softCompactTokenThreshold(contextBudget);
 	const midCompactAt = midCompactTokenThreshold(contextBudget);
 	const compactAt = compactTokenThreshold(contextBudget);
-	const packetEvery = Math.max(4, Math.floor(compactEvery / 2));
 	opts.onActivity?.({
 		kind: 'context',
 		label: `contextBudget ${contextBudget}`,
-		detail: `num_ctx=${contextBudget}; soft@${softCompactAt} mid@${midCompactAt} hard@${compactAt}; packet every ${packetEvery}; tool cap ${toolCap}; priorTx ${priorTranscriptCharBudget(contextBudget)}`,
+		detail: `num_ctx=${contextBudget}; soft@${softCompactAt} mid@${midCompactAt} hard@${compactAt}; tool cap ${toolCap}; priorTx ${priorTranscriptCharBudget(contextBudget)}`,
 	});
 
 	// Ensure Agent Terminal is visible even before the first shell call
@@ -1860,7 +1914,8 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 	try {
 		let step = 0;
 		/** Why the main tool loop ended (budget vs anti-loop). */
-		let loopExit: 'budget' | 'stuck' | undefined;
+		let loopExit: 'budget' | 'stuck' | 'length' | undefined;
+		let stuckCause = '';
 		const tryRefundContinue = (): boolean => {
 			if (refundedSteps >= MAX_REFUNDED_STEPS) return false;
 			refundedSteps += 1;
@@ -1885,72 +1940,9 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 				lastRealPromptTokens
 			);
 
-			// Refresh context packet periodically so IDE/status stay current.
-			if (step > 0 && step % packetEvery === 0 && depth === 0) {
-				try {
-					const wantRetrieve = step >= 2 || retrieveQueriesSeen.size > 0;
-					const fresh = await buildContextPacket({
-						task: opts.task,
-						facts,
-						workspaceRoot: opts.workspaceRoot,
-						includeRetrieve: wantRetrieve,
-						includePrefetch: step >= 2,
-						retrieveK: 4,
-						sessionId: opts.sessionId ?? undefined,
-						budget: {
-							total: contextPacketTokenBudget(contextBudget),
-							alloc: {
-								system: 0.1,
-								status: 0.05,
-								wiki_session: 0.08,
-								wiki_project: 0.08,
-								facts: 0.06,
-								lessons: 0.07,
-								ide: 0.12,
-								retrieve: 0.14,
-								git: 0.04,
-								mcp: 0.03,
-								history: 0.17,
-							},
-						},
-						boostPaths: [...touchedPaths],
-						rerankFn: wantRetrieve ? makeRerankFn(opts) : undefined,
-						historyText: [
-							...history.slice(-3).map(h => `${h.role}: ${String(h.content).slice(0, 350)}`),
-							...messages
-								.filter(m => m.role === 'user' || m.role === 'assistant')
-								.slice(-4)
-								.map(m => {
-									const text =
-										typeof m.content === 'string'
-											? m.content
-											: Array.isArray(m.content)
-												? m.content.map(p => ('text' in p ? p.text : '')).join(' ')
-												: '';
-									return `${m.role}: ${text.slice(0, 350)}`;
-								}),
-						]
-							.filter(Boolean)
-							.join('\n')
-							.slice(0, 6000),
-					});
-					systemBaseWithPacket = `${systemBase}\n\n${fresh.markdown}`;
-					if (messages[0]?.role === 'system') {
-						messages[0] = { role: 'system', content: systemBaseWithPacket };
-					}
-					opts.onContextBadge?.(fresh.badge);
-					opts.onActivity?.({
-						kind: 'context',
-						label: `context refresh @${step + 1}`,
-						detail: `${fresh.badge.inContext} in context`,
-					});
-				} catch {
-					/* best-effort */
-				}
-			}
-
 			// Compact only when the window is actually filling up.
 			// Do NOT hard-compact on a step timer — that wastes a 32k context (Cursor fills the window).
+			// Context packet is assembled only inside hard compact (into the summary user message).
 			if (tokEst > compactAt) {
 				sm.transition('compacting');
 				opts.onActivity?.({
@@ -1959,7 +1951,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 				});
 				messages = await compactWithLlm(
 					opts,
-					systemBase,
+					frozenSystem,
 					messages,
 					actions,
 					history,
@@ -1967,11 +1959,6 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					gates.compactStickyExtra(),
 					buildReadLedger()
 				);
-				if (messages[0]?.role === 'system') {
-					const sys = messages[0].content;
-					systemBaseWithPacket =
-						typeof sys === 'string' && sys ? sys : systemBaseWithPacket;
-				}
 				sm.transition('executing');
 			} else if (tokEst > midCompactAt) {
 				sm.transition('compacting');
@@ -1980,18 +1967,18 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					opts,
 					url,
 					messages,
-					systemBaseWithPacket,
+					frozenSystem,
 					buildReadLedger(),
 					activeInternalPlan
 						? formatPlanForPrompt(activeInternalPlan).slice(0, 400)
 						: undefined,
-					toolsForRound(activeToolNames, agentMode, opts.model)
+					toolsForRound(activeToolNames, agentMode, opts.model, frozenSkillCatalog)
 				);
 				messages = structured
-					? (structured as ChatMessage[])
+					? (structured)
 					: (midCompactMessages(
 							messages as Parameters<typeof midCompactMessages>[0],
-							systemBaseWithPacket,
+							frozenSystem,
 							{ readLedger: buildReadLedger() }
 						) as ChatMessage[]);
 				sm.transition('executing');
@@ -2043,7 +2030,6 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 			const llmStart = Date.now();
 			normalizeToolProtocolHistory(messages as Parameters<typeof normalizeToolProtocolHistory>[0]);
 			const sentTokenEstimate = estimateTokens(messages);
-			if (useStages && loopStage === 'explore' && step >= 3) loopStage = 'act';
 			phase = opts.basePhase
 				? opts.basePhase === 'implement' && gates.buildRed
 					? 'fix'
@@ -2053,6 +2039,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 				planMode: opts.planMode,
 				coachMode: opts.coachMode,
 				askMode: opts.askMode,
+				exploreOnly: opts.exploreOnly,
 			});
 			toolCap = toolResultCharCap(contextBudget, toolProfile === 'explore' || toolProfile === 'ask');
 			activeToolNames = toolNamesFor(phase, opts.task, {
@@ -2061,8 +2048,10 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 				planMode: opts.planMode,
 				coachMode: opts.coachMode,
 				askMode: opts.askMode,
+				exploreOnly: opts.exploreOnly,
 				mcpAvailable,
 				exploreSubagent: exploreSubagentOn,
+				toolGroups: enabledToolGroups,
 			});
 			if (phase !== lastPhase) {
 				opts.onActivity?.({
@@ -2072,12 +2061,26 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 				});
 				lastPhase = phase;
 			}
+			const roundTools = toolsForRound(
+				activeToolNames,
+				agentMode,
+				opts.model,
+				frozenSkillCatalog
+			);
+			if (!protocolSizedOnce) {
+				protocolSizedOnce = true;
+				emitProtocol('systemChars', String(frozenSystem.length));
+				emitProtocol('toolsChars', String(JSON.stringify(roundTools).length));
+			}
+			const roundMaxTokens = preferShortCompletion
+				? Math.min(completionCap, SHORT_COMPLETION_TOKENS)
+				: completionCap;
 			const round = await postAgentRound(
 				opts,
 				url,
 				sanitizeMessages(messages),
-				completionCap,
-				toolsForRound(activeToolNames, agentMode, opts.model)
+				roundMaxTokens,
+				roundTools
 			);
 			if (!round.ok) {
 				const errText = round.errorText;
@@ -2104,7 +2107,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 							aggressive ? 0 : 3,
 							aggressive ? 900 : 1800
 						),
-						systemBaseWithPacket,
+						frozenSystem,
 						{ readLedger: buildReadLedger() }
 					) as ChatMessage[];
 					normalizeToolProtocolHistory(
@@ -2174,6 +2177,14 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 				}
 				if (isTruncatedToolCallError(round.status, errText)) {
 					truncatedToolRetries += 1;
+					emitProtocol('badArgs', '1');
+					emitProtocol(
+						'sample',
+						JSON.stringify({
+							reason: 'truncated_tool_json',
+							preview: errText.slice(0, 2000),
+						})
+					);
 					const note =
 						truncatedToolRetries >= 3
 							? TRUNCATED_TOOL_JSON_FINAL_NOTE
@@ -2212,7 +2223,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					compactedOnce = true;
 					messages = await compactWithLlm(
 						opts,
-						systemBase,
+						frozenSystem,
 						messages,
 						actions,
 						history,
@@ -2237,7 +2248,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 						.filter(Boolean)
 						.join('\n');
 					messages = [
-						{ role: 'system', content: systemBaseWithPacket },
+						{ role: 'system', content: frozenSystem },
 						{ role: 'user', content: digest },
 					];
 					opts.onStatus?.('Invalid history — minimal reset, retrying…');
@@ -2302,6 +2313,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 				Number(data.usage?.completion_tokens ?? data.usage?.output_tokens ?? 0) || 0;
 
 			let toolCalls = normalizeToolCalls(msg.tool_calls ?? []);
+			const hadNativeToolCalls = toolCalls.length > 0;
 			// Some local models put text in alternate fields or return huge empty generations
 			const alt = msg as Record<string, unknown>;
 			let content = coerceMessageContent(msg.content);
@@ -2337,6 +2349,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 				if (parsed.length) {
 					toolCalls = parsed;
 					proseToolParseRetries = 0;
+					emitProtocol('contentToolCalls', String(parsed.length));
 					opts.onActivity?.({
 						kind: 'checkpoint',
 						label: 'Parsed tool_calls from text',
@@ -2344,6 +2357,11 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					});
 				} else if (looksLikeToolJson(content) && proseToolParseRetries < 3) {
 					proseToolParseRetries += 1;
+					emitProtocol('badArgs', '1');
+					emitProtocol('sample', JSON.stringify({
+						reason: 'tool_json_parse_failed',
+						preview: content.slice(0, 2000),
+					}));
 					trace?.error('tool_json_parse_failed', content.slice(0, 400));
 					opts.onActivity?.({
 						kind: 'checkpoint',
@@ -2364,6 +2382,8 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					});
 					if (tryRefundContinue()) continue;
 				}
+			} else if (hadNativeToolCalls) {
+				emitProtocol('nativeToolCalls', String(toolCalls.length));
 			}
 
 			// When tools came from prose JSON, don't keep the raw JSON as assistant chat content.
@@ -2378,28 +2398,39 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					finishReason === 'length' ||
 					tokensOut >= 7500 ||
 					(content.length >= 12000 && !looksLikeToolJson(content));
+				const partialTool =
+					looksLikeToolJson(content) || /<tool_call>|<function\s*=/i.test(content);
+				const maxLengthRetries = partialTool ? TOOL_LENGTH_RETRIES : PROSE_LENGTH_RETRIES;
 
-				// Completion budget ran out mid-answer: at most 2 continuations (opencode-style).
-				if (hitLengthCap && lengthTruncationNudges < 2 && step + 1 <= stepBudget) {
+				// Completion budget ran out mid-answer: limited continuations (opencode-style).
+				// Prose finish gets one extra retry under a short max_tokens cap.
+				if (hitLengthCap && lengthTruncationNudges < maxLengthRetries && step + 1 <= stepBudget) {
 					lengthTruncationNudges += 1;
+					emitProtocol('lengthExits', '1');
 					messages.push({ role: 'assistant', content: clipData(content || '(truncated)', 1500) });
-					const note = LENGTH_CAP_NOTE;
+					const note = partialTool ? LENGTH_CAP_NOTE : LENGTH_CAP_SUMMARY_NOTE;
+					if (!partialTool) preferShortCompletion = true;
 					trace?.info('harness', String(note.length));
 					messages.push({ role: 'user', content: note });
-					opts.onStatus?.(`Truncated reply (max_tokens) — continuing (${lengthTruncationNudges}/2)…`);
+					opts.onStatus?.(
+						`Truncated reply (max_tokens) — continuing (${lengthTruncationNudges}/${maxLengthRetries})…`
+					);
 					opts.onActivity?.({
 						kind: 'checkpoint',
-						label: 'Truncated completion — retry tools',
+						label: partialTool
+							? 'Truncated completion — retry smaller tool'
+							: 'Truncated completion — short summary',
 						detail: `finish_reason=${finishReason || '?'} tokensOut=${tokensOut}`,
 					});
 					if (tryRefundContinue()) continue;
 				}
-				if (hitLengthCap && lengthTruncationNudges >= 2) {
-					loopExit = 'stuck';
+				if (hitLengthCap && lengthTruncationNudges >= maxLengthRetries) {
+					loopExit = 'length';
+					emitProtocol('lengthExits', '1');
 					opts.onActivity?.({
 						kind: 'checkpoint',
 						label: 'Stopped after length truncations',
-						detail: '2 continuations exhausted',
+						detail: `${maxLengthRetries} continuations exhausted`,
 					});
 					break;
 				}
@@ -2407,6 +2438,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 				// Empty/trivial finish: one protocol retry, then accept (not an intent crutch).
 				if ((!content || trivial) && emptyFinishNudges < 2 && step + 1 < stepBudget) {
 					emptyFinishNudges += 1;
+					emitProtocol('emptyReplies', '1');
 					const note = EMPTY_TURN_NOTE;
 					trace?.info('harness', String(note.length));
 					messages.push({ role: 'assistant', content: content || '(empty)' });
@@ -2430,6 +2462,32 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 
 				// Done is decided by the oracle: after changes, build/test must be green (or the model says blocked).
 				const blocked = parseBlockedClaim(summary);
+				// Exploration-only then prose: refuse finish (structural tool counts — not user-phrase matchers).
+				if (
+					shouldRefuseDiagFinish({
+						planMode: opts.planMode,
+						askMode: opts.askMode,
+						coachMode: opts.coachMode,
+						statusQuestion,
+						blocked: !!blocked,
+						effectfulCount,
+						anyToolCount,
+						diagFinishNudges,
+					}) &&
+					step + 1 < stepBudget
+				) {
+					diagFinishNudges += 1;
+					trace?.info('harness', String(DIAG_ONLY_FINISH_NOTE.length));
+					messages.push({ role: 'assistant', content: summary });
+					messages.push({ role: 'user', content: DIAG_ONLY_FINISH_NOTE });
+					opts.onActivity?.({
+						kind: 'checkpoint',
+						label: 'Finish refused — need effectful tool',
+						detail: `explore-only (${anyToolCount} tools, 0 effectful)`,
+					});
+					opts.onStatus?.('Continue: apply a change with tools, or reply blocked:…');
+					continue;
+				}
 				const changedFiles = successfulWriteCount > 0;
 				let doneNote = '';
 				let loggedExperimentRound = false;
@@ -2439,7 +2497,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					!opts.planMode &&
 					!opts.coachMode &&
 					oracleCfg &&
-					!gates.hasVerifiedGreen()
+					(writesSinceOracle > 0 || !gates.hasVerifiedGreen())
 				) {
 					const result = await runOracleNow('finish check');
 					const roundFiles = [...writtenPaths];
@@ -2505,6 +2563,40 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					}
 				} else if (!blocked && changedFiles && !oracleCfg && claimsBuildOrTestGreen(summary) && !gates.hasVerifiedGreen()) {
 					doneNote = finalReplyNote('unverified');
+				}
+
+				if (
+					!blocked &&
+					shouldRequestSpecSelfCheck({
+						planMode: opts.planMode,
+						askMode: opts.askMode,
+						coachMode: opts.coachMode,
+						statusQuestion,
+						blocked: !!blocked,
+						verifiedGreen: gates.hasVerifiedGreen(),
+						writtenSourceCount: writtenSourcePaths.size,
+						readSpecCount: readSpecPaths.size,
+						writtenTestCount: writtenTestPaths.size,
+						specCheckNudges,
+					}) &&
+					step + 1 < stepBudget
+				) {
+					specCheckNudges += 1;
+					const note = specSelfCheckNote({
+						sourcePaths: [...writtenSourcePaths],
+						specPaths: [...readSpecPaths],
+						testPaths: [...writtenTestPaths],
+					});
+					trace?.info('harness', String(note.length));
+					messages.push({ role: 'assistant', content: summary });
+					messages.push({ role: 'user', content: note });
+					opts.onActivity?.({
+						kind: 'checkpoint',
+						label: 'Spec edge-case check',
+						detail: `${writtenSourcePaths.size} source, ${readSpecPaths.size} spec, ${writtenTestPaths.size} tests`,
+					});
+					opts.onStatus?.('Spec edge-case check before finish…');
+					continue;
 				}
 
 				// Do not block the user-visible reply on update_status. An extra model
@@ -2655,6 +2747,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 				tool_calls: toolCalls,
 			});
 			lengthTruncationNudges = 0;
+			preferShortCompletion = false;
 			emptyFinishNudges = 0;
 
 			const exploreTools = new Set([
@@ -2667,10 +2760,6 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 				'references',
 			]);
 
-			/** User nudges deferred until all tool_results for this turn are present (all providers). */
-			const pendingNudges: string[] = [];
-			/** Fresh I/O this step (not cache / soft-hit / refuse). */
-			let stepFreshIo = false;
 			const stepFingerprints: string[] = [];
 			let stepHadMutate = false;
 
@@ -2687,10 +2776,13 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 				readLimit: number;
 				readWindowKey: string;
 				readAliases: string[];
-				/** A successful read that counts toward the red-build cap. */
-				incrementsRedRead: boolean;
 			}
 			const lane: ParallelIoJob[] = [];
+
+			const noteIdenticalCall = (fingerprint: string, content: string): string => {
+				const { note } = loopDetector.recordCall(fingerprint, hashResult(content));
+				return note ? `${note}\n${content}` : content;
+			};
 
 			const runIoJob = async (
 				job: ParallelIoJob
@@ -2733,12 +2825,12 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 				if (ran.threw) {
 					success = false;
 					failedFingerprints.set(fingerprint, priorFails + 1);
-					consecutiveToolFails += 1;
+					const threwContent = noteIdenticalCall(fingerprint, output.slice(0, toolCap));
 					messages.push({
 						role: 'tool',
 						tool_call_id: call.id,
 						name,
-						content: output.slice(0, toolCap),
+						content: threwContent,
 					});
 					actions.push(`${name} threw`);
 					opts.onActivity?.({
@@ -2754,16 +2846,39 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					return;
 				}
 				success = isToolSuccess(name, output);
+				anyToolCount += 1;
 				if (success) {
 					resultCache.set(fingerprint, output);
-					consecutiveToolFails = 0;
 					if (pathKey) {
 						touchedPaths.add(pathKey);
+					}
+					if (isEffectfulTool(name)) {
+						effectfulCount += 1;
+					}
+					if (
+						name === 'browser_click' ||
+						name === 'browser_type' ||
+						name === 'browser_navigate'
+					) {
+						if (/UI changed after action/i.test(output)) {
+							uiChangeCount += 1;
+							unchangedStreak = 0;
+						} else if (/UI UNCHANGED after action/i.test(output)) {
+							unchangedStreak += 1;
+						} else {
+							unchangedStreak = 0;
+						}
 					}
 				} else {
 					failedFingerprints.set(fingerprint, priorFails + 1);
 					failedAtWriteCount.set(fingerprint, successfulWriteCount);
-					consecutiveToolFails += 1;
+					if (
+						name === 'browser_click' ||
+						name === 'browser_type' ||
+						name === 'browser_navigate'
+					) {
+						unchangedStreak = 0;
+					}
 				}
 
 				const shellLike = name === 'shell' || name === 'dotnet';
@@ -2833,54 +2948,16 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 						const pk = canonicalizePathKey(wp);
 						if (pk) readThisTurn.add(pk);
 					}
-					if (useStages && loopStage === 'act') loopStage = 'verify';
 					if (opts.workspaceRoot && writtenPaths.size) {
-						void advancePlanAfterWrites(opts.workspaceRoot, writtenPaths, {
+						pendingPlanAdvance = advancePlanAfterWrites(opts.workspaceRoot, writtenPaths, {
 							task: opts.task,
 							sessionId: opts.sessionId,
-						}).then(p => {
-							if (p) {
-								activeInternalPlan = p;
-								if (useStages && p.items.some(i => i.status === 'pending')) {
-									loopStage = 'act';
-									// Re-inject plan into system message after slice advance.
-									if (messages[0]?.role === 'system') {
-										const base = systemBaseWithPacket.replace(
-											/\n\n### Internal build plan[\s\S]*$/,
-											''
-										);
-										const block = formatPlanForPrompt(p);
-										systemBaseWithPacket = `${base}\n\n${block}`;
-										messages[0] = { role: 'system', content: systemBaseWithPacket };
-									}
-								}
-							}
 						});
 					}
-				}
-				// Stale old_string: clear read-this-turn so the next edit must re-read (tool result already explains).
-				if (
-					(name === 'edit' || name === 'apply_patch') &&
-					!success &&
-					/old_string was not found|hunk \d+:|context not found/i.test(output)
-				) {
-					const pk = canonicalizePathKey(String(args.path ?? ''));
-					if (pk) readThisTurn.delete(pk);
 				}
 				if (name === 'read' && success) {
 					const pk = canonicalizePathKey(String(args.path ?? ''));
 					if (pk) readThisTurn.add(pk);
-				}
-				if (
-					name === 'read' &&
-					!success &&
-					/FILE_NOT_FOUND/i.test(output) &&
-					useStages &&
-					loopStage !== 'explore' &&
-					exploreReopens < 2
-				) {
-					loopStage = 'explore';
-					exploreReopens += 1;
 				}
 				if (name === 'delete' || name === 'rename') {
 					if (success) successfulWriteCount += 1;
@@ -2944,9 +3021,9 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 
 				actions.push(
 					output.startsWith('FILE_NOT_FOUND:')
-						? `${name} missing ${args.path ?? ''}`.trim()
+						? `${name} missing ${String(args.path ?? '')}`.trim()
 						: success
-							? `${name} ${args.path ?? args.oldPath ?? args.command ?? args.tool ?? args.task ?? args.query ?? ''}`.trim()
+							? `${name} ${String(args.path ?? args.oldPath ?? args.command ?? args.tool ?? args.task ?? args.query ?? '')}`.trim()
 							: name === 'shell' &&
 								  isShellNoiseFailure(String(args.command ?? ''), output)
 								? 'shell failed (cmd-noise)'
@@ -2956,10 +3033,6 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 				if (name === 'read' && pathKey && success) {
 					readPathsSeen.add(pathKey);
 					readThisTurn.add(pathKey);
-					readsWhileRed = gates.buildRed ? readsWhileRed + 1 : 0;
-					if (useStages && loopStage === 'explore' && readThisTurn.size >= 2) {
-						loopStage = 'act';
-					}
 					const parsed = parseReadCoverage(output);
 					const endLine = parsed?.end ?? readStart + readLimit - 1;
 					const startLine = parsed?.start ?? readStart;
@@ -2970,16 +3043,23 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					const wins = readWindows.get(pathKey) ?? [];
 					wins.push({ start: startLine, end: endLine });
 					readWindows.set(pathKey, wins);
+					const diskBody = output;
+					const prevMeta = readWindowKey ? readWindowBodies.get(readWindowKey) : undefined;
+					if (prevMeta && diskBody === prevMeta.body) {
+						output = `(unchanged since step ${prevMeta.step})\n${diskBody}`;
+					}
 					if (readWindowKey) {
-						resultCache.set(`readwin:${readWindowKey}`, output);
+						readWindowBodies.set(readWindowKey, { body: diskBody, step: step + 1 });
+						resultCache.set(`readwin:${readWindowKey}`, diskBody);
+					}
+					const rel = String(args.path ?? '').replace(/\\/g, '/');
+					if (/\.md$/i.test(rel) || /(^|\/)docs\//i.test(rel) || /(^|\/)cards?\//i.test(rel)) {
+						readSpecPaths.add(rel);
 					}
 				}
 				if (name === 'list' && pathKey && success) {
 					listPathsSeen.add(pathKey);
 					resultCache.set(`list:${pathKey}`, output);
-				}
-				if (name !== 'read' && !exploreTools.has(name)) {
-					readsWhileRed = 0;
 				}
 
 				if (
@@ -2992,19 +3072,40 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 						keys.add(canonicalizePathKey(String(args.newPath)));
 					}
 					invalidatePaths(resultCache, readPathsSeen, readMaxEnd, keys);
-					for (const k of keys) softReadHits.delete(k);
 					for (const cacheKey of [...resultCache.keys()]) {
-						if (cacheKey.startsWith('list:')) resultCache.delete(cacheKey);
+						if (cacheKey.startsWith('list:') || cacheKey.startsWith('readwin:')) {
+							resultCache.delete(cacheKey);
+						}
+					}
+					for (const k of [...readWindowBodies.keys()]) {
+						const base = k.split('#')[0] ?? k;
+						if ([...keys].some(pk => base === pk || base.endsWith('/' + pk) || pk.endsWith('/' + base))) {
+							readWindowBodies.delete(k);
+						}
 					}
 					listPathsSeen.clear();
+					const wroteRel = String(
+						name === 'rename' ? (args.newPath ?? args.oldPath ?? '') : (args.path ?? '')
+					).replace(/\\/g, '/');
+					if (wroteRel) {
+						if (isTestFilePath(wroteRel)) writtenTestPaths.add(wroteRel);
+						else if (!/\.(md|json|ya?ml|txt)$/i.test(wroteRel)) writtenSourcePaths.add(wroteRel);
+					}
 				}
 
 				if (name === 'retrieve' && success) {
 					output = annotateRetrieveWithReadMemory(output, readPathsSeen, readMaxEnd);
-					if (useStages && loopStage === 'explore') loopStage = 'act';
 				}
-				if (name === 'search' && success && useStages && loopStage === 'explore') {
-					loopStage = 'act';
+
+				if (name === 'read' && pathKey && success) {
+					const diskBody = (() => {
+						const m = /^\(unchanged since step \d+\)\n/.exec(output);
+						return m ? output.slice(m[0].length) : output;
+					})();
+					const { note } = loopDetector.recordCall(fingerprint, hashResult(diskBody));
+					if (note) output = `${note}\n${output}`;
+				} else {
+					output = noteIdenticalCall(fingerprint, output);
 				}
 
 				messages.push({
@@ -3030,15 +3131,16 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 				}
 			};
 
+			const agentToolSchemas = Object.fromEntries(
+				AGENT_TOOLS.map(t => [t.function.name, t.function.parameters as JsonSchemaLike])
+			) as Record<string, JsonSchemaLike>;
+
 			for (const call of toolCalls) {
 				if (opts.cancelled() || opts.abortSignal?.aborted) {
 					lane.length = 0;
 					ensureToolResultsForCalls(messages, toolCalls, 'Cancelled by user');
 					turnOutcome = 'cancelled';
 					return 'Cancelled.';
-				}
-				if (!exploreTools.has(call.function.name)) {
-					await flushLane();
 				}
 
 				let args: Record<string, unknown> = {};
@@ -3047,6 +3149,15 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 				} catch (parseErr) {
 					const detail =
 						parseErr instanceof Error ? parseErr.message : String(parseErr);
+					emitProtocol('badArgs', '1');
+					emitProtocol(
+						'sample',
+						JSON.stringify({
+							reason: 'invalid_tool_args_json',
+							tool: call.function.name,
+							preview: String(call.function.arguments ?? '').slice(0, 2000),
+						})
+					);
 					await flushLane();
 					messages.push({
 						role: 'tool',
@@ -3061,8 +3172,47 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					continue;
 				}
 
-				const name = call.function.name;
 				const toolAdvice: string[] = [];
+				const normalized = normalizeToolCall({
+					name: call.function.name,
+					args,
+					activeToolNames,
+					workspaceRoot: opts.workspaceRoot,
+					toolSchemas: agentToolSchemas,
+				});
+				if (normalized.notes.length) toolAdvice.push(...normalized.notes);
+				if (normalized.error) {
+					const unknown = /no tool named/i.test(normalized.error);
+					emitProtocol(unknown ? 'unknownTools' : 'badArgs', '1');
+					emitProtocol(
+						'sample',
+						JSON.stringify({
+							reason: unknown ? 'unknown_tool' : 'normalize_error',
+							tool: call.function.name,
+							error: normalized.error.slice(0, 500),
+							args: Object.keys(args),
+						})
+					);
+					await flushLane();
+					const notePrefix = normalized.notes.length
+						? `${normalized.notes.join(' ')}\n`
+						: '';
+					messages.push({
+						role: 'tool',
+						tool_call_id: call.id,
+						name: normalized.name || call.function.name,
+						content: `${notePrefix}${normalized.error}`,
+					});
+					actions.push(
+						`${call.function.name} blocked (${unknown ? 'unknown tool' : 'bad-args'})`
+					);
+					continue;
+				}
+				const name = normalized.name;
+				args = normalized.args;
+				if (!exploreTools.has(name)) {
+					await flushLane();
+				}
 				const refuse = async (content: string, label: string) => {
 					await flushLane();
 					trace?.info('harness', String(content.length));
@@ -3105,25 +3255,14 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 						);
 						continue;
 					}
-				}
-
-				// Weak profile: with the build red, three reads are enough to locate the error; broad exploration waits.
-				const pendingRedReads = lane.reduce((n, job) => n + (job.incrementsRedRead ? 1 : 0), 0);
-				if (
-					weakProfile &&
-					gates.buildRed &&
-					readsWhileRed + pendingRedReads >= 3 &&
-					(name === 'list' || name === 'retrieve' || name === 'search' || (name === 'read' && !mentionsErrorFile(String(args.path ?? ''), gates.lastBuildErrors)))
-				) {
-					await refuse(
-						[
-							'Not run: the build is red and three reads have happened since. Edit the files named in the errors, or run the build again.',
-							'Open errors:',
-							...gates.lastBuildErrors.slice(0, 8).map(e => `- ${e}`),
-						].join('\n'),
-						'red build'
-					);
-					continue;
+					const contentLines = String(args.content ?? '').split(/\r?\n/).length;
+					if (contentLines > 180) {
+						await refuse(
+							`Not written: content is ${contentLines} lines (limit 180 on weak profile). Write a minimal skeleton (<60 lines), then grow the file with edit one method/block at a time. For .NET projects prefer the dotnet tool (new / sln_add / add_reference).`,
+							'large write'
+						);
+						continue;
+					}
 				}
 
 				if (name === 'list') {
@@ -3157,70 +3296,15 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 				const isReadonly = READONLY_TOOLS.has(name);
 				const priorFails = failedFingerprints.get(fingerprint) ?? 0;
 
-				if (name === 'list' && pathKey && listPathsSeen.has(pathKey) && resultCache.has(`list:${pathKey}`)) {
-					const prior = resultCache.get(`list:${pathKey}`) ?? '';
-					const content = `(already in context — earlier listing of ${args.path})\n${clipData(prior, toolCap)}`;
-					await flushLane();
-					messages.push({
-						role: 'tool',
-						tool_call_id: call.id,
-						name,
-						content,
-					});
-					actions.push(`list ${args.path} cached`.trim());
-					opts.onActivity?.({
-						kind: 'tool',
-						label: `list cached ${args.path}`,
-						tool: name,
-						toolCallId: call.id,
-						toolStatus: 'ok',
-						success: true,
-						detail: content.slice(0, 200),
-					});
-					continue;
-				}
-
-				// Same path + covered window: return remembered content; new startLine past coverage still runs.
+				// Same path + covered window tracking (fresh disk read always; unchanged marker after commit).
 				const readStart = Math.max(
 					1,
 					Number(args.startLine ?? args.offset ?? 1) || 1
 				);
 				const readLimit = Math.max(1, Math.min(400, Number(args.limit ?? 120) || 120));
 				const readAliases = readAliasesFor(pathKey);
-				const coveredEnd = Math.max(
-					0,
-					...readAliases.map(k => readMaxEnd.get(k) ?? 0)
-				);
-				const alreadyRead = readAliases.some(k => readPathsSeen.has(k));
 				const readWindowKey =
 					name === 'read' && pathKey ? `${pathKey}@${readStart}@${readLimit}` : '';
-				const cachedWindow =
-					name === 'read' && pathKey && alreadyRead
-						? rememberedReadWindow(resultCache, readAliases, readStart, readLimit)
-						: undefined;
-				if (name === 'read' && cachedWindow !== undefined && readStart <= coveredEnd) {
-					const hits = (softReadHits.get(pathKey) ?? 0) + 1;
-					softReadHits.set(pathKey, hits);
-					const content = `(already in context up to L${coveredEnd})\n${clipData(cachedWindow, toolCap)}`;
-					await flushLane();
-					messages.push({
-						role: 'tool',
-						tool_call_id: call.id,
-						name,
-						content,
-					});
-					actions.push(`read ${args.path} cached`.trim());
-					opts.onActivity?.({
-						kind: 'tool',
-						label: `read cached ${args.path}`,
-						tool: name,
-						toolCallId: call.id,
-						toolStatus: 'ok',
-						success: true,
-						detail: content.slice(0, 200),
-					});
-					continue;
-				}
 
 				// Identical failed command: not re-run (same input, same failure) unless files changed since.
 				if (
@@ -3228,13 +3312,15 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					(name === 'shell' || name === 'dotnet') &&
 					failedAtWriteCount.get(fingerprint) === successfulWriteCount
 				) {
-					const refusal = [
-						'Not run: this exact command already failed in this run and no file changed since.',
-						'Change the command, or fix the files named in its output first.',
-					].join('\n');
+					const refusal = noteIdenticalCall(
+						fingerprint,
+						[
+							'Not run: this exact command already failed in this run and no file changed since.',
+							'Change the command, or fix the files named in its output first.',
+						].join('\n')
+					);
 					messages.push({ role: 'tool', tool_call_id: call.id, name, content: refusal });
 					actions.push(`${name} advised (failed-repeat)`);
-					consecutiveToolFails += 1;
 					continue;
 				}
 				// Identical edit/write/apply_patch that already failed (or duplicate in this step batch).
@@ -3245,30 +3331,49 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					(name === 'edit' || name === 'write' || name === 'apply_patch')
 				) {
 					const pk = canonicalizePathKey(String(args.path ?? ''));
-					if (pk) readThisTurn.delete(pk);
 					// Treat as failed so later identical calls in this run stay blocked.
 					failedFingerprints.set(fingerprint, Math.max(priorFails, 1));
-					const refusal = [
-						`Not run: this exact ${name} already failed in this run (same arguments).`,
-						pk
-							? `Call read on ${args.path} again (fresh this turn), copy the EXACT bytes into old_string, then edit with a shorter unique span.`
-							: 'Re-read the target file and retry with different arguments.',
-						'Do not repeat the same old_string/new_string. If the change is already present in the file, move on.',
-					].join('\n');
+					let window = '';
+					if (typeof args.path === 'string') {
+						const raw = await opts.bridge.readRaw(String(args.path));
+						if (raw !== undefined) {
+							window =
+								name !== 'write' && args.old_string
+									? closestWindow(raw, String(args.old_string), 15)
+									: numberedExcerpt(raw, 120);
+						}
+					}
+					const refusal = noteIdenticalCall(
+						fingerprint,
+						[
+							`Not run: this exact ${name} already failed in this run (same arguments).`,
+							pk
+								? `Copy the EXACT bytes into old_string from the window below, then edit with a shorter unique span.`
+								: 'Re-read the target file and retry with different arguments.',
+							'Do not repeat the same old_string/new_string. If the change is already present in the file, move on.',
+							window ? `Current contents:\n${window}` : '',
+						]
+							.filter(Boolean)
+							.join('\n')
+					);
 					await flushLane();
 					messages.push({ role: 'tool', tool_call_id: call.id, name, content: refusal });
 					actions.push(`${name} blocked (failed-repeat)`);
-					consecutiveToolFails += 1;
 					continue;
 				}
 
-				if (cached && priorCount >= 1 && isReadonly) {
+				// Soft-hit for readonly tools except read/list (those always go to disk).
+				if (cached && priorCount >= 1 && isReadonly && name !== 'read' && name !== 'list') {
 					await flushLane();
+					const content = noteIdenticalCall(
+						fingerprint,
+						`(already in context — same ${name} result for the same arguments)\n${clipToolOutput(name, cached, toolCap)}`
+					);
 					messages.push({
 						role: 'tool',
 						tool_call_id: call.id,
 						name,
-						content: `(already in context — same ${name} result for the same arguments)\n${clipToolOutput(name, cached, toolCap)}`,
+						content,
 					});
 					if (!warnedFingerprints.has(fingerprint)) {
 						warnedFingerprints.add(fingerprint);
@@ -3426,73 +3531,50 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					continue;
 				}
 
-				// Stage enforcement (stable tool schemas — refuse at execution).
-				const explorationClosed = useStages && loopStage !== 'explore';
-				if (explorationClosed && EXPLORE_TOOLS_STAGE.has(name)) {
-					await flushLane();
-					messages.push({
-						role: 'tool',
-						tool_call_id: call.id,
-						name,
-						content: [
-							`Not run: exploration is closed for this step (stage=${loopStage}).`,
-							'Edit focus paths, or call delegate_task (mode explore) with a precise question.',
-						].join('\n'),
-					});
-					actions.push(`${name} blocked (stage ${loopStage})`);
-					continue;
-				}
-
-				// Path gate for scaffold slices (only when current item lists paths).
-				if (
-					(name === 'write' || name === 'edit' || name === 'apply_patch') &&
-					activeInternalPlan &&
-					!pathAllowedByPlan(activeInternalPlan, String(args.path ?? ''))
-				) {
-					const item = activeInternalPlan.items.find(i => i.status === 'pending');
-					await flushLane();
-					messages.push({
-						role: 'tool',
-						tool_call_id: call.id,
-						name,
-						content: `Not run: current slice allows only ${(item?.paths ?? []).join(', ') || '(none)'}. Finish that item before other paths.`,
-					});
-					actions.push(`${name} blocked (plan path gate)`);
-					continue;
-				}
-
-				// Hard read-before-mutate gate (this turn only).
+				// Hard read-before-mutate gate (this turn only) — refuse delivers a numbered excerpt and marks read.
 				if (name === 'edit' || name === 'apply_patch') {
-					const pk = canonicalizePathKey(String(args.path ?? ''));
+					const pathArg = String(args.path ?? '');
+					const pk = canonicalizePathKey(pathArg);
 					if (pk && !readThisTurn.has(pk)) {
-						await flushLane();
-						messages.push({
-							role: 'tool',
-							tool_call_id: call.id,
-							name,
-							content: `Not run: read ${args.path} first this turn, then ${name}.`,
-						});
-						actions.push(`${name} blocked (read-this-turn gate)`);
-						continue;
+						const raw = await opts.bridge.readRaw(pathArg);
+						const decision = decideEditReadGate(
+							readGate,
+							pathArg,
+							raw,
+							args.old_string !== undefined ? String(args.old_string) : undefined
+						);
+						if (!decision.allow) {
+							await flushLane();
+							applyReadGateRemedy(readGate, decision);
+							messages.push({
+								role: 'tool',
+								tool_call_id: call.id,
+								name,
+								content: noteIdenticalCall(fingerprint, decision.message),
+							});
+							actions.push(`${name} blocked (read-this-turn gate)`);
+							continue;
+						}
 					}
 				}
 				if (name === 'write') {
-					const pk = canonicalizePathKey(String(args.path ?? ''));
-					const alreadySeen =
-						pk &&
-						(readPathsSeen.has(pk) ||
-							[...readPathsSeen].some(k => k === pk || k.endsWith('/' + pk)));
-					// Overwrite of an existing/previously-seen file requires a read this turn.
-					if (pk && alreadySeen && !readThisTurn.has(pk)) {
-						await flushLane();
-						messages.push({
-							role: 'tool',
-							tool_call_id: call.id,
-							name,
-							content: `Not run: read ${args.path} first this turn before overwriting with write.`,
-						});
-						actions.push(`${name} blocked (read-this-turn gate)`);
-						continue;
+					const pathArg = String(args.path ?? '');
+					const pk = canonicalizePathKey(pathArg);
+					if (pk && !readThisTurn.has(pk)) {
+						const raw = await opts.bridge.readRaw(pathArg);
+						const decision = decideWriteReadGate(readGate, pathArg, raw);
+						if (!decision.allow) {
+							await flushLane();
+							applyReadGateRemedy(readGate, decision);
+							messages.push({
+								role: 'tool',
+								tool_call_id: call.id,
+								name,
+								content: noteIdenticalCall(fingerprint, decision.message),
+							});
+							actions.push(`${name} blocked (read-this-turn gate)`);
+							continue;
+						}
 					}
 				}
 
@@ -3562,8 +3644,8 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					if (name === 'apply_patch') {
 						const patchBody = String(args.patch ?? args.patchText ?? '');
 						const parsed = parsePatch(patchBody);
-						if (parsed.ok && parsed.hunks.length === 1 && parsed.hunks[0]!.type === 'update') {
-							const hunk = parsed.hunks[0]!;
+						if (parsed.ok && parsed.hunks.length === 1 && parsed.hunks[0].type === 'update') {
+							const hunk = parsed.hunks[0];
 							const current = await opts.bridge.readRaw(hunk.path);
 							const applied = applyPatchHunk(hunk, () => current);
 							previewArgs = applied.ok
@@ -3586,7 +3668,6 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					}
 				}
 
-				stepFreshIo = true;
 				const job: ParallelIoJob = {
 					call,
 					name,
@@ -3599,9 +3680,6 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					readLimit,
 					readWindowKey,
 					readAliases,
-					incrementsRedRead:
-						name === 'read' &&
-						!mentionsErrorFile(String(args.path ?? ''), gates.lastBuildErrors),
 				};
 				if (exploreTools.has(name)) {
 					lane.push(job);
@@ -3612,46 +3690,42 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 
 			await flushLane();
 
-			const batchKey = stepFingerprints.slice().sort().join('\0');
-			if (batchKey && batchKey === lastToolBatchKey) {
-				consecutiveSameBatch += 1;
-			} else {
-				consecutiveSameBatch = 0;
-				lastToolBatchKey = batchKey;
+			if (pendingPlanAdvance) {
+				const advanced = await pendingPlanAdvance;
+				pendingPlanAdvance = undefined;
+				if (advanced) {
+					activeInternalPlan = advanced;
+					if (advanced.items.some(i => i.status === 'pending')) {
+						messages.push({
+							role: 'user',
+							content: `### Internal build plan (updated at step ${step + 1})\n\n${formatPlanForPrompt(advanced)}`,
+						});
+					}
+				}
 			}
-			if (stepFreshIo) {
-				consecutiveNoopToolSteps = 0;
-			} else {
-				consecutiveNoopToolSteps += 1;
-			}
+
 			if (stepHadMutate) {
 				exploreOnlySteps = 0;
 			} else if (toolCalls.some(tc => exploreTools.has(tc.function.name))) {
 				exploreOnlySteps += 1;
 			}
-			// Flush any remaining deferred notes (oracle / protocol) after tool_results.
-			for (const nudge of pendingNudges) {
-				trace?.info('harness', String(nudge.length));
-				messages.push({ role: 'user', content: nudge });
+			// Successful tool progress resets length-truncation streak (distant truncations must not kill the run).
+			if (toolCalls.length > 0) {
+				lengthTruncationNudges = 0;
+				preferShortCompletion = false;
 			}
+			loopDetector.endStep();
+			loopDetector.setExploreOnlySteps(exploreOnlySteps);
+			loopDetector.setUnchangedStreak(unchangedStreak);
 
 			// Hard stop when tools loop without progress — no coaching nudges.
-			const stuckHard =
-				(consecutiveNoopToolSteps >= 6 ||
-					consecutiveSameBatch >= 5 ||
-					exploreOnlySteps >= 20) &&
-				step >= 5;
-			if (stuckHard) {
+			if (loopDetector.shouldStop() && step >= 2) {
 				loopExit = 'stuck';
+				stuckCause = loopDetector.cause();
 				opts.onActivity?.({
 					kind: 'checkpoint',
 					label: 'Stopped tool loop',
-					detail:
-						consecutiveNoopToolSteps >= 6
-							? 'repeated cache-only tools'
-							: consecutiveSameBatch >= 5
-								? 'identical tool batch repeated'
-								: 'explore-only streak',
+					detail: stuckCause,
 				});
 				opts.onStatus?.('Tools stuck — final status without tools…');
 				break;
@@ -3695,117 +3769,108 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 		if (!loopExit) loopExit = 'budget';
 		const stepsUsed = Math.min(step + 1, stepBudget);
 
-		// Stuck: final prose turn. Keep tool schemas (prefix-cache) but force tool_choice none.
-		if (loopExit === 'stuck') {
-			messages.push({
-				role: 'user',
-				content: STUCK_WRAP_PROMPT,
-			});
-			opts.onStatus?.('Tools were stuck — final status without tools…');
-			try {
-				const wrap = await postAgentRound(
-					opts,
-					url,
-					sanitizeMessages(messages),
-					2048,
-					toolsForRound(activeToolNames, agentMode, opts.model),
-					'none'
-				);
-				if (wrap.ok) {
-					const msg = wrap.data.choices?.[0]?.message;
-					const raw = coerceMessageContent(msg?.content);
-					const split = splitThinkContent(raw);
-					let answer = (split.content || raw).trim();
-					// If the model still emitted tool_calls, ignore explore and only keep a short edit intent in prose.
-					if ((!answer || looksLikeToolJson(answer)) && msg?.tool_calls?.length) {
-						const names = msg.tool_calls.map(t => t.function.name).join(', ');
-						answer = `I still tried to call tools (${names}) after being told to stop. Name one file and the exact change for the next turn.`;
-					}
-					if (answer) {
-						turnOutcome = 'done';
-						opts.onTaskUpdate?.({
-							id: taskId,
-							name: truncateHistory(opts.task, 60),
-							status: 'completed',
-							result: truncateHistory(answer, 120),
-							elapsed: Date.now() - started,
-						});
-						return answer;
-					}
-				}
-			} catch {
-				/* fall through */
-			}
-			turnOutcome = 'max-steps';
-			opts.onTaskUpdate?.({
-				id: taskId,
-				name: truncateHistory(opts.task, 60),
-				status: 'failed',
-				result: 'stuck tools',
-				elapsed: Date.now() - started,
-			});
-			return [
-				'Stopped: tools were repeating without new progress.',
-				summarizeActionsForLlm(actions),
-				'Tip: restate a concrete next step (file + change), not just “continue”.',
-			].join('\n\n');
-		}
+		const wrapPrompt =
+			loopExit === 'stuck'
+				? stuckWrapPrompt(stuckCause || loopDetector.cause())
+				: loopExit === 'length'
+					? LENGTH_EXHAUSTED_PROMPT
+					: MAX_STEPS_PROMPT;
+		const wrapStatus =
+			loopExit === 'stuck'
+				? 'Tools were stuck — final status without tools…'
+				: loopExit === 'length'
+					? 'Output length exhausted — final status without tools…'
+					: 'Step budget exhausted — final status without tools…';
+		const wrapFallback =
+			loopExit === 'stuck'
+				? [
+						'Stopped: tools were repeating without new progress.',
+						stuckCause ? `Reason: ${stuckCause}` : '',
+						summarizeActionsForLlm(actions),
+						'Tip: restate a concrete next step (file + change), not just “continue”.',
+					]
+						.filter(Boolean)
+						.join('\n\n')
+				: loopExit === 'length'
+					? [
+							'Stopped: the output length limit was exhausted after repeated truncations.',
+							summarizeActionsForLlm(actions),
+							'Tip: ask for a smaller next step (file + change).',
+						].join('\n\n')
+					: [
+							`Reached max tool steps (${stepsUsed}/${hardCap}) without finishing tools` +
+								(activeInternalPlan
+									? ` (slice ${activeInternalPlan.items.filter(i => i.status === 'done').length + 1}/${activeInternalPlan.items.length})`
+									: '') +
+								'.',
+							summarizeActionsForLlm(actions),
+							reviewLog.length ? `Last checkpoint: ${reviewLog[reviewLog.length - 1]}` : '',
+							'Tip: ask to continue with a specific next step, or break the task into smaller pieces.',
+						]
+							.filter(Boolean)
+							.join('\n\n');
 
+		messages.push({
+			role: 'user',
+			content: wrapPrompt,
+		});
+		opts.onStatus?.(wrapStatus);
+		try {
+			const wrap = await postAgentRound(
+				opts,
+				url,
+				sanitizeMessages(messages),
+				SHORT_COMPLETION_TOKENS,
+				toolsForRound(activeToolNames, agentMode, opts.model, frozenSkillCatalog),
+				'none'
+			);
+			if (wrap.ok) {
+				const msg = wrap.data.choices?.[0]?.message;
+				const raw = coerceMessageContent(msg?.content);
+				const split = splitThinkContent(raw);
+				let answer = (split.content || raw).trim();
+				if ((!answer || looksLikeToolJson(answer)) && msg?.tool_calls?.length) {
+					const names = msg.tool_calls.map(t => t.function.name).join(', ');
+					const reason =
+						loopExit === 'stuck'
+							? stuckCause || loopDetector.cause()
+							: loopExit === 'length'
+								? 'output length limit exhausted after repeated truncations'
+								: 'maximum steps reached';
+					answer = [
+						`Stopped: ${reason}.`,
+						`I still tried to call tools (${names}) after being told to stop.`,
+						'Name one file and the exact change for the next turn.',
+					].join(' ');
+				}
+				if (answer) {
+					turnOutcome = loopExit === 'budget' ? 'max-steps' : 'done';
+					opts.onTaskUpdate?.({
+						id: taskId,
+						name: truncateHistory(opts.task, 60),
+						status: loopExit === 'budget' ? 'failed' : 'completed',
+						result: truncateHistory(answer, 120),
+						elapsed: Date.now() - started,
+					});
+					return answer;
+				}
+			}
+		} catch {
+			/* fall through */
+		}
+		turnOutcome = 'max-steps';
 		opts.onTaskUpdate?.({
 			id: taskId,
 			name: truncateHistory(opts.task, 60),
 			status: 'failed',
-			result: 'max steps',
+			result:
+				loopExit === 'stuck'
+					? 'stuck tools'
+					: loopExit === 'length'
+						? 'length exhausted'
+						: 'max steps',
 			elapsed: Date.now() - started,
 		});
-		turnOutcome = 'max-steps';
-
-		let finalSummary = '';
-		try {
-			opts.onStatus?.('Step budget exhausted — asking for a final summary…');
-			const base = (opts.baseUrl || defaultBase(opts.provider)).replace(/\/$/, '');
-			const res = await fetch(`${base}/chat/completions`, {
-				method: 'POST',
-				headers: {
-					'Content-Type': 'application/json',
-					...(opts.apiKey ? { Authorization: `Bearer ${opts.apiKey}` } : {}),
-				},
-				signal: opts.abortSignal,
-				body: JSON.stringify({
-					model: opts.model,
-					temperature: 0.2,
-					stream: false,
-					max_tokens: 700,
-					...llmContextOptions(getContextBudget(opts.numCtx)),
-					...llmJsonOptions(opts.forceJson),
-					messages: [
-						{
-							role: 'system',
-							content:
-								'Summarize agent progress in under 200 words. Cover what was done, what remains, and how to continue. Do not invent paths.',
-						},
-						{
-							role: 'user',
-							content: [
-								`Task: ${opts.task}`,
-								summarizeActionsForLlm(actions),
-								reviewLog.length
-									? `Last checkpoint: ${reviewLog[reviewLog.length - 1]}`
-									: '',
-							]
-								.filter(Boolean)
-								.join('\n'),
-						},
-					],
-				}),
-			});
-			if (res.ok) {
-				const data = await readChatCompletionResponse(res);
-				finalSummary = data.choices?.[0]?.message?.content?.trim() ?? '';
-			}
-		} catch {
-			finalSummary = '';
-		}
 
 		let statusFallback = '';
 		if (statusQuestion) {
@@ -3813,22 +3878,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 			const saved = await loadProjectStatus(opts.workspaceRoot);
 			statusFallback = (saved ? formatStatusForPrompt(saved) : emptyStatusPrompt()) + '\n\n';
 		}
-
-		const noProgress = actions.length === 0 || /writes=0/.test(summarizeActionsForLlm(actions));
-		return (
-			statusFallback +
-			`Reached max tool steps (${stepsUsed}/${hardCap}) without finishing tools` +
-			(activeInternalPlan
-				? ` (slice ${activeInternalPlan.items.filter(i => i.status === 'done').length + 1}/${activeInternalPlan.items.length})`
-				: '') +
-			`.\n\n` +
-			(finalSummary ? `${finalSummary}\n\n` : '') +
-			`${summarizeActionsForLlm(actions)}\n` +
-			(reviewLog.length ? `Last checkpoint: ${reviewLog[reviewLog.length - 1]}\n\n` : '') +
-			(noProgress
-				? `Tip: “continue” alone will not help — say the concrete next step (file + change).`
-				: `Tip: ask to continue with a specific next step, or break the task into smaller pieces.`)
-		);
+		return statusFallback + wrapFallback;
 	} catch (err) {
 		turnOutcome = 'error';
 		const message = err instanceof Error ? err.message : String(err);
@@ -4008,7 +4058,7 @@ async function executeTool(
 				return await browser.browserNavigate(String(args.url));
 			case 'browser_snapshot': {
 				const snap = await browser.browserSnapshot();
-				return `URL: ${snap.url}\nTitle: ${snap.title}\n\n${snap.text}`;
+				return `URL: ${snap.url}\nTitle: ${snap.title}\n\n${snap.text}\n\n(Snapshot is the source of truth for the next click/type.)`;
 			}
 			case 'browser_click':
 				return await browser.browserClick(String(args.selector));
@@ -4153,7 +4203,8 @@ async function executeTool(
 							: [],
 						depth: depth + 1,
 						maxSteps: wantExplore ? 10 : wantPlan ? 12 : 16,
-						planMode: wantExplore || wantPlan,
+						planMode: wantPlan,
+						exploreOnly: wantExplore,
 						askMode: false,
 						coachMode: false,
 						isolated: true,
@@ -4456,14 +4507,18 @@ async function compactWithLlm(
 					.join('\n')}`
 			: '';
 
+	// Keep the exact same system string (stable prefix); packet goes in the summary user message.
 	return [
-		{ role: 'system', content: `${system}\n\n${packet.markdown}` },
+		{ role: 'system', content: system },
 		{
 			role: 'user',
 			content: [
 				prior,
 				`Current task:\n${opts.task}`,
-				``,
+				'',
+				'### Context packet (compact)',
+				packet.markdown,
+				'',
 				'### Rolling summary + facts',
 				'The conversation was compacted. STABLE FACTS (system message) hold the canonical paths and open errors.',
 				rolling,
@@ -4552,19 +4607,34 @@ async function postAgentRound(
 		proseToolsOnly: !!opts.proseToolsOnly,
 		tools,
 	};
-	const sampling = llmSamplingOptions(thinkInput);
+	const baseSampling = llmSamplingOptions(thinkInput);
+	const sampling = {
+		...baseSampling,
+		...(opts.sampling ?? {}),
+	};
+	const samplingExtras: Record<string, number> = {};
+	if (typeof sampling.top_k === 'number') samplingExtras.top_k = sampling.top_k;
+	if (typeof sampling.presence_penalty === 'number') {
+		samplingExtras.presence_penalty = sampling.presence_penalty;
+	}
+	if (typeof sampling.repeat_penalty === 'number') {
+		samplingExtras.repeat_penalty = sampling.repeat_penalty;
+	}
+	if (typeof sampling.dry_multiplier === 'number') {
+		samplingExtras.dry_multiplier = sampling.dry_multiplier;
+	}
 	const cappedTokens = toolAwareMaxTokens(maxTokens, thinkInput);
 	const disableThink = shouldDisableThinking(thinkInput);
 	const enableThink = shouldEnableThinking(thinkInput);
-	let outbound = stripReasoningFromMessages(messages) as ChatMessage[];
+	let outbound = stripReasoningFromMessages(messages);
 	if (disableThink || enableThink) {
-		outbound = applySoftThinkSwitch(outbound, disableThink) as ChatMessage[];
+		outbound = applySoftThinkSwitch(outbound, disableThink);
 	}
 
 	const toolPayload =
 		opts.proseToolsOnly || tools.length === 0
 			? {}
-			: { tools, tool_choice: toolChoice as 'auto' | 'none' };
+			: { tools, tool_choice: toolChoice };
 
 	let response = await fetch(openaiUrl, {
 		method: 'POST',
@@ -4579,6 +4649,7 @@ async function postAgentRound(
 			messages: outbound,
 			temperature: sampling.temperature,
 			top_p: sampling.top_p,
+			...samplingExtras,
 			max_tokens: cappedTokens,
 			stream: true,
 			stream_options: { include_usage: true },
@@ -4605,6 +4676,7 @@ async function postAgentRound(
 					messages: outbound,
 					temperature: sampling.temperature,
 					top_p: sampling.top_p,
+					...samplingExtras,
 					max_tokens: cappedTokens,
 					stream: true,
 					stream_options: { include_usage: true },
@@ -4751,7 +4823,7 @@ async function streamSseChatCompletion(
 			}>;
 		};
 		try {
-			chunk = JSON.parse(payload);
+			chunk = JSON.parse(payload) as typeof chunk;
 		} catch {
 			return;
 		}
@@ -4808,7 +4880,7 @@ async function streamSseChatCompletion(
 		}
 	};
 
-	while (true) {
+	for (;;) {
 		const { done, value } = await reader.read();
 		if (done) break;
 		buffer += decoder.decode(value, { stream: true });
@@ -4967,7 +5039,7 @@ function aggregateSseChatCompletion(raw: string): ChatCompletionData {
 			}>;
 		};
 		try {
-			chunk = JSON.parse(payload);
+			chunk = JSON.parse(payload) as typeof chunk;
 		} catch {
 			continue;
 		}
@@ -5095,7 +5167,7 @@ async function postAnthropicRound(
 			for (const tc of m.tool_calls ?? []) {
 				let input: Record<string, unknown> = {};
 				try {
-					input = JSON.parse(tc.function.arguments || '{}');
+					input = JSON.parse(tc.function.arguments || '{}') as Record<string, unknown>;
 				} catch {
 					input = {};
 				}
@@ -5240,17 +5312,35 @@ function isTruncatedToolCallError(status: number, errText: string): boolean {
 	);
 }
 
+/** Drop trailing commas before } or ] (common local-model JSON). */
+function stripTrailingCommas(text: string): string {
+	return text.replace(/,\s*([}\]])/g, '$1');
+}
+
 /**
  * Parse tool arguments; attempt light repair when local models truncate trailing braces/quotes.
  */
-function parseToolArguments(raw: string): Record<string, unknown> {
+export function parseToolArguments(raw: string): Record<string, unknown> {
 	const text = raw.trim() || '{}';
-	try {
-		return JSON.parse(text) as Record<string, unknown>;
-	} catch {
-		/* try repair */
+	const candidates = [
+		text,
+		stripTrailingCommas(text),
+		repairJsonStringEscapes(text),
+		repairJsonStringEscapes(stripTrailingCommas(text)),
+		balanceJsonBrackets(text),
+		balanceJsonBrackets(stripTrailingCommas(repairJsonStringEscapes(text))),
+	];
+	for (const c of candidates) {
+		try {
+			const v = JSON.parse(c) as unknown;
+			if (v && typeof v === 'object' && !Array.isArray(v)) {
+				return v as Record<string, unknown>;
+			}
+		} catch {
+			/* next */
+		}
 	}
-	let repaired = text;
+	let repaired = stripTrailingCommas(repairJsonStringEscapes(text));
 	// Close an open JSON string if content was cut mid-file.
 	const quoteCount = (repaired.match(/(?<!\\)"/g) || []).length;
 	if (quoteCount % 2 === 1) {
@@ -5262,7 +5352,7 @@ function parseToolArguments(raw: string): Record<string, unknown> {
 		repaired += '}'.repeat(opens - closes);
 	}
 	try {
-		return JSON.parse(repaired) as Record<string, unknown>;
+		return JSON.parse(stripTrailingCommas(repaired)) as Record<string, unknown>;
 	} catch (err) {
 		throw new Error(err instanceof Error ? err.message : 'unexpected end of JSON input');
 	}
@@ -5639,9 +5729,11 @@ function balanceJsonBrackets(text: string): string {
 function tryParseJsonObject(text: string): Record<string, unknown> | null {
 	const candidates = [
 		text,
+		stripTrailingCommas(text),
 		repairJsonStringEscapes(text),
+		repairJsonStringEscapes(stripTrailingCommas(text)),
 		balanceJsonBrackets(text),
-		balanceJsonBrackets(repairJsonStringEscapes(text)),
+		balanceJsonBrackets(stripTrailingCommas(repairJsonStringEscapes(text))),
 	];
 	for (const c of candidates) {
 		try {
@@ -5650,7 +5742,9 @@ function tryParseJsonObject(text: string): Record<string, unknown> | null {
 			if (typeof v === 'string') {
 				const inner = v.trim();
 				if (inner.startsWith('{') || inner.startsWith('[')) {
-					v = JSON.parse(balanceJsonBrackets(repairJsonStringEscapes(inner)));
+					v = JSON.parse(
+						balanceJsonBrackets(repairJsonStringEscapes(stripTrailingCommas(inner)))
+					);
 				}
 			}
 			if (v && typeof v === 'object' && !Array.isArray(v)) {
@@ -5666,9 +5760,11 @@ function tryParseJsonObject(text: string): Record<string, unknown> | null {
 function tryParseJsonArray(text: string): unknown[] | null {
 	const candidates = [
 		text,
+		stripTrailingCommas(text),
 		repairJsonStringEscapes(text),
+		repairJsonStringEscapes(stripTrailingCommas(text)),
 		balanceJsonBrackets(text),
-		balanceJsonBrackets(repairJsonStringEscapes(text)),
+		balanceJsonBrackets(stripTrailingCommas(repairJsonStringEscapes(text))),
 	];
 	for (const c of candidates) {
 		try {
@@ -5676,10 +5772,12 @@ function tryParseJsonArray(text: string): unknown[] | null {
 			if (typeof v === 'string') {
 				const inner = v.trim();
 				if (inner.startsWith('[')) {
-					v = JSON.parse(balanceJsonBrackets(repairJsonStringEscapes(inner)));
+					v = JSON.parse(
+						balanceJsonBrackets(repairJsonStringEscapes(stripTrailingCommas(inner)))
+					);
 				}
 			}
-			if (Array.isArray(v)) return v;
+			if (Array.isArray(v)) return v as unknown[];
 		} catch {
 			/* next */
 		}
@@ -5687,8 +5785,66 @@ function tryParseJsonArray(text: string): unknown[] | null {
 	return null;
 }
 
-function parseProseToolCalls(text: string): ToolCall[] {
-	const cleaned = stripMarkdownFences(text);
+/** Strip closed + trailing unclosed think blocks before lifting tool calls from content. */
+function stripThinkForProtocol(text: string): string {
+	return stripThinkBlocks(text)
+		.replace(/<think\b[^>]*>[\s\S]*$/i, '')
+		.trim();
+}
+
+/**
+ * Walk top-level JSON values glued back-to-back (e.g. `{...}{...}`).
+ */
+function splitGluedJsonValues(text: string): string[] {
+	const out: string[] = [];
+	let i = 0;
+	while (i < text.length) {
+		while (i < text.length && /\s/.test(text[i])) i++;
+		if (i >= text.length) break;
+		const startCh = text[i];
+		if (startCh !== '{' && startCh !== '[') break;
+		const open = startCh;
+		const close = open === '{' ? '}' : ']';
+		let depth = 0;
+		let inString = false;
+		let escaped = false;
+		let end = -1;
+		for (let j = i; j < text.length; j++) {
+			const ch = text[j];
+			if (escaped) {
+				escaped = false;
+				continue;
+			}
+			if (ch === '\\' && inString) {
+				escaped = true;
+				continue;
+			}
+			if (ch === '"') {
+				inString = !inString;
+				continue;
+			}
+			if (inString) continue;
+			if (ch === open) depth++;
+			else if (ch === close) {
+				depth--;
+				if (depth === 0) {
+					end = j;
+					break;
+				}
+			}
+		}
+		if (end < 0) {
+			out.push(text.slice(i));
+			break;
+		}
+		out.push(text.slice(i, end + 1));
+		i = end + 1;
+	}
+	return out;
+}
+
+export function parseProseToolCalls(text: string): ToolCall[] {
+	const cleaned = stripMarkdownFences(stripThinkForProtocol(text));
 	const span = extractJsonObjectSpan(cleaned) ?? cleaned;
 
 	const asToolCall = (
@@ -5728,18 +5884,29 @@ function parseProseToolCalls(text: string): ToolCall[] {
 			})
 			.filter((x): x is ToolCall => Boolean(x));
 
-	const obj = tryParseJsonObject(span);
-	if (obj) {
+	const liftObject = (obj: Record<string, unknown>, indexBase: number): ToolCall[] => {
 		if (Array.isArray(obj.tool_calls)) {
-			return fromArray(obj.tool_calls);
+			return fromArray(obj.tool_calls).map((c, i) => ({
+				...c,
+				id: c.id || `prose_${indexBase + i}`,
+			}));
 		}
-		// tool_calls sometimes arrives as a JSON string
 		if (typeof obj.tool_calls === 'string') {
 			const arr = tryParseJsonArray(obj.tool_calls);
-			if (arr?.length) return fromArray(arr);
+			if (arr?.length) {
+				return fromArray(arr).map((c, i) => ({
+					...c,
+					id: c.id || `prose_${indexBase + i}`,
+				}));
+			}
 		}
 		if (typeof obj.name === 'string' && (obj.arguments !== undefined || obj.args !== undefined)) {
-			const one = asToolCall(obj.name, obj.arguments ?? obj.args, String(obj.id ?? 'prose_0'), 0);
+			const one = asToolCall(
+				obj.name,
+				obj.arguments ?? obj.args,
+				String(obj.id ?? `prose_${indexBase}`),
+				indexBase
+			);
 			return one ? [one] : [];
 		}
 		if (obj.function && typeof obj.function === 'object') {
@@ -5747,11 +5914,33 @@ function parseProseToolCalls(text: string): ToolCall[] {
 			const one = asToolCall(
 				String(fn.name ?? ''),
 				fn.arguments,
-				String(obj.id ?? 'prose_0'),
-				0
+				String(obj.id ?? `prose_${indexBase}`),
+				indexBase
 			);
 			return one ? [one] : [];
 		}
+		return [];
+	};
+
+	// Glued tool JSON: `{...}{...}` or multiple tool_call objects.
+	const glued = splitGluedJsonValues(span);
+	if (glued.length > 1) {
+		const gluedCalls: ToolCall[] = [];
+		for (const piece of glued) {
+			const pieceObj = tryParseJsonObject(piece);
+			if (pieceObj) gluedCalls.push(...liftObject(pieceObj, gluedCalls.length));
+			else {
+				const arr = tryParseJsonArray(piece);
+				if (arr?.length) gluedCalls.push(...fromArray(arr));
+			}
+		}
+		if (gluedCalls.length) return gluedCalls;
+	}
+
+	const obj = tryParseJsonObject(span);
+	if (obj) {
+		const lifted = liftObject(obj, 0);
+		if (lifted.length) return lifted;
 	}
 
 	const asArray = tryParseJsonArray(span);
@@ -5885,19 +6074,19 @@ function isTrivialAssistantContent(text: string): boolean {
 function describeMutation(name: string, args: Record<string, unknown>): string {
 	switch (name) {
 		case 'write':
-			return `Write file ${args.path}`;
+			return `Write file ${String(args.path)}`;
 		case 'edit':
-			return `Edit ${args.path}`;
+			return `Edit ${String(args.path)}`;
 		case 'apply_patch':
-			return `Apply patch${args.path ? ` ${args.path}` : ''}`;
+			return `Apply patch${args.path ? ` ${String(args.path)}` : ''}`;
 		case 'dotnet':
 			return `Run: ${dotnetCommandLine(args) || `dotnet ${String(args.action ?? '')}`}`;
 		case 'delete':
-			return `Delete ${args.path}`;
+			return `Delete ${String(args.path)}`;
 		case 'rename':
-			return `Rename ${args.oldPath} → ${args.newPath}`;
+			return `Rename ${String(args.oldPath)} → ${String(args.newPath)}`;
 		case 'shell':
-			return `Run shell: ${args.command}`;
+			return `Run shell: ${String(args.command)}`;
 		default:
 			return `Execute ${name}`;
 	}

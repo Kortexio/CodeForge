@@ -46,10 +46,12 @@ assert(Object.keys(llmThinkingRequestFields(plain)).length === 0, 'empty fields'
 
 const toolSamp = llmSamplingOptions(toolRound);
 assert(toolSamp.temperature === 0.7 && toolSamp.top_p === 0.8, 'tool sampling');
+assert(toolSamp.presence_penalty === 1.0, 'tool presence_penalty');
 const planSamp = llmSamplingOptions(planRound);
 assert(planSamp.temperature === 0.6 && planSamp.top_p === 0.95, 'plan sampling');
 const plainSamp = llmSamplingOptions(plain);
 assert(plainSamp.temperature === 0.2, 'plain sampling');
+assert(plainSamp.presence_penalty === undefined, 'plain no presence_penalty');
 
 assert(
 	toolAwareMaxTokens(8192, { ...toolRound, tools: [{ function: { name: 'read' } }] }) === 3072,
@@ -94,5 +96,17 @@ assert(!String(softOff[0].content).includes('/no_think'), 'system stays clean');
 const softOn = applySoftThinkSwitch([{ role: 'user', content: 'plan this\n/no_think' }], false);
 assert(String(softOn[0].content).includes('/think'), 'soft /think');
 assert(!String(softOn[0].content).includes('/no_think'), 'opposite tag removed');
+
+assert(splitThinkContent('/no_think').content === '', 'echoed soft switch alone is empty');
+assert(splitThinkContent('  /think  \n').content === '', 'echoed /think alone is empty');
+assert(
+	splitThinkContent('/no_think\nDone: renamed calcTax.').content === 'Done: renamed calcTax.',
+	'echoed soft switch line stripped, text kept'
+);
+assert(
+	splitThinkContent('Use the /no_think switch on tool rounds.').content ===
+		'Use the /no_think switch on tool rounds.',
+	'inline mention of the switch is kept'
+);
 
 console.log('llmThinking.selftest: ok');

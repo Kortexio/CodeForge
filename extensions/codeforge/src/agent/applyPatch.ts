@@ -43,8 +43,8 @@ export function parsePatch(patchText: string): { ok: true; hunks: PatchHunk[] } 
 		const moveMatch = /^\*\*\*\s*Move\s+to:\s*(.+)$/im.exec(section);
 
 		if (addMatch) {
-			const path = addMatch[1]!.trim();
-			const rest = section.slice(addMatch.index! + addMatch[0].length).replace(/^\n/, '');
+			const path = addMatch[1].trim();
+			const rest = section.slice(addMatch.index + addMatch[0].length).replace(/^\n/, '');
 			const contents = rest
 				.split('\n')
 				.map(l => (l.startsWith('+') ? l.slice(1) : l.startsWith(' ') ? l.slice(1) : l))
@@ -57,13 +57,13 @@ export function parsePatch(patchText: string): { ok: true; hunks: PatchHunk[] } 
 			continue;
 		}
 		if (delMatch) {
-			hunks.push({ type: 'delete', path: delMatch[1]!.trim() });
+			hunks.push({ type: 'delete', path: delMatch[1].trim() });
 			continue;
 		}
 		if (updMatch) {
-			const path = updMatch[1]!.trim();
+			const path = updMatch[1].trim();
 			const movePath = moveMatch?.[1]?.trim();
-			let rest = section.slice(updMatch.index! + updMatch[0].length);
+			let rest = section.slice(updMatch.index + updMatch[0].length);
 			if (moveMatch) {
 				rest = rest.replace(moveMatch[0], '');
 			}
@@ -77,7 +77,7 @@ export function parsePatch(patchText: string): { ok: true; hunks: PatchHunk[] } 
 			} else {
 				for (const raw of rawChunks) {
 					const lines = raw.split('\n').filter((l, i) => !(i === 0 && l.startsWith('@@')));
-					chunks.push({ lines: lines.filter(l => l.length === 0 || /^[ +\-]/.test(l) || l.startsWith(' ')) });
+					chunks.push({ lines: lines.filter(l => l.length === 0 || /^[ +-]/.test(l) || l.startsWith(' ')) });
 				}
 			}
 			hunks.push({ type: 'update', path, chunks, movePath });
@@ -154,7 +154,7 @@ export function applyUpdateToText(
 ): { ok: true; text: string } | { ok: false; error: string } {
 	let text = fileText;
 	for (let i = 0; i < chunks.length; i++) {
-		const r = applyChunkToText(text, chunks[i]!);
+		const r = applyChunkToText(text, chunks[i]);
 		if (!r.ok) return { ok: false, error: `hunk ${i + 1}: ${r.error}` };
 		text = r.text;
 	}

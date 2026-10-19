@@ -135,7 +135,10 @@ export class GuardrailSession {
 			this.lastBuildErrors = [];
 			this.writesSinceBuild = 0;
 			this.consecutiveFileWrites = 0;
-			this.greenAfterWrites = true;
+			// Only a test command (or markVerifiedGreen from a full oracle) counts as finish-ready.
+			if (isTestCommand(command)) {
+				this.greenAfterWrites = true;
+			}
 			return null;
 		}
 		this.greenAfterWrites = false;
@@ -224,9 +227,17 @@ export class GuardrailSession {
 		return null;
 	}
 
-	/** A build/test command exited 0 after the last write (the only valid basis for a green claim). */
+	/** A test command (or full oracle) exited 0 after the last write — not build-only. */
 	hasVerifiedGreen(): boolean {
 		return this.greenAfterWrites && !this.buildRed && this.writesSinceBuild === 0;
+	}
+
+	/** Mark verified after a full oracle pass (may include build-only oracles). */
+	markVerifiedGreen(): void {
+		this.greenAfterWrites = true;
+		this.buildRed = false;
+		this.writesSinceBuild = 0;
+		this.consecutiveFileWrites = 0;
 	}
 
 	markMutatingWriteAllowed(): void {

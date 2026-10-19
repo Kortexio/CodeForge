@@ -100,10 +100,13 @@ export function orderCards(cards: CardDoc[]): CardDoc[] {
 	return out;
 }
 
-/** Cards named in the request (`C03`, `C01 a C05`, `C02-C04`); all cards when none are named. */
+/** Cards named in the request (`C03`, `C01 a C05`, `C02-C04`, `docs/C01.md` to `docs/C05.md`); all cards when none are named. */
 export function selectCards(task: string, cards: CardDoc[]): CardDoc[] {
 	const wanted = new Set<number>();
-	for (const m of task.matchAll(/\bC(\d+)\s*(?:a|-|–|to|até|ate|\.\.)\s*C?(\d+)\b/gi)) {
+	// Allow path/backtick noise: `docs/C01.md` to `docs/C05.md`, C01.md–C05, etc.
+	for (const m of task.matchAll(
+		/\bC(\d+)(?:\.md)?[`'"]?\s*(?:a|-|–|to|até|ate|\.\.)\s*(?:[`'"]?(?:docs\/)?)?C?(\d+)\b/gi
+	)) {
 		const [from, to] = [Number(m[1]), Number(m[2])].sort((x, y) => x - y);
 		for (let n = from; n <= to; n++) wanted.add(n);
 	}
@@ -114,6 +117,15 @@ export function selectCards(task: string, cards: CardDoc[]): CardDoc[] {
 
 export function mentionsCards(task: string): boolean {
 	return /\bcards?\b|\bC\d{2,}\b|docs\/C\d/i.test(task);
+}
+
+/**
+ * Multi-card work should run as isolated sub-runs (one card per agent loop).
+ * Forced = slash `/cards` / `/plan-run`. Auto = task mentions cards and ≥2 cards exist.
+ */
+export function shouldOrchestrateCards(task: string, cardCount: number, forced: boolean): boolean {
+	if (forced) return cardCount >= 1;
+	return cardCount >= 2 && mentionsCards(task);
 }
 
 export function wantsNewApp(task: string): boolean {
@@ -308,12 +320,18 @@ export async function runPlan(plan: Plan, deps: RunPlanDeps): Promise<Plan> {
 	return plan;
 }
 
+/** User-facing progress summary — sounds like work done, not harness machinery. */
 export function formatPlanReport(plan: Plan): string {
+	const done = plan.items.filter(i => i.status === 'done').length;
+	const total = plan.items.length;
 	const icon: Record<PlanItemStatus, string> = { done: '✓', blocked: '✗', running: '…', pending: '·' };
-	const lines = [`Plan (${plan.items.filter(i => i.status === 'done').length}/${plan.items.length} done):`];
+	const lines = [`Progress (${done}/${total} done):`];
 	for (const i of plan.items) {
-		lines.push(`${icon[i.status]} ${i.id} ${i.title}${i.attempts > 1 ? ` (${i.attempts} attempts)` : ''}`);
-		if (i.summary && i.status === 'done') lines.push(...i.summary.split('\n').slice(0, 2).map(l => `    ${l}`));
+		const retry = i.attempts > 1 && i.status !== 'done' ? ' (retried)' : '';
+		lines.push(`${icon[i.status]} ${i.title}${retry}`);
+		if (i.summary && i.status === 'done') {
+			lines.push(...i.summary.split('\n').slice(0, 2).map(l => `    ${l}`));
+		}
 	}
 	const blocked = plan.items.find(i => i.status === 'blocked');
 	if (blocked) {
@@ -321,10 +339,12 @@ export function formatPlanReport(plan: Plan): string {
 			'',
 			`${blocked.id} is blocked${blocked.lastError ? `:\n${blocked.lastError}` : '.'}`,
 			'',
-			'How do you want to proceed: fix and retry with `/cards`, adjust the card, or continue manually?'
+			'I stopped on this part so we can decide: retry it, adjust the card, or continue manually.'
 		);
 	} else if (plan.items.some(i => i.status !== 'done')) {
-		lines.push('', 'Plan interrupted — `/cards` resumes from the pending item.');
+		lines.push('', 'Stopped mid-way — say continue (or `/cards`) to pick up where we left off.');
+	} else {
+		lines.push('', `All ${total} parts are done.`);
 	}
 	return lines.join('\n');
 }

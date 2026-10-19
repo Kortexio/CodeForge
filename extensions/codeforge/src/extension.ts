@@ -234,12 +234,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<CodeFo
             await cfg.update('autoApproveEdits', next, vscode.ConfigurationTarget.Global);
             if (next) {
                 await getApprovalPolicy().allowAllEdits('always');
-                vscode.window.showInformationMessage(
+                void vscode.window.showInformationMessage(
                     'CodeForge: auto-approve file edits ON (write/rename/delete without asking)'
                 );
             } else {
                 await getApprovalPolicy().revokeAllEditsAlways();
-                vscode.window.showInformationMessage(
+                void vscode.window.showInformationMessage(
                     'CodeForge: auto-approve file edits OFF'
                 );
             }
@@ -278,7 +278,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<CodeFo
     );
 
     context.subscriptions.push(
-        vscode.commands.registerCommand('codeforge.configureProvider', async () => {
+        vscode.commands.registerCommand('codeforge.configureProvider', () => {
             AiSettingsPanel.show(context, settingsStore, governance);
         })
     );
@@ -326,12 +326,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<CodeFo
         vscode.commands.registerCommand('codeforge.exportSession', async (item?: { id?: string }) => {
             const id = item?.id ?? chatViewProvider.getCurrentSessionId() ?? undefined;
             if (!id) {
-                vscode.window.showWarningMessage('No session to export');
+                void vscode.window.showWarningMessage('No session to export');
                 return;
             }
             const out = await sessionStore.exportSession(id);
             if (out) {
-                vscode.window.showInformationMessage(`Session exported to ${out}`);
+                void vscode.window.showInformationMessage(`Session exported to ${out}`);
             }
         })
     );
@@ -346,7 +346,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<CodeFo
             const session = await sessionStore.importSession(picked[0].fsPath);
             if (session) {
                 await chatViewProvider.loadSession(session.id);
-                vscode.window.showInformationMessage('Session imported');
+                void vscode.window.showInformationMessage('Session imported');
             }
         })
     );
@@ -376,7 +376,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<CodeFo
     context.subscriptions.push(
         vscode.commands.registerCommand('codeforge.reloadSkills', async () => {
             await skills.reload(context.extensionPath);
-            vscode.window.showInformationMessage(
+            void vscode.window.showInformationMessage(
                 `Skills: ${skills.listSkills().length}, Rules: ${skills.listRules().length}`
             );
         })
@@ -385,7 +385,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<CodeFo
     context.subscriptions.push(
         vscode.commands.registerCommand('codeforge.refreshMcp', async () => {
             await mcp.refresh(effectiveMcpServers());
-            vscode.window.showInformationMessage(`MCP tools: ${mcp.listTools().length}`);
+            void vscode.window.showInformationMessage(`MCP tools: ${mcp.listTools().length}`);
         })
     );
 
@@ -405,7 +405,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<CodeFo
         vscode.commands.registerCommand('codeforge.inspectWorkspace', async () => {
             const root = bridge.getWorkspaceRoot();
             if (!root) {
-                vscode.window.showWarningMessage('Open a folder to inspect the workspace');
+                void vscode.window.showWarningMessage('Open a folder to inspect the workspace');
                 return;
             }
             const result = await bridge.execute({
@@ -422,11 +422,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<CodeFo
         vscode.commands.registerCommand('codeforge.indexEmbeddings', async () => {
             try {
                 const n = await indexEmbeddings(3000, true);
-                vscode.window.showInformationMessage(
+                void vscode.window.showInformationMessage(
                     n ? `Indexed ${n} embedding chunks` : 'No embeddings indexed (check provider /embeddings)'
                 );
             } catch (err) {
-                vscode.window.showErrorMessage(
+                void vscode.window.showErrorMessage(
                     `Embedding index failed: ${err instanceof Error ? err.message : String(err)}`
                 );
             }

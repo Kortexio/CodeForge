@@ -8,7 +8,7 @@ function assert(cond: boolean, msg: string): void {
 	if (!cond) throw new Error(msg);
 }
 
-async function main(): Promise<void> {
+export async function run(): Promise<void> {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), 'cf-spill-'));
 	const big = 'line\n'.repeat(500);
 	const rel = await spillToolOutput(root, big, { toolName: 'shell' });
@@ -20,10 +20,13 @@ async function main(): Promise<void> {
 	assert(/full output saved to/i.test(clipped), 'marker');
 	assert((await fs.readdir(toolOutputDir(root))).includes('.gitignore'), 'gitignore');
 	await fs.rm(root, { recursive: true, force: true });
-	console.log('toolOutputSpill.selftest: ok');
 }
 
-main().catch(err => {
-	console.error(err);
-	process.exit(1);
-});
+if (require.main === module) {
+	run()
+		.then(() => console.log('toolOutputSpill.selftest: ok'))
+		.catch(err => {
+			console.error(err);
+			process.exit(1);
+		});
+}

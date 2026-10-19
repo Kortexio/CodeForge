@@ -92,25 +92,39 @@ export function looksLikeXmlToolMarkup(text: string): boolean {
 	return /<tool_call\b/i.test(text) || /<function\s*=/i.test(text) || /<parameter\s*=/i.test(text);
 }
 
+function stripThinkMarkup(text: string): string {
+	return text
+		.replace(/<think\b[^>]*>[\s\S]*?<\/think>/gi, '')
+		.replace(/<think\b[^>]*>[\s\S]*$/i, '')
+		.trim();
+}
+
 /**
  * Parse `<tool_call>…</tool_call>` / `<function=name><parameter=k>v</parameter>` into tool_calls.
  */
 export function parseXmlToolCalls(text: string): LiftedToolCall[] {
 	if (!text || !looksLikeXmlToolMarkup(text)) return [];
+	const source = stripThinkMarkup(text);
 
 	const blocks: string[] = [];
 	const blockRe = /<tool_call\b[^>]*>([\s\S]*?)<\/tool_call>/gi;
 	let m: RegExpExecArray | null;
-	while ((m = blockRe.exec(text))) {
+	while ((m = blockRe.exec(source))) {
 		blocks.push(m[1] ?? '');
 	}
-	// Unclosed trailing <tool_call> (model cut off)
-	if (!blocks.length) {
-		const open = /<tool_call\b[^>]*>([\s\S]*)$/i.exec(text);
+	// Unclosed trailing <tool_call> (model cut off) — also after closed siblings
+	const trailing = /(?:<\/tool_call>\s*)?<tool_call\b[^>]*>(?![\s\S]*<\/tool_call>)([\s\S]*)$/i.exec(
+		source
+	);
+	if (trailing) {
+		const body = trailing[1] ?? '';
+		if (body && !blocks.includes(body)) blocks.push(body);
+	} else if (!blocks.length) {
+		const open = /<tool_call\b[^>]*>([\s\S]*)$/i.exec(source);
 		if (open) blocks.push(open[1] ?? '');
 	}
-	if (!blocks.length && /<function\s*=/i.test(text)) {
-		blocks.push(text);
+	if (!blocks.length && /<function\s*=/i.test(source)) {
+		blocks.push(source);
 	}
 
 	const out: LiftedToolCall[] = [];

@@ -196,7 +196,7 @@ export class SkillsRulesLoader {
 			if (kind === 'skill') {
 				this.skills.push({
 					id: `${scope}:${title}`,
-					scope: scope as SkillDoc['scope'],
+					scope: scope,
 					title,
 					content: parsed.body,
 					description:
@@ -261,7 +261,7 @@ export function parseFrontmatter(raw: string): { meta: Record<string, unknown>; 
 		if (idx <= 0) continue;
 		const key = line.slice(0, idx).trim();
 		if (!key || key.startsWith('#')) continue;
-		let valRaw = line.slice(idx + 1).trim();
+		const valRaw = line.slice(idx + 1).trim();
 
 		// Block list: key:\n  - a\n  - b
 		if (!valRaw) {
@@ -497,7 +497,7 @@ export function expandBraces(glob: string): string[] {
 	const alts = m[1].split(',').map(s => s.trim()).filter(Boolean);
 	const out: string[] = [];
 	for (const alt of alts) {
-		const next = glob.slice(0, m.index) + alt + glob.slice(m.index! + m[0].length);
+		const next = glob.slice(0, m.index) + alt + glob.slice(m.index + m[0].length);
 		out.push(...expandBraces(next));
 	}
 	return out.length ? out : [glob];

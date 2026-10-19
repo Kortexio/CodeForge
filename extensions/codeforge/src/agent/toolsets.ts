@@ -55,14 +55,15 @@ export function currentPhase(task: string, state: { buildRed: boolean }): AgentP
 export function profileForTurn(
 	phase: AgentPhase,
 	task: string,
-	opts: { planMode?: boolean; coachMode?: boolean; askMode?: boolean }
+	opts: { planMode?: boolean; coachMode?: boolean; askMode?: boolean; exploreOnly?: boolean }
 ): ToolPermissionProfile {
 	void phase; // phase stays for telemetry / activity labels; tools follow mode below
 	if (opts.coachMode) return 'coach';
 	if (opts.askMode) return 'ask';
+	if (opts.exploreOnly) return 'explore';
 	if (isStatusQuestion(task)) return 'status';
 	if (opts.planMode) return 'plan';
-	// Agent mode: full tool surface (incl. shell for HTTPS/API). Do not strip shell/write
+	// Agent mode: CORE (+ optional toolGroups), including shell. Do not strip shell/write
 	// just because the prompt lacked coding verbs — that made "list /v1/models" explore-only.
 	return 'build';
 }
@@ -80,8 +81,11 @@ export function toolNamesFor(
 		planMode?: boolean;
 		coachMode?: boolean;
 		askMode?: boolean;
+		exploreOnly?: boolean;
 		mcpAvailable?: boolean;
 		exploreSubagent?: boolean;
+		/** Resolved once at run start (config + mode). */
+		toolGroups?: string[];
 	}
 ): Set<string> {
 	void opts.weakProfile;
@@ -90,9 +94,11 @@ export function toolNamesFor(
 		planMode: opts.planMode,
 		coachMode: opts.coachMode,
 		askMode: opts.askMode,
+		exploreOnly: opts.exploreOnly,
 	});
 	const profileOpts: ProfileOptions = {
 		mcpAvailable: opts.mcpAvailable === true,
+		toolGroups: opts.toolGroups,
 	};
 	return filterToolsByProfile(opts.allNames, profile, profileOpts);
 }
@@ -173,7 +179,7 @@ export function buildDotnetCommand(args: Record<string, unknown>): { command: st
 			return { command: `dotnet test${project ? ` ${project}` : ''} -nologo -v q${filter}` };
 		}
 		default:
-			return { error: `Unknown dotnet action "${action}". Use one of: ${DOTNET_ACTIONS.join(', ')}.` };
+			return { error: `Unknown dotnet action "${String(action)}". Use one of: ${DOTNET_ACTIONS.join(', ')}.` };
 	}
 }
 

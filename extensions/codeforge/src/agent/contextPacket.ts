@@ -322,18 +322,20 @@ async function gatherIdeState(): Promise<{
 	};
 }
 
-async function gatherToolCapabilities(
+function gatherToolCapabilities(
 	workspaceRoot: string | undefined,
 	gitAvailable: boolean
 ): Promise<string> {
 	const indexed = getIndexedCount();
 	const semantic = hasSemanticEmbeddings();
-	return [
-		'### TOOL CAPABILITIES',
-		`- Workspace root: ${workspaceRoot || '(none — ask user to open a folder)'}`,
-		`- Git: ${gitAvailable ? 'available' : 'unavailable (git_* tools will fail)'}`,
-		`- Index: ${indexed} paths cached; retrieve is ${semantic ? 'hybrid lexical+semantic' : 'lexical-only (embeddings not ready)'}`,
-	].join('\n');
+	return Promise.resolve(
+		[
+			'### TOOL CAPABILITIES',
+			`- Workspace root: ${workspaceRoot || '(none — ask user to open a folder)'}`,
+			`- Git: ${gitAvailable ? 'available' : 'unavailable (git_* tools will fail)'}`,
+			`- Index: ${indexed} paths cached; retrieve is ${semantic ? 'hybrid lexical+semantic' : 'lexical-only (embeddings not ready)'}`,
+		].join('\n')
+	);
 }
 
 async function gatherWorkspacePrefetch(workspaceRoot?: string): Promise<string> {

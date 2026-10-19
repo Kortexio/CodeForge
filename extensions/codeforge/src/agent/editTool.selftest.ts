@@ -1,7 +1,7 @@
 /**
  * Unit checks for tolerant edit matching (run via compiled out/).
  */
-import { applyEdit, normalizeForMatch, stripReadLineNumbers } from './editTool';
+import { applyEdit, closestWindow, normalizeForMatch, stripReadLineNumbers } from './editTool';
 
 function assert(cond: boolean, msg: string): void {
 	if (!cond) throw new Error(msg);
@@ -28,6 +28,10 @@ assert(numbered.ok && numbered.text.includes('return 2'), 'strip read prefixes')
 
 const miss = applyEdit('abc\n', 'zzz', 'yyy');
 assert(!miss.ok && /not found/i.test(miss.error), 'miss error');
+assert(!miss.ok && /^\s*\d+\|/m.test(miss.error), 'miss shows numbered window');
+
+const win = closestWindow('aaa\nbbb\nccc\nddd\neee\n', 'bbb', 1);
+assert(win.includes('  1|aaa') && win.includes('  2|bbb') && win.includes('  3|ccc'), 'closestWindow radius');
 
 const multi = applyEdit('aa\nxx\naa\n', 'aa', 'bb', false);
 assert(!multi.ok && /matches 2/i.test(multi.error), 'ambiguous');
@@ -52,5 +56,15 @@ const already = applyEdit(
 );
 assert(already.ok && already.alreadyApplied === true, 'already applied when new_string present');
 assert(already.ok && already.text === alreadyFile, 'already applied does not rewrite');
+
+// Indent-tolerant: spaces in file, tabs in old_string — single match, re-indent new_string.
+const indentFile = ['function f() {', '\tif (true) {', '\t\treturn 1;', '\t}', '}', ''].join('\n');
+const indentEdit = applyEdit(
+	indentFile,
+	'  if (true) {\n    return 1;\n  }',
+	'  if (true) {\n    return 2;\n  }'
+);
+assert(indentEdit.ok, 'indent-tolerant match');
+assert(indentEdit.ok && indentEdit.text.includes('\t\treturn 2;'), 're-indent new_string to file tabs');
 
 console.log('editTool.selftest: ok');

@@ -63,10 +63,6 @@ function allow(...names: string[]): PermissionRuleset {
 	return names.map(permission => ({ permission, pattern: '*', action: 'allow' as const }));
 }
 
-function deny(...names: string[]): PermissionRuleset {
-	return names.map(permission => ({ permission, pattern: '*', action: 'deny' as const }));
-}
-
 /** Ask mode: read the repo + web (no writes / shell mutators). */
 export const ASK_ALLOWED_TOOLS = [
 	'list',
@@ -156,62 +152,78 @@ const EXPLORE_ALLOWED = [
 	'web_fetch',
 ] as const;
 
-/** Full Agent surface (Cursor-parity). */
-const BUILD_ALLOWED_CORE = [
+/**
+ * Default Agent surface: CORE only. Optional groups come from
+ * `codeforge.ai.toolGroups` and `AgentModeDefinition.toolGroups`.
+ */
+export const CORE = [
 	'read',
-	'write',
 	'edit',
+	'write',
 	'apply_patch',
 	'list',
 	'search',
 	'retrieve',
-	'delete',
-	'rename',
-	'open',
 	'shell',
 	'await_shell',
 	'dotnet',
 	'diagnostics',
-	'symbols',
-	'references',
-	'definition',
-	'git_status',
-	'git_diff',
-	'git_log',
-	'git_blame',
-	'git_conflicts',
-	'git_commit_msg',
-	'git_add',
-	'git_commit',
-	'git_push',
-	'gh_pr_create',
-	'wiki_read',
-	'wiki_search',
-	'wiki_write',
-	'wiki_fact',
-	'wiki_facts',
-	'web_search',
-	'web_fetch',
 	'todo_write',
-	'edit_notebook',
-	'generate_image',
-	'canvas_write',
-	'voice_status',
-	'browser_navigate',
-	'browser_snapshot',
-	'browser_click',
-	'browser_type',
-	'browser_screenshot',
 	'delegate_task',
 	'update_status',
 	'skill',
 ] as const;
+
+export const TOOL_GROUPS = {
+	git: [
+		'git_status',
+		'git_diff',
+		'git_log',
+		'git_blame',
+		'git_conflicts',
+		'git_commit_msg',
+		'git_add',
+		'git_commit',
+		'git_push',
+		'gh_pr_create',
+	],
+	wiki: ['wiki_read', 'wiki_search', 'wiki_write', 'wiki_fact', 'wiki_facts'],
+	browser: [
+		'browser_navigate',
+		'browser_snapshot',
+		'browser_click',
+		'browser_type',
+		'browser_screenshot',
+	],
+	web: ['web_search', 'web_fetch'],
+	media: ['generate_image', 'canvas_write', 'voice_status'],
+	notebook: ['edit_notebook'],
+	navigation: ['symbols', 'references', 'definition'],
+	files: ['delete', 'rename', 'open'],
+} as const;
+
+export type ToolGroupName = keyof typeof TOOL_GROUPS;
+
+export function toolsForGroups(groups: Iterable<string>): string[] {
+	const out: string[] = [];
+	for (const g of groups) {
+		const key = String(g).trim() as ToolGroupName;
+		const list = TOOL_GROUPS[key];
+		if (list) out.push(...list);
+	}
+	return out;
+}
 
 export interface ProfileOptions {
 	/** Include mcp_call when MCP tools are connected. */
 	mcpAvailable?: boolean;
 	/** @deprecated delegate_task is always in build; kept for callers. */
 	exploreSubagent?: boolean;
+	/**
+	 * Enabled optional tool groups for the build profile
+	 * (from config + agent mode). Ignored for other profiles.
+	 */
+	toolGroups?: string[];
 }
 
 export function rulesetForProfile(
@@ -230,9 +242,9 @@ export function rulesetForProfile(
 		case 'explore':
 			return merge(denyAll(), allow(...EXPLORE_ALLOWED));
 		case 'build': {
-			const extras: string[] = [];
+			const extras: string[] = [...toolsForGroups(opts.toolGroups ?? [])];
 			if (opts.mcpAvailable) extras.push('mcp_call');
-			return merge(denyAll(), allow(...BUILD_ALLOWED_CORE, ...extras));
+			return merge(denyAll(), allow(...CORE, ...extras));
 		}
 	}
 }

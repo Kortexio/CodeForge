@@ -14,6 +14,13 @@ export interface FileChange {
     newContent?: string;
 }
 
+interface DiffPreviewMessage {
+    type: string;
+    files?: string[];
+    accepted?: string[];
+    rejected?: string[];
+}
+
 export class DiffPreview {
     private static panel: vscode.WebviewPanel | undefined;
 
@@ -42,7 +49,7 @@ export class DiffPreview {
                 resolve(result);
             };
 
-            panel.webview.onDidReceiveMessage((message) => {
+            panel.webview.onDidReceiveMessage((message: DiffPreviewMessage) => {
                 if (message.type === 'accept') {
                     finish({ accepted: message.files ?? [], rejected: [] });
                     panel.dispose();

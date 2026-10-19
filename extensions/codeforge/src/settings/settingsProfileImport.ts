@@ -12,7 +12,7 @@ import type { AiSettingsState } from './aiSettingsStore';
 const STATE_FIELD = 'codeforge.ai.settings.v1';
 const EXT_KEYS = ['kortexio.codeforge', 'kortexio.opencodeide-ai'];
 
-export async function readSettingsFromProfileDbs(
+export function readSettingsFromProfileDbs(
 	log?: (line: string) => void
 ): Promise<AiSettingsState[]> {
 	const home = os.homedir();
@@ -32,7 +32,7 @@ export async function readSettingsFromProfileDbs(
 			out.push(state);
 		}
 	}
-	return out;
+	return Promise.resolve(out);
 }
 
 function readSettingsFromVscdb(
@@ -41,7 +41,7 @@ function readSettingsFromVscdb(
 ): AiSettingsState | undefined {
 	// Prefer Node's experimental node:sqlite when available (Electron/Node 22+).
 	try {
-		// eslint-disable-next-line @typescript-eslint/no-require-imports
+		// eslint-disable-next-line @typescript-eslint/no-require-imports, @typescript-eslint/no-var-requires -- optional runtime dependency
 		const sqlite = require('node:sqlite') as {
 			DatabaseSync: new (path: string, opts?: { readOnly?: boolean }) => {
 				prepare: (sql: string) => { get: (...args: unknown[]) => { value?: string } | undefined };
