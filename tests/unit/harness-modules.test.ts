@@ -417,7 +417,10 @@ describe('nudges', () => {
 		expect(note).toMatch(/Reading the code is not proof/);
 		expect(note).toMatch(/execute the code at the exact boundary value/);
 		expect(note).toMatch(/parse to midnight/);
-		expect(note).toMatch(/delete it before finishing; do not modify existing test files/);
+		expect(note).toMatch(/Do not create, edit or delete any file under a test directory/);
+		expect(note).toMatch(/outside the workspace \(OS temp dir\) and delete it before finishing/);
+		expect(note).toMatch(/do not scaffold a new project or test file/);
+		expect(note).not.toMatch(/do not modify existing test files/);
 		expect(note).not.toMatch(/update tests if needed/);
 	});
 });

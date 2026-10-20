@@ -105,6 +105,12 @@ import {
 	stuckWrapPrompt,
 } from './nudges';
 import { isEffectfulTool, shouldRefuseDiagFinish, shouldRequestSpecSelfCheck } from './finishGate';
+import {
+	applyEditPreview,
+	assertionEditRefusal,
+	missingAssertions,
+	specCheckMutationRefusal,
+} from './mutationGuard';
 import { isTestFilePath } from '../governance/guardrailEngine';
 import {
 	advancePlanAfterWrites,
@@ -1569,6 +1575,10 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 	const writtenTestPaths = new Set<string>();
 	const readSpecPaths = new Set<string>();
 	let specCheckNudges = 0;
+	/** True once the spec edge-case note was sent; file creates in the workspace are refused. */
+	let specCheckActive = false;
+	/** Paths created by write this run — assertion gate applies only to tests that pre-existed. */
+	const createdThisRun = new Set<string>();
 	/** Disk body + step for identical-read markers: (unchanged since step N). */
 	const readWindowBodies = new Map<string, { body: string; step: number }>();
 	const emitProtocol = (label: string, detail?: string) => {
@@ -2582,6 +2592,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					step + 1 < stepBudget
 				) {
 					specCheckNudges += 1;
+					specCheckActive = true;
 					const note = specSelfCheckNote({
 						sourcePaths: [...writtenSourcePaths],
 						specPaths: [...readSpecPaths],
@@ -3181,6 +3192,18 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					toolSchemas: agentToolSchemas,
 				});
 				if (normalized.notes.length) toolAdvice.push(...normalized.notes);
+				if (normalized.leakedArgs?.length) {
+					if (!normalized.error) emitProtocol('badArgs', '1');
+					emitProtocol(
+						'sample',
+						JSON.stringify({
+							reason: normalized.error ? 'leaked_param_conflict' : 'leaked_param_repaired',
+							tool: call.function.name,
+							leakedArgs: normalized.leakedArgs,
+							preview: String(call.function.arguments ?? '').slice(0, 2000),
+						})
+					);
+				}
 				if (normalized.error) {
 					const unknown = /no tool named/i.test(normalized.error);
 					emitProtocol(unknown ? 'unknownTools' : 'badArgs', '1');
@@ -3263,6 +3286,53 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 						);
 						continue;
 					}
+				}
+
+				const mutatePath = String(args.path ?? args.oldPath ?? '').replace(/\\/g, '/');
+				if (
+					mutatePath &&
+					(name === 'write' || name === 'edit' || name === 'delete' || name === 'apply_patch')
+				) {
+					const mutateKey = canonicalizePathKey(mutatePath);
+					const existingBody = name === 'delete' ? '' : await opts.bridge.readRaw(mutatePath);
+					const fileExists = name === 'delete' ? true : existingBody !== undefined;
+					const specRefusal = specCheckMutationRefusal({
+						active: specCheckActive,
+						tool: name,
+						isTestPath: isTestFilePath(mutatePath),
+						fileExists,
+					});
+					if (specRefusal) {
+						await refuse(specRefusal, 'spec check');
+						continue;
+					}
+					if (
+						(name === 'edit' || name === 'write') &&
+						isTestFilePath(mutatePath) &&
+						typeof existingBody === 'string' &&
+						!createdThisRun.has(mutateKey)
+					) {
+						const after =
+							name === 'write'
+								? String(args.content ?? '')
+								: applyEditPreview(
+										existingBody,
+										String(args.old_string ?? ''),
+										String(args.new_string ?? ''),
+										Boolean(args.replace_all)
+									);
+						if (after !== undefined) {
+							const assertionRefusal = assertionEditRefusal(
+								mutatePath,
+								missingAssertions(existingBody, after)
+							);
+							if (assertionRefusal) {
+								await refuse(assertionRefusal, 'test assertion');
+								continue;
+							}
+						}
+					}
+					if (name === 'write' && !fileExists) createdThisRun.add(mutateKey);
 				}
 
 				if (name === 'list') {

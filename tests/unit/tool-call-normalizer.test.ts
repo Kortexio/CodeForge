@@ -243,4 +243,136 @@ describe('toolCallNormalizer', () => {
 		expect(r.error).toMatch(/Expected:/);
 		expect(r.error).toMatch(/Received arguments: path/);
 	});
+
+	describe('leaked Qwen XML parameter markers', () => {
+		const VIP_OLD = '\tprivate const decimal VipRate = 0.1m;';
+		const VIP_NEW = '\tprivate const decimal VipRate = 0.15m;';
+
+		it('splits </old_string><parameter=new_string> into separate args when new_string is missing', () => {
+			const r = normalizeToolCall({
+				name: 'edit',
+				args: {
+					path: 'src/Acme.Billing/PricingRules.cs',
+					old_string: `${VIP_OLD}\n</old_string>\n<parameter=new_string>\n${VIP_NEW}\n</parameter>`,
+				},
+				activeToolNames: CORE,
+				toolSchemas: SCHEMAS,
+			});
+			expect(r.error).toBeUndefined();
+			expect(r.args.old_string).toBe(VIP_OLD);
+			expect(r.args.new_string).toBe(VIP_NEW);
+			expect(r.leakedArgs).toEqual(['old_string']);
+			expect(r.notes.join(' ')).toMatch(/close every value with <\/parameter>/);
+		});
+
+		it('keeps the separate value when it matches the leaked one', () => {
+			const r = normalizeToolCall({
+				name: 'edit',
+				args: {
+					path: 'a.cs',
+					old_string: `${VIP_OLD}\n</old_string>\n<parameter=new_string>\n${VIP_NEW}`,
+					new_string: VIP_NEW,
+				},
+				activeToolNames: CORE,
+				toolSchemas: SCHEMAS,
+			});
+			expect(r.error).toBeUndefined();
+			expect(r.args.old_string).toBe(VIP_OLD);
+			expect(r.args.new_string).toBe(VIP_NEW);
+		});
+
+		it('treats a separate new_string equal to the old text as an echo (T2 sample)', () => {
+			const oldBody = "\tif (now > new Date(coupon.expires)) {\n\t\tthrow new Error('EXPIRED_COUPON');\n\t}";
+			const newBody =
+				"\tconst expiresDate = new Date(coupon.expires);\n\texpiresDate.setHours(23, 59, 59, 999);\n\tif (now > expiresDate) {\n\t\tthrow new Error('EXPIRED_COUPON');\n\t}";
+			const r = normalizeToolCall({
+				name: 'edit',
+				args: {
+					old_string: `${oldBody}\n</old_string>\n<parameter=new_string>\n${newBody}`,
+					path: 'src/pricing/coupons.js',
+					new_string: oldBody,
+				},
+				activeToolNames: CORE,
+				toolSchemas: SCHEMAS,
+			});
+			expect(r.error).toBeUndefined();
+			expect(r.args.old_string).toBe(oldBody);
+			expect(r.args.new_string).toBe(newBody);
+		});
+
+		it('accepts a parameter that leaks into itself with the same value (CS3 sample)', () => {
+			const r = normalizeToolCall({
+				name: 'edit',
+				args: {
+					new_string: '| vip      | 15%      |\n</old_string>\n<parameter=new_string>\n| vip      | 15%      |',
+					old_string: '| vip      | 10%      |',
+					path: 'docs/pricing.md',
+				},
+				activeToolNames: CORE,
+				toolSchemas: SCHEMAS,
+			});
+			expect(r.error).toBeUndefined();
+			expect(r.args.old_string).toBe('| vip      | 10%      |');
+			expect(r.args.new_string).toBe('| vip      | 15%      |');
+			expect(r.leakedArgs).toEqual(['new_string']);
+		});
+
+		it('refuses a self-leak whose repeated value differs', () => {
+			const r = normalizeToolCall({
+				name: 'edit',
+				args: {
+					new_string: 'a = 2\n</new_string>\n<parameter=new_string>\na = 3',
+					old_string: 'a = 1',
+					path: 'x.py',
+				},
+				activeToolNames: CORE,
+				toolSchemas: SCHEMAS,
+			});
+			expect(r.error).toMatch(/the repeated new_string inside it has a different value/);
+		});
+
+		it('refuses instead of guessing when the separate value differs', () => {
+			const r = normalizeToolCall({
+				name: 'edit',
+				args: {
+					path: 'a.cs',
+					old_string: `${VIP_OLD}\n</old_string>\n<parameter=new_string>\n${VIP_NEW}`,
+					new_string: '\tprivate const decimal VipRate = 0.2m;',
+				},
+				activeToolNames: CORE,
+				toolSchemas: SCHEMAS,
+			});
+			expect(r.error).toMatch(/argument old_string contains the start of another parameter/);
+			expect(r.error).toMatch(/Close every parameter value with <\/parameter>/);
+			expect(r.leakedArgs).toEqual(['old_string']);
+		});
+
+		it('recovers several leaked parameters in a row', () => {
+			const r = normalizeToolCall({
+				name: 'edit',
+				args: {
+					path: `a.cs\n</path>\n<parameter=old_string>\n${VIP_OLD}\n</parameter>\n<parameter=new_string>\n${VIP_NEW}\n</parameter>\n</function>`,
+				},
+				activeToolNames: CORE,
+				toolSchemas: SCHEMAS,
+			});
+			expect(r.error).toBeUndefined();
+			expect(r.args.path).toBe('a.cs');
+			expect(r.args.old_string).toBe(VIP_OLD);
+			expect(r.args.new_string).toBe(VIP_NEW);
+		});
+
+		it('leaves file content alone when the names are not parameters of the tool', () => {
+			const html = '<div>\n</div>\n<parameter=color>\nred\n</parameter>';
+			const r = normalizeToolCall({
+				name: 'write',
+				args: { path: 'a.html', content: html },
+				activeToolNames: CORE,
+				toolSchemas: SCHEMAS,
+			});
+			expect(r.error).toBeUndefined();
+			expect(r.args.content).toBe(html);
+			expect(r.leakedArgs).toBeUndefined();
+		});
+	});
 });

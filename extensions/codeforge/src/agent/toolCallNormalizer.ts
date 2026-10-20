@@ -22,6 +22,8 @@ export type NormalizeToolCallResult = {
 	args: Record<string, unknown>;
 	notes: string[];
 	error?: string;
+	/** Argument keys that carried a leaked XML parameter marker (repaired or refused). */
+	leakedArgs?: string[];
 };
 
 /** Fold case / `_` / `-` for alias lookup. */
@@ -181,6 +183,100 @@ function coerceArgsBySchema(
 	return out;
 }
 
+/**
+ * Qwen XML tool format (`<parameter=k>\nv\n</parameter>`): when the model closes a value with
+ * `</k>` instead of `</parameter>`, the server keeps reading and the next parameters end up
+ * inside this value. Marker = close tag + `<parameter=name>` with both names known to the schema.
+ */
+const LEAKED_PARAM_MARKER = /\n?<\/([A-Za-z_][\w-]*)>[ \t]*\r?\n?[ \t]*<parameter=([A-Za-z_][\w-]*)>\r?\n?/;
+
+function stripWrapNewlines(value: string): string {
+	return value.replace(/^\r?\n/, '').replace(/\r?\n$/, '');
+}
+
+type LeakSplit = { head: string; recovered: Array<{ key: string; value: string }> };
+
+function splitLeakedParams(value: string, known: Set<string>): LeakSplit | undefined {
+	const first = LEAKED_PARAM_MARKER.exec(value);
+	if (!first) return undefined;
+	const isKnownClose = (tag: string) => tag === 'parameter' || known.has(tag);
+	if (!isKnownClose(first[1]) || !known.has(first[2])) return undefined;
+
+	const head = value.slice(0, first.index);
+	const recovered: Array<{ key: string; value: string }> = [];
+	let key = first[2];
+	let rest = value.slice(first.index + first[0].length);
+	for (;;) {
+		const next = LEAKED_PARAM_MARKER.exec(rest);
+		if (next && isKnownClose(next[1]) && known.has(next[2])) {
+			recovered.push({ key, value: rest.slice(0, next.index) });
+			key = next[2];
+			rest = rest.slice(next.index + next[0].length);
+			continue;
+		}
+		const tail = /\r?\n?<\/([A-Za-z_][\w-]*)>\s*(?:<\/function>\s*)?(?:<\/tool_call>\s*)?$/.exec(rest);
+		const body = tail && isKnownClose(tail[1]) ? rest.slice(0, tail.index) : rest;
+		recovered.push({ key, value: stripWrapNewlines(body) });
+		break;
+	}
+	return { head, recovered };
+}
+
+function repairLeakedParams(
+	args: Record<string, unknown>,
+	schema: JsonSchemaLike | undefined,
+	notes: string[]
+): { args: Record<string, unknown>; leaked: string[]; error?: string } {
+	const known = new Set(Object.keys(schema?.properties ?? {}));
+	if (!known.size) return { args, leaked: [] };
+	const out: Record<string, unknown> = { ...args };
+	const leaked: string[] = [];
+	for (const [key, raw] of Object.entries(args)) {
+		if (typeof raw !== 'string' || !known.has(key)) continue;
+		const split = splitLeakedParams(raw, known);
+		if (!split) continue;
+		leaked.push(key);
+		const names = split.recovered.map(r => r.key);
+		for (const r of split.recovered) {
+			if (r.key === key) {
+				if (r.value === split.head) continue;
+			} else {
+				const existing = out[r.key];
+				// A separate value equal to this argument's own head is the model echoing the
+				// previous parameter; the leaked value is the one it meant.
+				if (
+					existing === undefined ||
+					existing === null ||
+					existing === '' ||
+					existing === r.value ||
+					existing === split.head
+				) {
+					out[r.key] = r.value;
+					continue;
+				}
+			}
+			const conflict =
+				r.key === key
+					? `and the repeated ${key} inside it has a different value`
+					: `and ${r.key} was also sent separately with a different value`;
+			return {
+				args,
+				leaked,
+				error:
+					`Not run: argument ${key} contains the start of another parameter (<parameter=${r.key}>), ` +
+					`${conflict}. ` +
+					'Close every parameter value with </parameter> (not a closing tag named after the parameter, such as </old_string>) and call the tool again.',
+			};
+		}
+		out[key] = split.head;
+		notes.push(
+			`(argument ${key} contained </…><parameter=${names.join('>, <parameter=')}>; ` +
+				'split into separate arguments — close every value with </parameter>)'
+		);
+	}
+	return { args: out, leaked };
+}
+
 /** Normalize a path-like string for the workspace. */
 export function normalizeWorkspacePath(raw: unknown, workspaceRoot?: string): string {
 	let s = String(raw ?? '')
@@ -263,6 +359,12 @@ export function normalizeToolCall(input: NormalizeToolCallInput): NormalizeToolC
 
 	let args = applyArgAliases({ ...input.args }, resolved.name, notes);
 	const schema = input.toolSchemas?.[resolved.name];
+	const repaired = repairLeakedParams(args, schema, notes);
+	const leakedArgs = repaired.leaked.length ? repaired.leaked : undefined;
+	if (repaired.error) {
+		return { name: resolved.name, args, notes, error: repaired.error, leakedArgs };
+	}
+	args = repaired.args;
 	args = coerceArgsBySchema(args, schema);
 	args = normalizePathArgs(args, input.workspaceRoot, notes);
 
@@ -279,8 +381,9 @@ export function normalizeToolCall(input: NormalizeToolCallInput): NormalizeToolC
 			args,
 			notes,
 			error: `Not run: ${resolved.name} requires ${first}. Received arguments: ${keys}. Expected: ${compactSignature(schema)}.`,
+			leakedArgs,
 		};
 	}
 
-	return { name: resolved.name, args, notes };
+	return { name: resolved.name, args, notes, leakedArgs };
 }

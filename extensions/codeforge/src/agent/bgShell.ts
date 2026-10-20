@@ -71,6 +71,9 @@ export function startBgShell(command: string, cwd?: string): BgShellJob {
 		job.exitCode = code ?? 0;
 		job.done = true;
 	});
+	// A background job must not keep the process alive after the agent returns
+	// (headless runs otherwise sit until the bench timeout).
+	child.unref();
 	return job;
 }
 

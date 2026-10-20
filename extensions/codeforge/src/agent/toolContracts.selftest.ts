@@ -29,6 +29,22 @@ assert(!/Browser:/i.test(coreOnly), 'core omits browser when inactive');
 assert(!/web_search/i.test(coreOnly), 'core omits web when inactive');
 assert(!/symbols\/definition/i.test(coreOnly), 'core omits navigation when inactive');
 
+assert(
+	/Renaming or removing an identifier is done only when a search for the old name/.test(coreOnly),
+	'core contract requires a zero-hit search to finish a rename'
+);
+assert(/export keys/.test(coreOnly), 'rename contract covers object/export keys');
+assert(/Passing tests do not prove a rename/.test(coreOnly), 'rename contract: green tests are not enough');
+assert(
+	!/Renaming or removing an identifier/.test(buildToolSystemContract(['read', 'edit'])),
+	'rename contract only when search is active'
+);
+assert(/Files only/.test(toolDescription('rename')), 'rename tool is file-only');
+assert(
+	/del \(not rm\)/.test(toolDescription('shell')) && /%TEMP% \(not \/tmp\)/.test(toolDescription('shell')),
+	'shell contract maps Unix habits to cmd.exe'
+);
+
 const withBrowser = buildToolSystemContract([...CORE, 'browser_snapshot', 'browser_click']);
 assert(/Browser:/i.test(withBrowser), 'browser section when active');
 

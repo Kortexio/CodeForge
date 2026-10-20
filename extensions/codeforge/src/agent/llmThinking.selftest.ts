@@ -46,7 +46,7 @@ assert(Object.keys(llmThinkingRequestFields(plain)).length === 0, 'empty fields'
 
 const toolSamp = llmSamplingOptions(toolRound);
 assert(toolSamp.temperature === 0.7 && toolSamp.top_p === 0.8, 'tool sampling');
-assert(toolSamp.presence_penalty === 1.0, 'tool presence_penalty');
+assert(toolSamp.presence_penalty === 0, 'tool rounds send presence_penalty 0 (tool calls repeat tokens)');
 const planSamp = llmSamplingOptions(planRound);
 assert(planSamp.temperature === 0.6 && planSamp.top_p === 0.95, 'plan sampling');
 const plainSamp = llmSamplingOptions(plain);

@@ -86,6 +86,11 @@ export function buildToolSystemContract(activeNames?: Iterable<string>): string 
 	lines.push(
 		`Implementation finish: exploration-only (read/search/list/…) is not done. After a short look, call ${effectPhrase} or reply \`blocked: <reason>\`. A bug list or plan is not a substitute for applying the change.`
 	);
+	if (has('search') && (has('edit') || has('write') || has('apply_patch'))) {
+		lines.push(
+			'Renaming or removing an identifier is done only when a search for the old name in the requested scope returns no hits — definitions, imports, call sites and object/export keys (`oldName: x.newName` still exposes oldName). Passing tests do not prove a rename. Keep the old name only if the task asks for an alias.'
+		);
+	}
 	lines.push(
 		'Final reply: short summary of what tools changed (or that nothing was needed) — not an unapplied patch pasted as the answer.'
 	);
@@ -114,10 +119,12 @@ export const TOOL_DESCRIPTIONS = {
 	retrieve:
 		'Semantic/lexical top-k code snippets for a natural-language query. Prefer for “where is X?” over dumping whole files. query required; optional k (default 6).',
 	delete: 'Delete a file at path. Irreversible in the workspace — use only when the task requires removal.',
-	rename: 'Rename or move a file (oldPath → newPath). Both paths required.',
+	rename:
+		'Rename or move a file (oldPath → newPath). Both paths required. Files only — to rename a symbol, edit each occurrence, then search the old name until no hits remain.',
 	open: 'Reveal/open a file in the editor UI. Does not modify contents. path required.',
 	shell: [
 		'Run a cmd.exe command in the workspace (&& chaining OK; no PowerShell/Unix pipes).',
+		'cmd.exe has no Unix tools or heredocs: use del (not rm), type (not cat), findstr (not grep/tail/head), %TEMP% (not /tmp); create files with write, not `cat > file << EOF`; PowerShell cmdlets (Set-Content, Out-File) do not run here.',
 		'Use for builds/tests/dev servers. Prefer web_search/web_fetch for HTTP and dedicated tools for file/git ops.',
 		'Long jobs: background=true then await_shell. command required.',
 	].join(' '),

@@ -73,8 +73,9 @@ export function llmSamplingOptions(input: ThinkingRoundInput): {
 		return { temperature: 0.6, top_p: 0.95 };
 	}
 	if (shouldDisableThinking(input) || modelLikelySupportsThinking(input.model)) {
-		// Non-thinking / tool rounds — presence_penalty reduces degenerate repeats on Q2 quant.
-		return { temperature: 0.7, top_p: 0.8, presence_penalty: 1.0 };
+		// Non-thinking / tool rounds. presence_penalty stays 0: tool calls must repeat tokens
+		// (</parameter>, old_string copied into new_string), and a penalty taxes exactly that.
+		return { temperature: 0.7, top_p: 0.8, presence_penalty: 0 };
 	}
 	// Non-reasoning models keep the historical deterministic default
 	return { temperature: 0.2, top_p: 1 };

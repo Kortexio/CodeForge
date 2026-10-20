@@ -693,12 +693,13 @@ function cmdRun(taskKey, flags) {
 	if (flags.model) args.push('--model', String(flags.model));
 	if (flags.maxSteps) args.push('--maxSteps', String(flags.maxSteps));
 	if (flags.hardCap) args.push('--hardCap', String(flags.hardCap));
+	if (flags.sampling) args.push('--sampling', String(flags.sampling));
 
 	console.log(`Headless run ${meta.name}…`);
 	const agent = spawnSync(process.execPath, args, {
 		cwd: path.join(HERE, '..'),
 		encoding: 'utf8',
-		timeout: 1_800_000,
+		timeout: 3_600_000,
 	});
 	if (agent.status === 2) {
 		process.stdout.write(agent.stdout || '');
