@@ -13,7 +13,8 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '24'
+          # Code-OSS preinstall requires the same major as vscode/.nvmrc (currently 24.22+).
+          node-version: '24.22.0'
           cache: 'npm'
 
       - name: Install dependencies
