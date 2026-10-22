@@ -16,20 +16,38 @@ Built on [Code-OSS](https://github.com/microsoft/vscode). Your models. Your mach
 
 Most “local AI IDEs” stall when the model is small: they over-read, under-edit, or declare victory without verifying. **CodeForge fixes the agent loop itself** — read → edit → test → finish — and then adapts the harness to each model.
 
-On an **RTX 3060 12GB**, with **Qwen3.6-35B (IQ2_S)** via llama.cpp, the headless harness suite scored:
+### Measured on our local stack
 
-| Task | Mean (3 reps) | Stuck |
-|------|---------------:|------:|
-| T1 — bugfix | **100** | 0 |
-| T2 — feature (coupon) | **97** | 0 |
-| T3 — multi-file | **100** | 0 |
-| T4 — rename refactor | **100** | 0 |
+| | |
+|---|---|
+| **GPU** | NVIDIA RTX 3060 12GB |
+| **Model** | Qwen3.6-35B (IQ2_S / ~Q2 GGUF) |
+| **Inference** | [SuperLLaMA](https://github.com/vitorcastro78/superllama) — usable local llama.cpp on modest GPUs (OpenAI-compatible `/v1`, TurboQuant KV, Windows installer) |
+| **Suite** | Headless T1–T4 × 3 reps each (`benchmarks/`) |
 
-**Zero stuck runs. Zero bad tool-args.** A ~Q2 35B completing real agentic coding tasks end-to-end on a gaming GPU.
+**Harness off** (empty learned harness — contract + finish gates only):
+
+| Task | Mean (3 reps) | Stuck | badArgs |
+|------|---------------:|------:|--------:|
+| T1 — bug fix | **100** | 0 | 0 |
+| T2 — feature (coupon) | **97** | 0 | 0 |
+| T3 — multi-file | **100** | 0 | 0 |
+| T4 — rename refactor | **100** | 0 | 0 |
+
+**Harness on** (learned revision 1 for the same model):
+
+| Task | Mean (3 reps) | Stuck | badArgs |
+|------|---------------:|------:|--------:|
+| T1 — bug fix | **100** | 0 | 0 |
+| T2 — feature (coupon) | **94** | 0 | 0 |
+| T3 — multi-file | **100** | 0 | 0 |
+| T4 — rename refactor | **100** | 0 | 0 |
+
+**Zero stuck runs. Zero bad tool-args.** A ~Q2 35B completing real agentic coding tasks end-to-end on a gaming GPU — served by SuperLLaMA, driven by CodeForge's tool contract.
 
 That is the product bet: **the model is not the product — the contract around the model is.**
 
-Frontier APIs still work. Local weak models stop being a demo and start being a workflow.
+Frontier APIs still work. Local weak models stop being a demo and start being a workflow. Pair CodeForge with [SuperLLaMA](https://github.com/vitorcastro78/superllama) (or any OpenAI-compatible endpoint) and point Settings → AI at your local `/v1`.
 
 ---
 
@@ -40,7 +58,7 @@ Not another chat sidebar. A **tool + system contract** that refuses to paper ove
 | Capability | Why it matters |
 |---|---|
 | **Agentic loop that finishes** | Unlimited exploration within the turn budget (Cursor/Claude Code style). Continue button when the step budget ends. No soft “explore cap” that refuses new reads. |
-| **Adaptive harness** | Per-model profiles (`~/.CodeForge/ai/model-profiles/`) — sampling, write gates, finish limits, optional `toolTransport` for XML-leaky locals. Calibrate once; hysteresis adjusts online. |
+| **Adaptive harness** | Per-model profiles (`~/.codeforge/ai/model-profiles/`) — sampling, write gates, finish limits, optional `toolTransport` for XML-leaky locals. Calibrate once; hysteresis adjusts online. |
 | **Honest outcomes** | Stuck / truncated / oracle-red are **failed**, not “done”. Spec self-check and oracle before finish with writes. |
 | **You own the freedoms** | Sandbox level, Allow all, outside-workspace writes, MCP, Full agent freedom — all user settings, revocable. The model cannot grant itself permissions. |
 | **Measurable learning** | Harness revise proposes changes; keep only when paired bootstrap shows a real gain. No quiet contamination of `harness.json`. |
@@ -71,7 +89,7 @@ Not another chat sidebar. A **tool + system contract** that refuses to paper ove
 
 | | CodeForge |
 |---|---|
-| Models | OpenAI, Anthropic, Gemini, xAI, OpenRouter, Ollama, vLLM, LM Studio, llama.cpp / any OpenAI-compatible API |
+| Models | OpenAI, Anthropic, Gemini, xAI, OpenRouter, Ollama, vLLM, LM Studio, [SuperLLaMA](https://github.com/vitorcastro78/superllama) / llama.cpp / any OpenAI-compatible API |
 | Adaptive harness | Per-model profiles + calibrate + hysteresis |
 | Agent | Multi-file loop with approvals; Ask / Plan / Agent + permission chip |
 | Chat | Cursor-like sidebar: composer, context ring, tool rows, Undo/Review, Restore, Continue |
