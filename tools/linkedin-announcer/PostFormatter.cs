@@ -20,10 +20,6 @@ public static partial class PostFormatter
     {
         hook ??= Hooks[Math.Abs(tagName.GetHashCode(StringComparison.Ordinal)) % Hooks.Length];
         var baseUrl = repoUrl.TrimEnd('/');
-        var notesUrl = $"{baseUrl}/releases/tag/{tagName}";
-        var version = tagName.TrimStart('v', 'V');
-        var setupAsset = $"CodeForge-Setup-{version}-win32-x64.exe";
-        var downloadUrl = $"{baseUrl}/releases/download/{tagName}/{setupAsset}";
         var improvements = SummarizeImprovements(releaseBody);
         var hashtags = "#AI #OpenSource #LocalLLM #CodingAgent #DeveloperTools #llama.cpp";
 
@@ -44,9 +40,7 @@ public static partial class PostFormatter
         }
 
         sb.AppendLine();
-        sb.AppendLine($"Repo: {baseUrl}");
-        sb.AppendLine($"Download: {downloadUrl}");
-        sb.AppendLine($"Release notes: {notesUrl}");
+        sb.AppendLine(baseUrl);
         sb.AppendLine();
         sb.Append(hashtags);
 
@@ -54,7 +48,7 @@ public static partial class PostFormatter
         if (text.Length <= MaxLength)
             return text;
 
-        var footer = $"\n\nRepo: {baseUrl}\nDownload: {downloadUrl}\nRelease notes: {notesUrl}\n\n{hashtags}";
+        var footer = $"\n\n{baseUrl}\n\n{hashtags}";
         var head = hook + $"\n\nCodeForge {tagName} is out.\n\nWhat's new:\n";
         var budget = MaxLength - head.Length - footer.Length - 1;
         var bullets = new StringBuilder();
@@ -82,11 +76,21 @@ public static partial class PostFormatter
         if (string.IsNullOrWhiteSpace(releaseBody))
             return [];
 
+        // Prefer the "## What's new" section when present (skip AHA marketing prose).
+        var body = releaseBody.Replace("\r\n", "\n");
+        var whatsNew = WhatsNewSectionRegex().Match(body);
+        if (whatsNew.Success)
+            body = whatsNew.Groups[1].Value;
+
         var items = new List<string>();
-        foreach (var raw in releaseBody.Replace("\r\n", "\n").Split('\n'))
+        foreach (var raw in body.Split('\n'))
         {
             var line = CleanMarkdownLine(raw.TrimEnd());
             if (string.IsNullOrWhiteSpace(line) || IsNoiseLine(line))
+                continue;
+
+            // Prefer real bullets over narrative paragraphs for LinkedIn.
+            if (!(line.StartsWith('•') || raw.TrimStart().StartsWith('-') || raw.TrimStart().StartsWith('*')))
                 continue;
 
             var text = line.TrimStart('•', '-', '*', ' ').Trim();
@@ -97,7 +101,7 @@ public static partial class PostFormatter
                 text = text[..177].TrimEnd() + "…";
 
             items.Add(text);
-            if (items.Count >= 6)
+            if (items.Count >= 5)
                 break;
         }
 
@@ -110,7 +114,8 @@ public static partial class PostFormatter
         if (lower.Length == 0)
             return true;
         if (lower is "summary" or "what's new" or "whats new" or "what shipped" or "notes"
-            or "release notes" or "install" or "fixes" or "changes")
+            or "release notes" or "install" or "fixes" or "changes"
+            or "the aha moment" or "measured on our local stack" or "not in this release")
             return true;
         if (lower.StartsWith("try it", StringComparison.Ordinal))
             return true;
@@ -119,6 +124,10 @@ public static partial class PostFormatter
         if (lower.StartsWith("download:", StringComparison.Ordinal))
             return true;
         if (lower.StartsWith("full notes", StringComparison.Ordinal))
+            return true;
+        if (lower.StartsWith("release date", StringComparison.Ordinal))
+            return true;
+        if (lower.StartsWith("linkedin draft", StringComparison.Ordinal))
             return true;
         if (lower.StartsWith("download **", StringComparison.Ordinal) || lower.StartsWith("download ", StringComparison.Ordinal))
             return true;
@@ -151,4 +160,7 @@ public static partial class PostFormatter
 
     [GeneratedRegex(@"`([^`]+)`")]
     private static partial Regex InlineCodeRegex();
+
+    [GeneratedRegex(@"##\s*What's new\s*\n([\s\S]*?)(?=\n##\s|\z)", RegexOptions.IgnoreCase)]
+    private static partial Regex WhatsNewSectionRegex();
 }

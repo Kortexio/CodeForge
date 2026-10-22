@@ -19,6 +19,6 @@ export REPO_URL=https://github.com/Kortexio/CodeForge
 dotnet run --project tools/linkedin-announcer -- post
 ```
 
-Post format: short hook + what's new + repo / download / notes CTA. Optional `LINKEDIN_ORG_URN` posts as the company page.
+Post format: short hook + what's new bullets + **one** repo URL CTA. Optional `LINKEDIN_ORG_URN` posts as the company page.
 
 Put `[skip-announce]` in the GitHub Release notes body to publish a release without posting to LinkedIn.
