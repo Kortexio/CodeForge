@@ -11,6 +11,8 @@
 
 import { spawn } from 'child_process';
 import * as fs from 'fs/promises';
+import { killProcessTree } from '../sandbox/processKill';
+import { quoteShellArg } from './hooksShellQuote';
 import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
@@ -115,6 +117,18 @@ async function runCommandHook(
 		a.replace(/^\.\//, path.join(cwd, '.CodeForge') + path.sep).replace(/\\/g, path.sep)
 	);
 
+	const scriptPath = resolveHookScriptPath(hook.command, args, cwd);
+	if (scriptPath) {
+		try {
+			await fs.access(scriptPath);
+		} catch {
+			log?.(
+				`[hooks] missing hook script (${payload.event}): ${scriptPath} — fail-open`
+			);
+			return { permission: 'allow' };
+		}
+	}
+
 	return new Promise(resolve => {
 		let settled = false;
 		const finish = (r: HookResult) => {
@@ -125,7 +139,9 @@ async function runCommandHook(
 
 		let child;
 		try {
-			child = spawn(hook.command, args, {
+			const quotedArgs = args.map(quoteShellArg);
+			const cmdline = [hook.command, ...quotedArgs].join(' ');
+			child = spawn(cmdline, [], {
 				cwd,
 				shell: true,
 				windowsHide: true,
@@ -149,11 +165,7 @@ async function runCommandHook(
 		});
 
 		const timer = setTimeout(() => {
-			try {
-				child.kill();
-			} catch {
-				/* ignore */
-			}
+			killProcessTree(child);
 			log?.(`[hooks] timeout ${payload.event} (${timeoutMs}ms) — fail-open`);
 			finish({ permission: 'allow' });
 		}, timeoutMs);
@@ -202,6 +214,18 @@ async function runCommandHook(
 			/* ignore */
 		}
 	});
+}
+
+function resolveHookScriptPath(command: string, args: string[], cwd: string): string | undefined {
+	const scriptExt = /\.(js|mjs|cjs|ts|ps1|cmd|bat|sh)$/i;
+	if (args[0]) {
+		const p = path.isAbsolute(args[0]) ? args[0] : path.join(cwd, args[0]);
+		if (scriptExt.test(p) || args[0].includes(path.sep)) return p;
+	}
+	if (scriptExt.test(command) || command.includes(path.sep)) {
+		return path.isAbsolute(command) ? command : path.join(cwd, command);
+	}
+	return undefined;
 }
 
 function parseHookStdout(stdout: string): Record<string, unknown> | undefined {

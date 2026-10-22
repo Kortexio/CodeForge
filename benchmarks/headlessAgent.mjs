@@ -9,13 +9,14 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import Module from 'node:module';
-import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
+import { resolveBenchLayout } from './layout.mjs';
 
-const HERE = path.dirname(fileURLToPath(import.meta.url));
-const REPO = path.resolve(HERE, '..');
-const EXT_OUT = path.join(REPO, 'extensions', 'codeforge', 'out');
-const VSCODE_MOCK = path.join(REPO, 'tests', 'support', 'vscodeFsMock.js');
+const LAYOUT = resolveBenchLayout();
+const HERE = LAYOUT.here;
+const REPO = LAYOUT.repoRoot;
+const EXT_OUT = process.env.CODEFORGE_EXT_OUT?.trim() || LAYOUT.extOut;
+const VSCODE_MOCK = LAYOUT.vscodeMock;
 const SETTINGS_FILE = path.join(os.homedir(), '.CodeForge', 'ai', 'settings.json');
 
 function parseArgs(argv) {
@@ -255,27 +256,20 @@ async function main() {
 	}
 
 	const activities = [];
-	const protocol = {
-		nativeToolCalls: 0,
-		contentToolCalls: 0,
-		badArgs: 0,
-		unknownTools: 0,
-		lengthExits: 0,
-		emptyReplies: 0,
-		systemChars: 0,
-		toolsChars: 0,
-	};
+	const { createProtocolAggregator, flushRunTelemetry } = require(
+		path.join(EXT_OUT, 'agent', 'protocolTelemetry.js')
+	);
+	const protocolAgg = createProtocolAggregator();
 	const samplesDir = flags.samplesDir
 		? path.resolve(String(flags.samplesDir))
 		: path.join(runHome, 'protocol-samples');
 	fs.mkdirSync(samplesDir, { recursive: true });
 	let sampleN = 0;
-
-	const bump = (key, n = 1) => {
-		if (Object.prototype.hasOwnProperty.call(protocol, key)) {
-			protocol[key] += n;
-		}
-	};
+	if (flags.profileHome) {
+		process.env.CODEFORGE_MODEL_PROFILE_HOME = path.resolve(String(flags.profileHome));
+	} else if (!process.env.CODEFORGE_MODEL_PROFILE_HOME) {
+		process.env.CODEFORGE_MODEL_PROFILE_HOME = path.join(os.homedir(), '.CodeForge');
+	}
 
 	const started = Date.now();
 	let reply = '';
@@ -300,49 +294,42 @@ async function main() {
 			weakProfile: weak,
 			isolated: true,
 			sampling,
+			serverId: llm.serverId,
 			onActivity: ev => {
 				activities.push(ev);
-				if (ev.kind === 'protocol') {
-					const label = String(ev.label || '');
-					if (label === 'sample') {
-						sampleN += 1;
-						const file = path.join(samplesDir, `${String(sampleN).padStart(3, '0')}.json`);
-						try {
-							const parsed = JSON.parse(String(ev.detail || '{}'));
-							fs.writeFileSync(
-								file,
-								JSON.stringify(
-									{
-										at: new Date().toISOString(),
-										model: llm.model,
-										server: llm.serverName,
-										...parsed,
-									},
-									null,
-									2
-								)
-							);
-						} catch {
-							fs.writeFileSync(file, String(ev.detail || ''), 'utf8');
-						}
-						return;
+				protocolAgg.observe(ev);
+				if (ev.kind === 'protocol' && ev.label === 'sample') {
+					sampleN += 1;
+					const file = path.join(samplesDir, `${String(sampleN).padStart(3, '0')}.json`);
+					try {
+						const parsed = JSON.parse(String(ev.detail || '{}'));
+						fs.writeFileSync(
+							file,
+							JSON.stringify(
+								{
+									at: new Date().toISOString(),
+									model: llm.model,
+									server: llm.serverName,
+									...parsed,
+								},
+								null,
+								2
+							)
+						);
+					} catch {
+						fs.writeFileSync(file, String(ev.detail || ''), 'utf8');
 					}
-					if (label === 'systemChars' || label === 'toolsChars') {
-						protocol[label] = Number(ev.detail || 0) || 0;
-						return;
-					}
-					bump(label, Number(ev.detail || 1) || 1);
-					return;
 				}
-				const blob = `${ev.label || ''} ${ev.detail || ''}`;
-				if (/bad-args|invalid tool arguments/i.test(blob)) bump('badArgs');
-				if (/no tool named|Unknown bridge tool|not available/i.test(blob)) bump('unknownTools');
-				if (/Parsed tool_calls from text/i.test(ev.label || '')) bump('contentToolCalls');
 			},
 			onStatus: text => {
+				// Fallback only — prefer onLoopExit when the agent reports it.
+				if (loopExit !== 'unknown') return;
 				if (/stuck/i.test(text)) loopExit = 'stuck';
 				else if (/budget|maximum steps|step budget/i.test(text)) loopExit = 'budget';
 				else if (/length|truncat/i.test(text)) loopExit = 'length';
+			},
+			onLoopExit: exit => {
+				loopExit = exit;
 			},
 		};
 		// Same path as chat: multi-card tasks run one isolated sub-run per card.
@@ -373,6 +360,21 @@ async function main() {
 		}
 	}
 
+	const elapsedMs = Date.now() - started;
+	const protocolSnap = protocolAgg.snapshot();
+	try {
+		flushRunTelemetry({
+			serverId: llm.serverId,
+			model: llm.model,
+			source: 'bench',
+			loopExit,
+			elapsedMs,
+			aggregator: protocolAgg,
+		});
+	} catch {
+		/* best-effort */
+	}
+
 	const result = {
 		runtime: 'headless',
 		model: llm.model,
@@ -382,16 +384,17 @@ async function main() {
 		numCtx,
 		toolCallMode: probe.toolCallMode,
 		toolCallModeDetail: probe.detail,
-		elapsedMs: Date.now() - started,
+		elapsedMs,
 		loopExit,
 		steps: activities.filter(a => a.kind === 'tool').length,
 		refusals,
-		protocol,
+		protocol: protocolSnap.protocol,
 		sampleCount: sampleN,
 		toolLog: activities
 			.filter(a => a.kind === 'tool' || a.kind === 'checkpoint')
 			.map(a => `${a.kind === 'tool' ? a.toolStatus || 'tool' : 'checkpoint'} ${a.label || ''} ${String(a.detail || '').slice(0, 160)}`.trim()),
 		replyPreview: String(reply).slice(0, 500),
+		replyTail: String(reply).trim().slice(-500),
 		samplesDir,
 	};
 	const outPath = flags.out ? path.resolve(String(flags.out)) : path.join(runHome, 'headless-result.json');

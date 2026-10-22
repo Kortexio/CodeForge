@@ -12,6 +12,13 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import { aiSettingsFile, ensureDir, homeRoot } from '../storage/paths';
 import { readSettingsFromProfileDbs } from './settingsProfileImport';
+import {
+	loadMcpSecrets,
+	loadServerSecrets,
+	migrateLegacySecretsToStorage,
+	persistMcpSecrets,
+	persistServerSecret,
+} from './aiSecrets';
 
 export type ServerKind =
 	| 'openai'
@@ -171,8 +178,77 @@ export class AiSettingsStore {
 	private unifiedOnce = false;
 	private activeProfileOverlay: SettingsProfile | undefined;
 
+	private secretsReady = false;
+	private secretOverlay: AiSettingsState | undefined;
+
 	constructor(private readonly context: vscode.ExtensionContext) {
 		bindStore(this);
+	}
+
+	/** Load API keys / MCP secrets from SecretStorage (call once during activation). */
+	async bootstrapSecrets(): Promise<void> {
+		if (this.secretsReady) return;
+		const raw = this.readRawState();
+		await migrateLegacySecretsToStorage(this.context, raw);
+		const withServers = await loadServerSecrets(this.context, raw.servers);
+		const withMcp = await loadMcpSecrets(this.context, raw.mcpServers);
+		const merged: AiSettingsState = {
+			...raw,
+			servers: withServers,
+			mcpServers: withMcp,
+		};
+		this.secretOverlay = merged;
+		await this.context.globalState.update(STATE_KEY, this.stripSecretsForPersistence(merged));
+		await this.writeDisk(this.stripSecretsForPersistence(merged));
+		this.secretsReady = true;
+		this._onDidChange.fire(this.getState());
+	}
+
+	private readRawState(): AiSettingsState {
+		if (this.activeProfileOverlay) {
+			return structuredClone(this.activeProfileOverlay.state);
+		}
+		const disk = this.readDiskSync();
+		const raw =
+			this.context.globalState.get<AiSettingsState>(STATE_KEY) ??
+			this.context.globalState.get<AiSettingsState>(LEGACY_STATE_KEY);
+		if (disk && Array.isArray(disk.servers)) return disk;
+		if (raw && Array.isArray(raw.servers)) return raw;
+		return this.seedFromLegacySettings();
+	}
+
+	private stripSecretsForPersistence(state: AiSettingsState): AiSettingsState {
+		return {
+			...state,
+			servers: (state.servers ?? []).map(s => ({ ...s, apiKey: undefined })),
+			mcpServers: (state.mcpServers ?? []).map(m => ({
+				...m,
+				apiKey: undefined,
+				env: undefined,
+				headers: undefined,
+			})),
+		};
+	}
+
+	private mergeSecretOverlay(state: AiSettingsState): AiSettingsState {
+		const overlay = this.secretOverlay;
+		if (!overlay) return state;
+		const servers = state.servers.map(s => {
+			const from = overlay.servers.find(x => x.id === s.id);
+			return from?.apiKey ? { ...s, apiKey: from.apiKey } : s;
+		});
+		const mcpServers = state.mcpServers.map(m => {
+			const from = overlay.mcpServers.find(x => x.id === m.id);
+			return from
+				? {
+						...m,
+						apiKey: from.apiKey ?? m.apiKey,
+						env: from.env ?? m.env,
+						headers: from.headers ?? m.headers,
+					}
+				: m;
+		});
+		return { ...state, servers, mcpServers };
 	}
 
 	/** Point the AI panel at a tenant profile; pass undefined to restore global settings. */
@@ -215,7 +291,7 @@ export class AiSettingsStore {
 		} else {
 			return this.seedFromLegacySettings();
 		}
-		return this.normalizeState(state);
+		return this.mergeSecretOverlay(this.normalizeState(state));
 	}
 
 	private normalizeState(state: AiSettingsState): AiSettingsState {
@@ -263,10 +339,17 @@ export class AiSettingsStore {
 	}
 
 	async save(state: AiSettingsState): Promise<void> {
+		for (const s of state.servers) {
+			await persistServerSecret(this.context, s.id, s.apiKey);
+		}
+		for (const m of state.mcpServers) {
+			await persistMcpSecrets(this.context, m);
+		}
+		const persisted = this.stripSecretsForPersistence(state);
 		if (this.activeProfileOverlay?.onSave) {
 			this.activeProfileOverlay.state = state;
-			await this.activeProfileOverlay.onSave(state);
-			this._onDidChange.fire(this.getState());
+			await this.activeProfileOverlay.onSave(persisted);
+			this._onDidChange.fire(state);
 			return;
 		}
 		// Overlay without onSave must not trap getState() on a stale in-memory copy
@@ -274,8 +357,9 @@ export class AiSettingsStore {
 		if (this.activeProfileOverlay) {
 			this.activeProfileOverlay = undefined;
 		}
-		await this.context.globalState.update(STATE_KEY, state);
-		await this.writeDisk(state);
+		this.secretOverlay = state;
+		await this.context.globalState.update(STATE_KEY, persisted);
+		await this.writeDisk(persisted);
 		await this.syncActiveToWorkspaceSettings(state);
 		this._onDidChange.fire(state);
 	}
@@ -623,7 +707,7 @@ export class AiSettingsStore {
 		await Promise.all([
 			cfg.update('provider', server.kind, vscode.ConfigurationTarget.Global),
 			cfg.update('baseUrl', server.baseUrl, vscode.ConfigurationTarget.Global),
-			cfg.update('apiKey', server.apiKey ?? '', vscode.ConfigurationTarget.Global),
+			cfg.update('apiKey', '', vscode.ConfigurationTarget.Global),
 			cfg.update('model', state.activeModel ?? server.models[0] ?? '', vscode.ConfigurationTarget.Global),
 			cfg.update('contextBudget', numCtx, vscode.ConfigurationTarget.Global),
 		]);

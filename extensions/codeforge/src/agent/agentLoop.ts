@@ -9,7 +9,13 @@ import { DiffPreview } from '../ui/diffPreview';
 import { getApprovalPolicy } from '../policy/approvalPolicy';
 import { getTrace } from '../trace/traceService';
 import { getMcp } from '../mcp/mcpClient';
-import { approvalLevelForRisk, getToolRegistry, type ToolRisk } from './toolRegistry';
+import {
+	approvalLevelForRisk,
+	getToolRegistry,
+	toolNeedsApproval,
+	type ToolDefinition,
+	type ToolRisk,
+} from './toolRegistry';
 import { getAgentModeRegistry, toolVisibleInMode, type AgentModeDefinition } from './agentModes';
 import { SessionStore } from '../sessions/sessionStore';
 import { buildPriorAgentTranscript } from './priorContext';
@@ -20,6 +26,8 @@ import {
 	updateTokenCalibration,
 } from './contextOverflow';
 import { buildToolSystemContract, toolDescription } from './toolContracts';
+import { resolveProfileForRun, type ModelProfile } from './modelProfile';
+import { applyHarnessKnobs, learnedHarnessBlock, loadHarnessArtifact } from './harnessRevision';
 import { normalizeToolCall, type JsonSchemaLike } from './toolCallNormalizer';
 import { looksLikeXmlToolMarkup, parseXmlToolCalls } from './xmlToolCalls';
 import {
@@ -29,6 +37,7 @@ import {
 	normalizeToolProtocolHistory,
 	safeMidCompactTailStart,
 	softCompactToolResults,
+	toWireToolArguments,
 } from './toolHistory';
 import {
 	applySoftThinkSwitch,
@@ -97,6 +106,7 @@ import {
 	LENGTH_CAP_SUMMARY_NOTE,
 	oracleRejectNote,
 	parseBlockedClaim,
+	runtimeVerifyNote,
 	specSelfCheckNote,
 	TRUNCATED_TOOL_JSON_FINAL_NOTE,
 	TRUNCATED_TOOL_JSON_NOTE,
@@ -104,7 +114,13 @@ import {
 	MAX_STEPS_PROMPT,
 	stuckWrapPrompt,
 } from './nudges';
-import { isEffectfulTool, shouldRefuseDiagFinish, shouldRequestSpecSelfCheck } from './finishGate';
+import {
+	countsAsRuntimeObserve,
+	isEffectfulTool,
+	shouldRefuseDiagFinish,
+	shouldRequestRuntimeVerify,
+	shouldRequestSpecSelfCheck,
+} from './finishGate';
 import {
 	applyEditPreview,
 	assertionEditRefusal,
@@ -156,7 +172,11 @@ import {
 	toolNamesFor,
 	type AgentPhase,
 } from './toolsets';
-import { createLoopDetector, hashResult } from './loopDetector';
+import {
+	createLoopDetector,
+	hashResult,
+	isExploreToolName,
+} from './loopDetector';
 import {
 	appendRoundResult,
 	coachTaskPrompt,
@@ -217,6 +237,20 @@ const MUTATING = new Set([
 	'generate_image',
 	'canvas_write',
 ]);
+
+function agentToolNeedsUserApproval(name: string): boolean {
+	if (MUTATING.has(name)) return true;
+	const reg = getToolRegistry().get(name);
+	if (reg && toolNeedsApproval(reg)) return true;
+	if (name === 'mcp_call') {
+		const pseudo: Pick<ToolDefinition, 'risk' | 'requiresApproval'> = {
+			risk: riskForAgentTool(name) as ToolRisk,
+		};
+		return toolNeedsApproval(pseudo);
+	}
+	return false;
+}
+
 const READONLY_TOOLS = new Set([
 	'read',
 	'list',
@@ -593,10 +627,6 @@ export const AGENT_TOOLS = [
 				type: 'object',
 				properties: {
 					command: { type: 'string', description: 'Command to run' },
-					sandbox: {
-						type: 'string',
-						description: 'safe-local | restricted | isolated | container | unrestricted',
-					},
 					background: {
 						type: 'boolean',
 						description: 'If true, start in background and return a job id',
@@ -1138,7 +1168,8 @@ function toolsForRound(
 	mode?: AgentModeDefinition,
 	modelId?: string,
 	/** Frozen at run start so the tools array stays byte-identical across rounds. */
-	skillCatalog?: string
+	skillCatalog?: string,
+	shellCmdExeHints = true
 ): typeof AGENT_TOOLS {
 	const registry = getToolRegistry();
 	const catalog = skillCatalog ?? formatSkillCatalogForTool();
@@ -1150,6 +1181,15 @@ function toolsForRound(
 		if (!usePatch && t.function.name === 'apply_patch') return false;
 		return true;
 	}).map(t => {
+		if (t.function.name === 'shell') {
+			return {
+				...t,
+				function: {
+					...t.function,
+					description: toolDescription('shell', { shellCmdExeHints }),
+				},
+			} as (typeof AGENT_TOOLS)[number];
+		}
 		if (t.function.name !== 'skill') return t;
 		return {
 			type: 'function' as const,
@@ -1171,7 +1211,7 @@ function toolsForRound(
 					required: ['name'],
 				},
 			},
-		};
+		} as (typeof AGENT_TOOLS)[number];
 	});
 	const ext = registry
 		.toOpenAiTools()
@@ -1246,6 +1286,10 @@ export interface AgentLoopOptions {
 	task: string;
 	/** Optional per-server sampling overrides (applied over llmSamplingOptions). */
 	sampling?: AgentSamplingOptions;
+	/** Server id for ModelProfile load (defaults to "default"). */
+	serverId?: string;
+	/** Pre-resolved profile; when omitted, loaded from disk for serverId+model. */
+	modelProfile?: ModelProfile;
 	/** Optional vision parts (data URLs) attached to the user turn. */
 	images?: Array<{ mime: string; dataUrl: string; label?: string }>;
 	history?: AgentHistoryMessage[];
@@ -1253,6 +1297,8 @@ export interface AgentLoopOptions {
 	abortSignal?: AbortSignal;
 	onStatus?: (text: string) => void;
 	onActivity?: (event: AgentActivityEvent) => void;
+	/** How the tool loop ended (budget / stuck / length / done). Used for Continue UI. */
+	onLoopExit?: (exit: 'budget' | 'stuck' | 'length' | 'done' | 'cancelled' | 'error') => void;
 	onContextBadge?: (badge: { indexed: number; inContext: number }) => void;
 	/** Prompt tokens used vs context window limit (for the composer ring). */
 	onContextUsage?: (usage: { used: number; limit: number }) => void;
@@ -1362,7 +1408,29 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 	const mcpTools = mcp?.listTools() ?? [];
 	const governance = getGovernanceStore();
 	const weakProfile = opts.weakProfile === true;
+	const loadedProfile: ModelProfile =
+		opts.modelProfile ??
+		resolveProfileForRun(opts.serverId || 'default', opts.model, opts.sampling);
+	const harnessOverride = process.env.CODEFORGE_HARNESS_FILE?.trim();
+	const learnedHarness = loadHarnessArtifact(
+		opts.serverId || 'default',
+		opts.model,
+		harnessOverride || undefined
+	);
+	const modelProfile = applyHarnessKnobs(loadedProfile, learnedHarness);
+	opts.modelProfile = modelProfile;
+	if (modelProfile.toolTransport === 'text' && opts.proseToolsOnly !== false) {
+		opts.proseToolsOnly = true;
+	}
+	const largeFileLines = modelProfile.mutations.largeFileExistingLines;
+	const writeMaxLines = modelProfile.mutations.writeMaxContentLines;
 	const gates = new GuardrailSession(governance.runtimeConfig({ weakProfile }));
+	if (weakProfile) {
+		gates.cfg.maxWritesWithoutBuild = Math.min(
+			gates.cfg.maxWritesWithoutBuild,
+			modelProfile.weak.maxWritesWithoutBuild
+		);
+	}
 	const agentMode = opts.agentModeId
 		? getAgentModeRegistry().get(opts.agentModeId)
 		: getAgentModeRegistry().active();
@@ -1378,7 +1446,9 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 		? skillsMatchingHints(governance.getState().skills, agentMode.skillHints).map(s => s.id)
 		: [];
 	const forceSkills = [
-		...(weakProfile ? ['skill.harness-weak-models'] : []),
+		...(weakProfile && modelProfile.prompt.forcedWeakSkill
+			? ['skill.harness-weak-models']
+			: []),
 		...(openPaths.some(p => /\.cshtml$|\.razor$|\/(Pages|Views)\//i.test(p)) ? ['skill.dotnet-razor'] : []),
 		...hintedSkillIds,
 	];
@@ -1420,7 +1490,11 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 		mcpAvailable: mcpAvailableEarly,
 		toolGroups: enabledToolGroups,
 	});
-	const toolContract = buildToolSystemContract(seedActiveTools);
+	const toolContract = buildToolSystemContract(seedActiveTools, {
+		renameSearchRule: modelProfile.prompt.renameSearchRule,
+		shellCmdExeHints: modelProfile.prompt.shellCmdExeHints,
+	});
+	const frozenShellHints = modelProfile.prompt.shellCmdExeHints;
 
 	const planModeHint = opts.coachMode
 		? [
@@ -1497,6 +1571,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 			: '',
 		agentsMdSection,
 		forcedSkillSection,
+		learnedHarnessBlock(learnedHarness),
 		mcpHint,
 	]
 		.filter(Boolean)
@@ -1575,6 +1650,9 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 	const writtenTestPaths = new Set<string>();
 	const readSpecPaths = new Set<string>();
 	let specCheckNudges = 0;
+	/** Successful browser observe or non-oracle shell/dotnet after source edits. */
+	let runtimeObserveCount = 0;
+	let runtimeVerifyNudges = 0;
 	/** True once the spec edge-case note was sent; file creates in the workspace are refused. */
 	let specCheckActive = false;
 	/** Paths created by write this run — assertion gate applies only to tests that pre-existed. */
@@ -1613,8 +1691,6 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 	/** Caps step-=1 refunds so repair/overflow paths cannot spin forever. */
 	let refundedSteps = 0;
 	const MAX_REFUNDED_STEPS = 12;
-	/** Explore-only steps without a write/shell since last mutate. */
-	let exploreOnlySteps = 0;
 	const loopDetector = createLoopDetector();
 	/** Retries when gateway rejects truncated tool-call JSON (common with large writes). */
 	let truncatedToolRetries = 0;
@@ -1632,7 +1708,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 	const MAX_ORACLE_REJECTIONS = 6;
 	let gateFinishRejections = 0;
 	const MAX_GATE_FINISH_REJECTIONS = 2;
-	const oracleCfg = opts.planMode || opts.askMode ? undefined : detectOracle(opts.workspaceRoot, nodeOracleFs);
+	let oracleCfg = opts.planMode || opts.askMode ? undefined : detectOracle(opts.workspaceRoot, nodeOracleFs);
 	let lastProgressMarker = '';
 	const progressMarker = () =>
 		`${successfulWriteCount}|${uiChangeCount}|${gates.buildRed ? 'red' : 'ok'}|${gates.lastBuildErrors.length}`;
@@ -1982,7 +2058,13 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					activeInternalPlan
 						? formatPlanForPrompt(activeInternalPlan).slice(0, 400)
 						: undefined,
-					toolsForRound(activeToolNames, agentMode, opts.model, frozenSkillCatalog)
+					toolsForRound(
+						activeToolNames,
+						agentMode,
+						opts.model,
+						frozenSkillCatalog,
+						frozenShellHints
+					)
 				);
 				messages = structured
 					? (structured)
@@ -2075,7 +2157,8 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 				activeToolNames,
 				agentMode,
 				opts.model,
-				frozenSkillCatalog
+				frozenSkillCatalog,
+				frozenShellHints
 			);
 			if (!protocolSizedOnce) {
 				protocolSizedOnce = true;
@@ -2402,6 +2485,55 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 				toolCalls.length && looksLikeToolJson(content) ? '' : content
 			);
 
+			// finish_reason=length with tool_calls: only run if arguments parse strictly (no repair).
+			if (toolCalls.length && finishReason === 'length') {
+				const truncated = toolCalls.filter(tc => {
+					const raw = String(tc.function?.arguments ?? '');
+					try {
+						JSON.parse(raw);
+						return false;
+					} catch {
+						return true;
+					}
+				});
+				if (truncated.length) {
+					emitProtocol('lengthExits', '1');
+					messages.push({
+						role: 'assistant',
+						content: assistantContent || '',
+						tool_calls: toolCalls,
+					});
+					for (const tc of toolCalls) {
+						messages.push({
+							role: 'tool',
+							tool_call_id: tc.id,
+							name: tc.function.name,
+							content:
+								'Not run: arguments were cut at the output limit. Retry with a smaller tool call.',
+						});
+						actions.push(`${tc.function.name} blocked (truncated-args)`);
+					}
+					if (lengthTruncationNudges < TOOL_LENGTH_RETRIES && step + 1 <= stepBudget) {
+						lengthTruncationNudges += 1;
+						messages.push({ role: 'user', content: LENGTH_CAP_NOTE });
+						opts.onActivity?.({
+							kind: 'checkpoint',
+							label: 'Truncated tool args — retry smaller tool',
+							detail: truncated.map(t => t.function.name).join(', '),
+						});
+						if (tryRefundContinue()) continue;
+						continue;
+					}
+					loopExit = 'length';
+					opts.onActivity?.({
+						kind: 'checkpoint',
+						label: 'Stopped after truncated tool arguments',
+						detail: `${TOOL_LENGTH_RETRIES} continuations exhausted`,
+					});
+					break;
+				}
+			}
+
 			if (!toolCalls.length) {
 				const trivial = isTrivialAssistantContent(content);
 				const hitLengthCap =
@@ -2483,6 +2615,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 						effectfulCount,
 						anyToolCount,
 						diagFinishNudges,
+						maxDiagFinishNudges: modelProfile.finish.maxDiagFinishNudges,
 					}) &&
 					step + 1 < stepBudget
 				) {
@@ -2501,6 +2634,9 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 				const changedFiles = successfulWriteCount > 0;
 				let doneNote = '';
 				let loggedExperimentRound = false;
+				if (!oracleCfg && changedFiles && !opts.planMode && !opts.askMode && !opts.coachMode) {
+					oracleCfg = detectOracle(opts.workspaceRoot, nodeOracleFs);
+				}
 				if (
 					!blocked &&
 					changedFiles &&
@@ -2568,6 +2704,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					if (!result.ok) {
 						await logRound(false);
 						doneNote = finalReplyNote('still-red', result.commands[result.commands.length - 1]);
+						turnOutcome = 'blocked';
 					} else {
 						await logRound(true);
 					}
@@ -2588,6 +2725,8 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 						readSpecCount: readSpecPaths.size,
 						writtenTestCount: writtenTestPaths.size,
 						specCheckNudges,
+						specSelfCheckEnabled: modelProfile.finish.specSelfCheckEnabled,
+						specSelfCheckMaxNudges: modelProfile.finish.specSelfCheckMaxNudges,
 					}) &&
 					step + 1 < stepBudget
 				) {
@@ -2607,6 +2746,37 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 						detail: `${writtenSourcePaths.size} source, ${readSpecPaths.size} spec, ${writtenTestPaths.size} tests`,
 					});
 					opts.onStatus?.('Spec edge-case check before finish…');
+					continue;
+				}
+
+				if (
+					!blocked &&
+					shouldRequestRuntimeVerify({
+						planMode: opts.planMode,
+						askMode: opts.askMode,
+						coachMode: opts.coachMode,
+						statusQuestion,
+						blocked: !!blocked,
+						verifiedGreen: !oracleCfg || gates.hasVerifiedGreen(),
+						writtenSourceCount: writtenSourcePaths.size,
+						runtimeObserveCount,
+						runtimeVerifyNudges,
+					}) &&
+					step + 1 < stepBudget
+				) {
+					runtimeVerifyNudges += 1;
+					const note = runtimeVerifyNote({
+						sourcePaths: [...writtenSourcePaths],
+					});
+					trace?.info('harness', String(note.length));
+					messages.push({ role: 'assistant', content: summary });
+					messages.push({ role: 'user', content: note });
+					opts.onActivity?.({
+						kind: 'checkpoint',
+						label: 'Runtime verify',
+						detail: `${writtenSourcePaths.size} source, ${runtimeObserveCount} runtime observes`,
+					});
+					opts.onStatus?.('Runtime verify: launch and observe the app…');
 					continue;
 				}
 
@@ -2697,20 +2867,23 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					}
 				}
 
+				const stillRed = /Oracle: build\/test is still red/i.test(doneNote);
+				if (blocked) turnOutcome = 'blocked';
+				else if (stillRed) turnOutcome = 'blocked';
+				else if (turnOutcome !== 'blocked') turnOutcome = 'done';
+				turnBlockedReason = blocked ?? (stillRed ? 'oracle still red' : '');
 				opts.onTaskUpdate?.({
 					id: taskId,
 					name: truncateHistory(opts.task, 60),
-					status: blocked ? 'failed' : 'completed',
+					status: turnOutcome === 'done' ? 'completed' : 'failed',
 					result: summary.slice(0, 200),
 					elapsed: Date.now() - started,
 				});
 				opts.onActivity?.({
 					kind: 'checkpoint',
-					label: blocked ? 'Blocked' : 'Turn summary',
-					detail: blocked ?? summarizeActionsForLlm(actions).slice(0, 400),
+					label: turnOutcome === 'done' ? 'Turn summary' : 'Blocked',
+					detail: blocked ?? (stillRed ? 'oracle still red' : summarizeActionsForLlm(actions).slice(0, 400)),
 				});
-				turnOutcome = blocked ? 'blocked' : 'done';
-				turnBlockedReason = blocked ?? '';
 				emitTurnMetrics();
 				let reply = summary + doneNote;
 				if (
@@ -2749,6 +2922,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 						}
 					}
 				}
+				opts.onLoopExit?.(turnOutcome === 'done' ? 'done' : 'stuck');
 				return reply;
 			}
 
@@ -2761,18 +2935,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 			preferShortCompletion = false;
 			emptyFinishNudges = 0;
 
-			const exploreTools = new Set([
-				'read',
-				'list',
-				'search',
-				'retrieve',
-				'symbols',
-				'definition',
-				'references',
-			]);
-
 			const stepFingerprints: string[] = [];
-			let stepHadMutate = false;
 
 			/** Read-only tools from one model step. I/O overlaps; results commit in call order. */
 			interface ParallelIoJob {
@@ -2863,8 +3026,25 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					if (pathKey) {
 						touchedPaths.add(pathKey);
 					}
-					if (isEffectfulTool(name)) {
-						effectfulCount += 1;
+					{
+						const cmdForRuntime =
+							name === 'dotnet'
+								? dotnetCommandLine(args)
+								: name === 'shell'
+									? String(args.command ?? '')
+									: undefined;
+						if (isEffectfulTool(name, cmdForRuntime)) {
+							effectfulCount += 1;
+						}
+						if (
+							countsAsRuntimeObserve(
+								name,
+								cmdForRuntime,
+								oracleCfg?.commands
+							)
+						) {
+							runtimeObserveCount += 1;
+						}
 					}
 					if (
 						name === 'browser_click' ||
@@ -2950,9 +3130,12 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					}
 				}
 				if ((name === 'write' || name === 'edit' || name === 'apply_patch') && success) {
-					gates.onSuccessfulWrite(args.path);
-					successfulWriteCount += 1;
-					writesSinceOracle += 1;
+					const alreadyApplied = /Already applied/i.test(output);
+					if (!alreadyApplied) {
+						gates.onSuccessfulWrite(args.path);
+						successfulWriteCount += 1;
+						writesSinceOracle += 1;
+					}
 					if (typeof args.path === 'string' && args.path.trim()) {
 						const wp = args.path.replace(/\\/g, '/');
 						writtenPaths.add(wp);
@@ -2970,8 +3153,23 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					const pk = canonicalizePathKey(String(args.path ?? ''));
 					if (pk) readThisTurn.add(pk);
 				}
-				if (name === 'delete' || name === 'rename') {
-					if (success) successfulWriteCount += 1;
+				if ((name === 'delete' || name === 'rename') && success) {
+					gates.onSuccessfulWrite(
+						name === 'rename' ? args.newPath ?? args.path : args.path
+					);
+					successfulWriteCount += 1;
+					writesSinceOracle += 1;
+					failedFingerprints.clear();
+				}
+				if (
+					name === 'dotnet' &&
+					success &&
+					/^(add_package|sln_add|add_reference|remove_package)$/i.test(String(args.action ?? ''))
+				) {
+					gates.onSuccessfulWrite(args.project ?? args.solution ?? args.path);
+					successfulWriteCount += 1;
+					writesSinceOracle += 1;
+					failedFingerprints.clear();
 				}
 				if (name === 'update_status' && success) {
 					statusUpdated = true;
@@ -3233,7 +3431,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 				}
 				const name = normalized.name;
 				args = normalized.args;
-				if (!exploreTools.has(name)) {
+				if (!isExploreToolName(name)) {
 					await flushLane();
 				}
 				const refuse = async (content: string, label: string) => {
@@ -3241,6 +3439,15 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					trace?.info('harness', String(content.length));
 					messages.push({ role: 'tool', tool_call_id: call.id, name, content });
 					actions.push(`${name} blocked (${label})`);
+					opts.onActivity?.({
+						kind: 'tool',
+						label: `${name} blocked (${label})`,
+						detail: content.slice(0, 400),
+						tool: name,
+						toolCallId: call.id,
+						toolStatus: 'failed',
+						success: false,
+					});
 				};
 
 				if (name === 'write' && typeof args.content === 'string' && args.content.length > 14000) {
@@ -3268,10 +3475,20 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 				}
 
 				// Weak profile: a full rewrite of a large existing file loses code; edit is the tool for that.
-				if (weakProfile && name === 'write' && gates.cfg.blockMassRewrite && typeof args.path === 'string') {
+				if (
+					weakProfile &&
+					name === 'write' &&
+					gates.cfg.blockMassRewrite &&
+					modelProfile.mutations.enforceMassRewriteGate &&
+					typeof args.path === 'string'
+				) {
 					const existing = await opts.bridge.readRaw(String(args.path));
 					const existingLines = existing?.split(/\r?\n/).length ?? 0;
-					if (existing !== undefined && existingLines > LARGE_FILE_LINES && isPartialRewrite(existing, String(args.content ?? ''))) {
+					if (
+						existing !== undefined &&
+						existingLines > largeFileLines &&
+						isPartialRewrite(existing, String(args.content ?? ''))
+					) {
 						await refuse(
 							`Not written: ${args.path} already has ${existingLines} lines and most of them would stay the same. Change the parts that differ with edit (old_string → new_string).`,
 							'large rewrite'
@@ -3279,9 +3496,9 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 						continue;
 					}
 					const contentLines = String(args.content ?? '').split(/\r?\n/).length;
-					if (contentLines > 180) {
+					if (writeMaxLines > 0 && contentLines > writeMaxLines) {
 						await refuse(
-							`Not written: content is ${contentLines} lines (limit 180 on weak profile). Write a minimal skeleton (<60 lines), then grow the file with edit one method/block at a time. For .NET projects prefer the dotnet tool (new / sln_add / add_reference).`,
+							`Not written: content is ${contentLines} lines (limit ${writeMaxLines} on weak profile). Write a minimal skeleton (<${largeFileLines} lines), then grow the file with edit one method/block at a time. For .NET projects prefer the dotnet tool (new / sln_add / add_reference).`,
 							'large write'
 						);
 						continue;
@@ -3349,7 +3566,6 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 
 				const fingerprint = toolFingerprint(name, args);
 				stepFingerprints.push(fingerprint);
-				if (!exploreTools.has(name)) stepHadMutate = true;
 				const priorCount = recentFingerprints.filter(f => f === fingerprint).length;
 				recentFingerprints.push(fingerprint);
 				if (recentFingerprints.length > 40) {
@@ -3506,7 +3722,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					detail: JSON.stringify(summarizeArgs(name, args)).slice(0, 200),
 				});
 
-				if (MUTATING.has(name) && !gateApproved) {
+				if (agentToolNeedsUserApproval(name) && !gateApproved) {
 					const policy = getApprovalPolicy();
 					if (policy.isAutoApproved(name)) {
 						/* Allow all / auto-approve — no HITL checkpoint */
@@ -3751,7 +3967,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					readWindowKey,
 					readAliases,
 				};
-				if (exploreTools.has(name)) {
+				if (isExploreToolName(name)) {
 					lane.push(job);
 					continue;
 				}
@@ -3774,18 +3990,12 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 				}
 			}
 
-			if (stepHadMutate) {
-				exploreOnlySteps = 0;
-			} else if (toolCalls.some(tc => exploreTools.has(tc.function.name))) {
-				exploreOnlySteps += 1;
-			}
 			// Successful tool progress resets length-truncation streak (distant truncations must not kill the run).
 			if (toolCalls.length > 0) {
 				lengthTruncationNudges = 0;
 				preferShortCompletion = false;
 			}
 			loopDetector.endStep();
-			loopDetector.setExploreOnlySteps(exploreOnlySteps);
 			loopDetector.setUnchangedStreak(unchangedStreak);
 
 			// Hard stop when tools loop without progress — no coaching nudges.
@@ -3857,7 +4067,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 						'Stopped: tools were repeating without new progress.',
 						stuckCause ? `Reason: ${stuckCause}` : '',
 						summarizeActionsForLlm(actions),
-						'Tip: restate a concrete next step (file + change), not just “continue”.',
+						'Tip: next turn must call edit, write, shell, or browser — do not only re-read files already in context.',
 					]
 						.filter(Boolean)
 						.join('\n\n')
@@ -3891,7 +4101,13 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 				url,
 				sanitizeMessages(messages),
 				SHORT_COMPLETION_TOKENS,
-				toolsForRound(activeToolNames, agentMode, opts.model, frozenSkillCatalog),
+				toolsForRound(
+					activeToolNames,
+					agentMode,
+					opts.model,
+					frozenSkillCatalog,
+					frozenShellHints
+				),
 				'none'
 			);
 			if (wrap.ok) {
@@ -3914,21 +4130,33 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					].join(' ');
 				}
 				if (answer) {
-					turnOutcome = loopExit === 'budget' ? 'max-steps' : 'done';
+					turnOutcome =
+						loopExit === 'budget'
+							? 'max-steps'
+							: loopExit === 'stuck'
+								? 'stuck'
+								: loopExit === 'length'
+									? 'max-steps'
+									: 'done';
 					opts.onTaskUpdate?.({
 						id: taskId,
 						name: truncateHistory(opts.task, 60),
-						status: loopExit === 'budget' ? 'failed' : 'completed',
+						status:
+							loopExit === 'stuck' || loopExit === 'length' || loopExit === 'budget'
+								? 'failed'
+								: 'completed',
 						result: truncateHistory(answer, 120),
 						elapsed: Date.now() - started,
 					});
+					opts.onLoopExit?.(loopExit ?? 'budget');
 					return answer;
 				}
 			}
 		} catch {
 			/* fall through */
 		}
-		turnOutcome = 'max-steps';
+		turnOutcome =
+			loopExit === 'stuck' ? 'stuck' : loopExit === 'length' ? 'max-steps' : 'max-steps';
 		opts.onTaskUpdate?.({
 			id: taskId,
 			name: truncateHistory(opts.task, 60),
@@ -3948,6 +4176,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 			const saved = await loadProjectStatus(opts.workspaceRoot);
 			statusFallback = (saved ? formatStatusForPrompt(saved) : emptyStatusPrompt()) + '\n\n';
 		}
+		opts.onLoopExit?.(loopExit ?? 'budget');
 		return statusFallback + wrapFallback;
 	} catch (err) {
 		turnOutcome = 'error';
@@ -3959,6 +4188,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 			result: message.slice(0, 200),
 			elapsed: Date.now() - started,
 		});
+		opts.onLoopExit?.('error');
 		throw err;
 	} finally {
 		// Fire-and-forget so the chat bubble can settle before git/status I/O.
@@ -4677,7 +4907,8 @@ async function postAgentRound(
 		proseToolsOnly: !!opts.proseToolsOnly,
 		tools,
 	};
-	const baseSampling = llmSamplingOptions(thinkInput);
+	const profileSamp = opts.modelProfile?.sampling;
+	const baseSampling = llmSamplingOptions(thinkInput, profileSamp);
 	const sampling = {
 		...baseSampling,
 		...(opts.sampling ?? {}),
@@ -4693,7 +4924,7 @@ async function postAgentRound(
 	if (typeof sampling.dry_multiplier === 'number') {
 		samplingExtras.dry_multiplier = sampling.dry_multiplier;
 	}
-	const cappedTokens = toolAwareMaxTokens(maxTokens, thinkInput);
+	const cappedTokens = toolAwareMaxTokens(maxTokens, thinkInput, opts.modelProfile?.completion);
 	const disableThink = shouldDisableThinking(thinkInput);
 	const enableThink = shouldEnableThinking(thinkInput);
 	let outbound = stripReasoningFromMessages(messages);
@@ -5436,7 +5667,14 @@ function sanitizeMessages(messages: ChatMessage[]): ChatMessage[] {
 			const next: ChatMessage = { role: m.role, content };
 			if (m.tool_call_id) next.tool_call_id = m.tool_call_id;
 			if (m.name) next.name = m.name;
-			if (m.tool_calls?.length) next.tool_calls = m.tool_calls;
+			if (m.tool_calls?.length) {
+				next.tool_calls = m.tool_calls.map(tc => {
+					const args = toWireToolArguments(tc.function.arguments ?? '', parseToolArguments);
+					return args === tc.function.arguments
+						? tc
+						: { ...tc, function: { ...tc.function, arguments: args } };
+				});
+			}
 			return next;
 		})
 	);
@@ -5557,9 +5795,12 @@ async function runProseToolFallback(
 		);
 	}
 
-	return actions.length
-		? `Done.\n${summarizeActionsForLlm(actions)}`
-		: text;
+	const failed = actions.filter(a => /\b(failed|denied|blocked)\b/i.test(a));
+	if (!actions.length) return text;
+	if (failed.length) {
+		return `Finished with failures.\n${summarizeActionsForLlm(actions)}`;
+	}
+	return `Done.\n${summarizeActionsForLlm(actions)}`;
 }
 
 function uniqHandoffPaths(paths: string[]): string[] {
@@ -6286,13 +6527,14 @@ function cleanToolDetailForUi(output: string): string {
 
 /** Shell exit≠0 must not be cached as success / treated as OK progress. */
 function isToolSuccess(name: string, output: string): boolean {
-	if (
-		/^(Error:|FAILED:|Not run:)/i.test(output.trim()) ||
-		/old_string was not found/i.test(output) ||
-		/hunk \d+:|apply_patch:/i.test(output) ||
-		/^FILE_NOT_FOUND:/i.test(output.trim())
-	) {
+	if (/^(Error:|FAILED:|Not run:)/i.test(output.trim()) || /^FILE_NOT_FOUND:/i.test(output.trim())) {
 		return false;
+	}
+	// Text rules for patch tools only — shell/search may mention "hunk" in docs.
+	if (name === 'edit' || name === 'write' || name === 'apply_patch') {
+		if (/old_string was not found/i.test(output) || /hunk \d+:|apply_patch:/i.test(output)) {
+			return false;
+		}
 	}
 	if (name.startsWith('git_') && /Git is unavailable|Git tool failed/i.test(output)) {
 		return false;

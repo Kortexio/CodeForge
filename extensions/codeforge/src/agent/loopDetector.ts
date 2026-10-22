@@ -1,15 +1,53 @@
 /**
  * Detects tool-loop stalls from identical call+result streaks (and related counters).
  * Pure — no vscode.
+ *
+ * No explore-step soft/hard caps: like Cursor/Claude Code, reads are unlimited within the
+ * turn step budget. Stall = identical repeats or browser UI unchanged.
  */
+
+export const EXPLORE_TOOL_NAMES = [
+	'read',
+	'list',
+	'search',
+	'retrieve',
+	'symbols',
+	'definition',
+	'references',
+] as const;
+
+export function isExploreToolName(name: string): boolean {
+	return (EXPLORE_TOOL_NAMES as readonly string[]).includes(name);
+}
+
+/**
+ * Tools that count as real progress for write/oracle gates elsewhere.
+ * skill / update_status / await_shell alone must NOT reset progress streaks.
+ */
+export const EFFECTFUL_TOOL_NAMES = [
+	'edit',
+	'write',
+	'apply_patch',
+	'delete',
+	'rename',
+	'shell',
+	'dotnet',
+	'browser_navigate',
+	'browser_click',
+	'browser_type',
+	'browser_snapshot',
+	'browser_screenshot',
+] as const;
+
+export function isEffectfulToolName(name: string): boolean {
+	return (EFFECTFUL_TOOL_NAMES as readonly string[]).includes(name);
+}
 
 export interface LoopDetector {
 	recordCall(fingerprint: string, resultHash: string): { note?: string };
 	endStep(): void;
 	shouldStop(): boolean;
 	cause(): string;
-	setExploreOnlySteps(n: number): void;
-	getExploreOnlySteps(): number;
 	setUnchangedStreak(n: number): void;
 	getUnchangedStreak(): number;
 	/** Consecutive steps where every call repeated a prior fingerprint+result. */
@@ -30,7 +68,6 @@ export function hashResult(text: string): string {
 export function createLoopDetector(): LoopDetector {
 	let currentStep = 1;
 	let consecutiveIdenticalSteps = 0;
-	let exploreOnlySteps = 0;
 	let unchangedStreak = 0;
 	/** fingerprint\0resultHash → step number when first seen */
 	const firstSeen = new Map<string, number>();
@@ -60,7 +97,7 @@ export function createLoopDetector(): LoopDetector {
 		},
 
 		shouldStop(): boolean {
-			return consecutiveIdenticalSteps >= 3 || exploreOnlySteps >= 20 || unchangedStreak >= 3;
+			return consecutiveIdenticalSteps >= 3 || unchangedStreak >= 3;
 		},
 
 		cause(): string {
@@ -70,18 +107,7 @@ export function createLoopDetector(): LoopDetector {
 			if (unchangedStreak >= 3) {
 				return 'browser UI UNCHANGED for 3 consecutive actions';
 			}
-			if (exploreOnlySteps >= 20) {
-				return '20 consecutive explore-only steps without a write or shell';
-			}
 			return 'tools stuck without progress';
-		},
-
-		setExploreOnlySteps(n: number): void {
-			exploreOnlySteps = Math.max(0, n);
-		},
-
-		getExploreOnlySteps(): number {
-			return exploreOnlySteps;
 		},
 
 		setUnchangedStreak(n: number): void {

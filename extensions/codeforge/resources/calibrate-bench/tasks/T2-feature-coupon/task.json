@@ -1,0 +1,9 @@
+{
+  "id": "T2-feature-coupon",
+  "category": "feature",
+  "title": "Implement applyCoupon from the docs",
+  "prompt": "Implement the `applyCoupon` function described in `docs/pricing.md` (Coupons section) in the coupons module and also export it from `src/index.js`. The coupons are in `config/coupons.json`. Confirm with `npm test`.",
+  "protected": ["test/", "config/"],
+  "checks": [],
+  "bonus": []
+}

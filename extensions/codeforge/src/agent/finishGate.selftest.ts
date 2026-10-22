@@ -1,7 +1,14 @@
 /**
- * Diagnose-only finish gate + spec self-check.
+ * Diagnose-only finish gate + spec self-check + runtime verify.
  */
-import { isEffectfulTool, shouldRefuseDiagFinish, shouldRequestSpecSelfCheck } from './finishGate';
+import {
+	countsAsRuntimeObserve,
+	isEffectfulTool,
+	isOracleBuildOrTestCommand,
+	shouldRefuseDiagFinish,
+	shouldRequestRuntimeVerify,
+	shouldRequestSpecSelfCheck,
+} from './finishGate';
 
 function assert(cond: boolean, msg: string): void {
 	if (!cond) throw new Error(msg);
@@ -11,6 +18,16 @@ assert(isEffectfulTool('edit'), 'edit effectful');
 assert(isEffectfulTool('browser_click'), 'click effectful');
 assert(!isEffectfulTool('read'), 'read not effectful');
 assert(!isEffectfulTool('browser_snapshot'), 'snapshot not effectful');
+assert(isEffectfulTool('shell', 'npm test'), 'mutating shell effectful');
+assert(!isEffectfulTool('shell', 'dir src'), 'readonly shell not effectful');
+assert(!isEffectfulTool('shell', 'git status'), 'git status not effectful');
+assert(!isEffectfulTool('shell', 'type README.md'), 'type not effectful');
+assert(!countsAsRuntimeObserve('shell', 'dir'), 'readonly shell not runtime observe');
+assert(isOracleBuildOrTestCommand('dotnet test'), 'dotnet test is oracle');
+assert(
+	!isOracleBuildOrTestCommand('echo npm test was mentioned', ['npm test']),
+	'oracle match requires full command'
+);
 
 assert(
 	shouldRefuseDiagFinish({
@@ -132,6 +149,66 @@ assert(
 		specCheckNudges: 0,
 	}),
 	'tests touched → skip even with spec'
+);
+
+assert(isOracleBuildOrTestCommand('npm test --silent'), 'npm test is oracle');
+assert(isOracleBuildOrTestCommand('dotnet build Foo.sln -nologo -v q'), 'dotnet build is oracle');
+assert(!isOracleBuildOrTestCommand('npm start'), 'npm start is runtime');
+assert(
+	countsAsRuntimeObserve('browser_snapshot'),
+	'snapshot counts (even if not effectful)'
+);
+assert(countsAsRuntimeObserve('shell', 'npm start'), 'start shell counts');
+assert(!countsAsRuntimeObserve('shell', 'npm test --silent'), 'test shell does not count');
+
+assert(
+	shouldRequestRuntimeVerify({
+		verifiedGreen: true,
+		writtenSourceCount: 1,
+		runtimeObserveCount: 0,
+		runtimeVerifyNudges: 0,
+	}),
+	'runtime verify fires'
+);
+
+assert(
+	!shouldRequestRuntimeVerify({
+		verifiedGreen: true,
+		writtenSourceCount: 1,
+		runtimeObserveCount: 1,
+		runtimeVerifyNudges: 0,
+	}),
+	'already observed → skip'
+);
+
+assert(
+	!shouldRequestRuntimeVerify({
+		verifiedGreen: true,
+		writtenSourceCount: 0,
+		runtimeObserveCount: 0,
+		runtimeVerifyNudges: 0,
+	}),
+	'no writes → skip'
+);
+
+assert(
+	!shouldRequestRuntimeVerify({
+		verifiedGreen: false,
+		writtenSourceCount: 1,
+		runtimeObserveCount: 0,
+		runtimeVerifyNudges: 0,
+	}),
+	'needs green'
+);
+
+assert(
+	!shouldRequestRuntimeVerify({
+		verifiedGreen: true,
+		writtenSourceCount: 1,
+		runtimeObserveCount: 0,
+		runtimeVerifyNudges: 1,
+	}),
+	'one-shot only'
 );
 
 console.log('finishGate.selftest: ok');

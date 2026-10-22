@@ -7,7 +7,7 @@ import { randomUUID } from 'crypto';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { StableFacts, normalizeFacts } from '../agent/stableFacts';
-import { ensureDir, ensureHomeLayout, sessionDir, sessionsDir } from '../storage/paths';
+import { ensureDir, ensureHomeLayout, sessionDir, sessionsDir, workspaceHash } from '../storage/paths';
 import { getSessionWikiStore } from '../memory/sessionWiki';
 import { salvageSessionProgress } from '../agent/projectStatus';
 
@@ -76,6 +76,7 @@ export interface ChatSession {
 const STORAGE_KEY = 'codeforge.ai.sessions.v2';
 const LEGACY_KEY = 'codeforge.ai.sessions.v1';
 const ACTIVE_KEY = 'codeforge.ai.activeSessionId';
+const ACTIVE_BY_WORKSPACE_KEY = 'codeforge.ai.activeSessionByWorkspace';
 const MAX_SESSIONS = 100;
 const INDEX_FILE = 'index.json';
 
@@ -84,6 +85,7 @@ export class SessionStore {
 	readonly onDidChange = this._onDidChange.event;
 	private cache: ChatSession[] | null = null;
 	private ready: Promise<void>;
+	private writeQueue: Promise<void> = Promise.resolve();
 
 	constructor(private readonly context: vscode.ExtensionContext) {
 		this.ready = this.bootstrap();
@@ -117,10 +119,31 @@ export class SessionStore {
 	}
 
 	getActiveId(): string | undefined {
+		const ws = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+		if (ws) {
+			const map =
+				this.context.globalState.get<Record<string, string>>(ACTIVE_BY_WORKSPACE_KEY) ?? {};
+			const id = map[workspaceHash(ws)];
+			if (id) return id;
+		}
 		return this.context.globalState.get<string>(ACTIVE_KEY);
 	}
 
 	async setActiveId(id: string | null): Promise<void> {
+		const ws = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+		if (ws) {
+			const map = {
+				...(this.context.globalState.get<Record<string, string>>(ACTIVE_BY_WORKSPACE_KEY) ??
+					{}),
+			};
+			const key = workspaceHash(ws);
+			if (id) {
+				map[key] = id;
+			} else {
+				delete map[key];
+			}
+			await this.context.globalState.update(ACTIVE_BY_WORKSPACE_KEY, map);
+		}
 		await this.context.globalState.update(ACTIVE_KEY, id ?? undefined);
 	}
 
@@ -151,7 +174,9 @@ export class SessionStore {
 		};
 		const all = this.list();
 		all.unshift(session);
-		await this.persist(all.slice(0, MAX_SESSIONS));
+		const trimmed = all.slice(0, MAX_SESSIONS);
+		this.cache = trimmed;
+		await this.persistChanged(session.id, { rewriteIndex: true });
 		await this.setActiveId(session.id);
 		await getSessionWikiStore().ensure(session.id, partial.task);
 		return session;
@@ -183,7 +208,8 @@ export class SessionStore {
 		}
 		all.splice(idx, 1);
 		all.unshift(session);
-		await this.persist(all);
+		this.cache = all;
+		await this.persistChanged(session.id, { rewriteIndex: true });
 		return session;
 	}
 
@@ -232,7 +258,8 @@ export class SessionStore {
 
 		const all = this.list();
 		all.unshift(session);
-		await this.persist(all.slice(0, MAX_SESSIONS));
+		this.cache = all.slice(0, MAX_SESSIONS);
+		await this.persistChanged(session.id, { rewriteIndex: true });
 		await this.setActiveId(session.id);
 		await getSessionWikiStore().ensure(session.id, session.task);
 		return session;
@@ -252,7 +279,8 @@ export class SessionStore {
 			timestamp: new Date().toISOString(),
 		});
 		session.updatedAt = new Date().toISOString();
-		await this.persist(all);
+		this.cache = all;
+		await this.persistChanged(id);
 	}
 
 	async createCheckpoint(
@@ -281,7 +309,8 @@ export class SessionStore {
 			session.state = 'paused';
 		}
 		session.updatedAt = new Date().toISOString();
-		await this.persist(all);
+		this.cache = all;
+		await this.persistChanged(id);
 		return checkpoint;
 	}
 
@@ -292,7 +321,8 @@ export class SessionStore {
 		if (!session) return;
 		session.rollingSummary = summary;
 		session.updatedAt = new Date().toISOString();
-		await this.persist(all);
+		this.cache = all;
+		await this.persistChanged(id);
 	}
 
 	async setStableFacts(id: string, facts: StableFacts): Promise<void> {
@@ -302,7 +332,8 @@ export class SessionStore {
 		if (!session) return;
 		session.stableFacts = normalizeFacts(facts);
 		session.updatedAt = new Date().toISOString();
-		await this.persist(all);
+		this.cache = all;
+		await this.persistChanged(id);
 		await getSessionWikiStore().setStableFacts(id, session.stableFacts);
 	}
 
@@ -313,7 +344,8 @@ export class SessionStore {
 		if (!session) return;
 		session.state = state;
 		session.updatedAt = new Date().toISOString();
-		await this.persist(all);
+		this.cache = all;
+		await this.persistChanged(id);
 	}
 
 	/**
@@ -336,7 +368,8 @@ export class SessionStore {
 		session.updatedAt = new Date().toISOString();
 		all.splice(idx, 1);
 		all.unshift(session);
-		await this.persist(all);
+		this.cache = all;
+		await this.persistChanged(session.id, { rewriteIndex: true });
 		return session;
 	}
 
@@ -344,7 +377,8 @@ export class SessionStore {
 		await this.ensureReady();
 		const session = this.list().find(s => s.id === id);
 		await this.keepProjectProgress(session);
-		await this.persist(this.list().filter(s => s.id !== id));
+		this.cache = this.list().filter(s => s.id !== id);
+		await this.persistChanged(undefined, { rewriteIndex: true });
 		try {
 			await fs.rm(sessionDir(id), { recursive: true, force: true });
 		} catch {
@@ -361,7 +395,8 @@ export class SessionStore {
 		for (const session of sessions) {
 			await this.keepProjectProgress(session);
 		}
-		await this.persist([]);
+		this.cache = [];
+		await this.persistChanged(undefined, { rewriteIndex: true });
 		await this.setActiveId(null);
 		for (const session of sessions) {
 			try {
@@ -417,7 +452,8 @@ export class SessionStore {
 		parsed.workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
 		const all = this.list();
 		all.unshift(parsed);
-		await this.persist(all.slice(0, MAX_SESSIONS));
+		this.cache = all.slice(0, MAX_SESSIONS);
+		await this.persistChanged(parsed.id, { rewriteIndex: true });
 		await this.setActiveId(parsed.id);
 		return parsed;
 	}
@@ -439,7 +475,7 @@ export class SessionStore {
 		}
 		if (legacy?.length) {
 			this.cache = legacy.map(normalizeSession);
-			await this.persist(this.cache);
+			await this.persistAllSessions(this.cache);
 			await this.context.globalState.update(STORAGE_KEY, undefined);
 			await this.context.globalState.update(LEGACY_KEY, undefined);
 		}
@@ -464,17 +500,62 @@ export class SessionStore {
 		}
 	}
 
-	private async persist(sessions: ChatSession[]): Promise<void> {
+	private enqueueWrite(task: () => Promise<void>): Promise<void> {
+		const run = this.writeQueue.then(task, task);
+		this.writeQueue = run.catch(() => {});
+		return run;
+	}
+
+	private async atomicWrite(filePath: string, body: string): Promise<void> {
+		const dir = path.dirname(filePath);
+		await ensureDir(dir);
+		const tmp = path.join(dir, `${path.basename(filePath)}.${randomUUID()}.tmp`);
+		await fs.writeFile(tmp, body, 'utf8');
+		await fs.rename(tmp, filePath);
+	}
+
+	private async writeSessionToDisk(session: ChatSession): Promise<void> {
+		await ensureDir(sessionDir(session.id));
+		const file = path.join(sessionDir(session.id), 'session.json');
+		await this.atomicWrite(file, JSON.stringify(normalizeSession(session), null, 2));
+	}
+
+	private async writeIndexToDisk(): Promise<void> {
+		const ids = (this.cache ?? []).slice(0, MAX_SESSIONS).map(s => s.id);
+		await this.atomicWrite(path.join(sessionsDir(), INDEX_FILE), JSON.stringify(ids, null, 2));
+	}
+
+	/** Write one session (and optionally refresh index.json). */
+	private async persistChanged(
+		sessionId: string | undefined,
+		opts?: { rewriteIndex?: boolean }
+	): Promise<void> {
+		await this.enqueueWrite(async () => {
+			await ensureDir(sessionsDir());
+			if (sessionId) {
+				const session = (this.cache ?? []).find(s => s.id === sessionId);
+				if (session) {
+					await this.writeSessionToDisk(session);
+				}
+			}
+			if (opts?.rewriteIndex) {
+				await this.writeIndexToDisk();
+			}
+			this._onDidChange.fire();
+		});
+	}
+
+	/** Migration / full rewrite — every session file + index. */
+	private async persistAllSessions(sessions: ChatSession[]): Promise<void> {
 		this.cache = sessions;
-		await ensureDir(sessionsDir());
-		const ids: string[] = [];
-		for (const session of sessions.slice(0, MAX_SESSIONS)) {
-			ids.push(session.id);
-			const dir = await ensureDir(sessionDir(session.id));
-			await fs.writeFile(path.join(dir, 'session.json'), JSON.stringify(session, null, 2), 'utf8');
-		}
-		await fs.writeFile(path.join(sessionsDir(), INDEX_FILE), JSON.stringify(ids, null, 2), 'utf8');
-		this._onDidChange.fire();
+		await this.enqueueWrite(async () => {
+			await ensureDir(sessionsDir());
+			for (const session of sessions.slice(0, MAX_SESSIONS)) {
+				await this.writeSessionToDisk(session);
+			}
+			await this.writeIndexToDisk();
+			this._onDidChange.fire();
+		});
 	}
 }
 

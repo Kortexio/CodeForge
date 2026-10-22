@@ -60,11 +60,13 @@ Classes:
 | Step budget | keep | silent extension when progress changes |
 | Checkpoints every N steps / `progressReview.ts` / REPLAN | replace | done — orchestrator (`orchestrator.ts`): one item per card, ~25 steps, 2 attempts, then `blocked`; auto when task mentions cards and ≥2 exist (slash `/cards` forces); headless uses `runOrchestrated` |
 | Spec self-check "confirm each rule" — model confirms boundaries by reading and is wrong | replace | done — `specSelfCheckNote` requires executing the code at each boundary value (inclusive bounds, date-only = midnight, caps, rounding); one-off commands; no files created/edited under test directories (scratch goes to the OS temp dir); no scaffolded project when the code is compiled — the existing suite is the executable check |
+| Done on build/test green without launching the app (opens but feature/runtime still broken) | replace | done — one-shot `shouldRequestRuntimeVerify` / `runtimeVerifyNote`: after source writes + green (or no oracle), require browser observe or non-oracle shell/dotnet launch before prose finish; `npm test` / `dotnet test` do not count |
 | Qwen XML parameter closed with `</old_string>` instead of `</parameter>`, next parameter leaks into the value | replace | done — `toolCallNormalizer` splits known-parameter markers (missing, echo and self-leak cases), refuses real conflicts with a fix hint; counted as `badArgs` with a raw sample |
 | `presence_penalty: 1.0` on tool rounds | remove | done — A/B 10/14 vs 13/14 with 0; tool calls must repeat tokens |
 | Unix/PowerShell habits on `cmd.exe` (`rm`, `/tmp`, heredoc, `Set-Content`) | replace | done — `shell` description maps them to `del`, `type`, `findstr`, `%TEMP%`, `write` |
 | Spec-check scratch files inside the workspace, and edits that change an existing test assertion | replace | done — `mutationGuard`: during the spec check, no test-dir changes, no new workspace files, no deletes; a pre-existing test file keeps every assertion line |
 | A background `dotnet test` kept the headless process alive after the agent had already stopped | replace | done — `bgShell` calls `child.unref()`, so the bench records the result instead of waiting out the timeout |
+| Same weak-model compensations for every model | replace | done — `ModelProfile` per server/model (`~/.CodeForge/ai/model-profiles/…`); protocol telemetry rollup; `bench calibrate` (weak keeps defaults; strong drops write-cap / mass-rewrite / forced-weak-skill when `badArgs/native < 0.05`); online hysteresis at run start (write cap on at trunc≥5%, off only after 50-run clean window; tool temp −0.1 if leak≥8%, floor 0.3). Suite packaged at `resources/calibrate-bench/` (`sync:calibrate-bench`); Settings → **Benchmark** |
 | Rename finished on green tests with the old name still exported (`oldName: x.newName`) | replace | done — system contract: a rename/removal is done only when a search for the old name returns no hits, export keys included; `rename` tool is file-only |
 | Reply that only echoes the `/no_think` soft switch accepted as the final answer | replace | done — `splitThinkContent` drops lines that are only `/think` or `/no_think`, so the empty-turn retry applies |
 | Windows shell mangles inner `"` (`node -e "…"` exits 0 without running) | replace | done — `cmdExeSpawn`: outer quotes + `windowsVerbatimArguments` in bridge, sandbox runtime and `bgShell` |
@@ -89,7 +91,9 @@ Classes:
 | Model retries `edit` whose `new_string` is already on disk (fake "missing brace") | replace | done — `applyEdit` returns `alreadyApplied` success so the 35B moves on |
 | Intent/continue enrich, thin-final/stuck soft nudges, write-count continue | remove | done — model works from system+tool contract; harness keeps protocol (length/JSON/budget) + tool gates only |
 | Stuck wrap used MAX_STEPS_PROMPT (wrong situation) / PT status labels | replace | done — `stuckWrapPrompt(cause)` vs `MAX_STEPS_PROMPT` vs `LENGTH_EXHAUSTED_PROMPT`; `loopExit` is `budget`/`stuck`/`length`; status/activity strings English |
-| Soft cache / noop-step stuck heuristics | replace | done — `loopDetector.ts` (identical call+result for 3 steps, explore-only ≥20, UI unchanged ≥3) |
+| Soft cache / noop-step stuck heuristics | replace | done — `loopDetector.ts` (identical call+result for 3 steps, UI unchanged ≥3); no explore-step soft/hard caps (Cursor/Claude Code style: unlimited reads within turn step budget) |
+| Soft explore-cap refused new reads and stalled T2 | remove | done — removed `EXPLORE_SOFT_CAP` / `EXPLORE_HARD_CAP`; budget exhaustion shows Continue button (`continueTurn`) instead of refusing reads |
+| Concrete tip after stuck still only re-reads | replace | done — stuck wrap says next turn must use edit/write/shell/browser; identical-repeat detector still stops loops |
 | Stale internal plan injection | replace | done — `internalPlans.ts` scoped to session/taskHash; archive on done/unrelated task |
 | Mechanical mid-compact digest | replace | done — structured LLM checkpoint (Objective / Work State / Next Move) with mechanical fallback |
 | Final round sends `tools: []` (breaks prefix cache) | replace | done — budget/stuck/length wraps use `postAgentRound` with tools + `tool_choice: none` |
@@ -118,6 +122,9 @@ Classes:
 | `chunker.ts` / `workspaceIndex.ts` / `rerank.ts` / `indexWatcher.ts` | hybrid retrieve index |
 | `toolHistory.ts` | soft/mid compact + read ledger |
 | `exploreMode.ts` | optional read-only explore subagent |
+| `modelProfile.ts` | per-model knobs (sampling, write cap, prompt extras, finish/orchestrator); disk under `~/.CodeForge/ai/model-profiles/` |
+| `protocolTelemetry.ts` | protocol aggregator + `runs.jsonl` / `rollup.json` per model |
+| `profileHysteresis.ts` | online flips at run start from rollup (write cap, tool temperature); quality knobs stay calibrate-only |
 
 ## Pending
 

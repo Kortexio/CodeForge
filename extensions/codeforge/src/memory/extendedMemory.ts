@@ -146,6 +146,23 @@ export interface ShellLessonResult {
  * Learn from a failed command. The lesson id comes from the error text, so the same
  * failure reinforces one record. Previously saved lessons match by their stored regex.
  */
+/** Failing test runs should not produce a "do not run again" lesson. */
+export function isRedTestFailure(command: string, output: string): boolean {
+	const cmd = command.trim().toLowerCase();
+	if (
+		!/\b(dotnet\s+test|npm\s+test|npm\s+run\s+test|yarn\s+test|pnpm\s+test|jest\b|pytest|cargo\s+test|go\s+test|vitest)\b/.test(
+			cmd
+		)
+	) {
+		return false;
+	}
+	const blob = `${command}\n${output}`;
+	return (
+		/\bfailed\b|\bfailure\b|\berror\b|\bFAIL\b|×|✕|not passed/i.test(blob) ||
+		/\b0 passed\b.*\bfailed\b/i.test(blob)
+	);
+}
+
 export async function learnFromShellFailure(
 	workspaceFolder: string | undefined,
 	command: string,
@@ -154,6 +171,7 @@ export async function learnFromShellFailure(
 	const cmd = command.trim();
 	const out = output || '';
 	if (!cmd && !out.trim()) return null;
+	if (isRedTestFailure(cmd, out)) return null;
 
 	const derived = lessonFromFailure(cmd, out);
 	const known = (await load(workspaceFolder)).lessons.find(

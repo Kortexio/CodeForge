@@ -1,0 +1,15 @@
+{
+  "id": "CS3-nav-vip-rate",
+  "category": "navigation",
+  "fixture": "billing",
+  "runtime": "dotnet",
+  "title": "Change the VIP discount (find where the rule lives)",
+  "prompt": "VIP customers now get a 15% discount instead of 10%. Make the change where the rule is defined and update the documentation. Confirm with `dotnet test`.",
+  "protected": ["tests/"],
+  "checks": [
+    { "type": "unchanged", "file": "src/Acme.Billing/Totals.cs", "why": "the rate lives in PricingRules, not Totals" }
+  ],
+  "bonus": [
+    { "type": "contains", "file": "docs/pricing.md", "pattern": "\\|\\s*vip\\s*\\|\\s*15%", "why": "docs table updated" }
+  ]
+}

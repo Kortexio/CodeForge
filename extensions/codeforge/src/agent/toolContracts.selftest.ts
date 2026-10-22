@@ -20,6 +20,7 @@ assert(/already applied/i.test(TOOL_SYSTEM_CONTRACT), 'system mentions already a
 assert(/Browser:|snapshot/i.test(TOOL_SYSTEM_CONTRACT), 'full contract mentions browser');
 assert(/UI UNCHANGED|After page state/i.test(toolDescription('browser_click')), 'click contract observe-after');
 assert(/Implementation finish|exploration-only|blocked:/i.test(TOOL_SYSTEM_CONTRACT), 'system finish contract');
+assert(/Runnable UI\/apps|launch the app/i.test(TOOL_SYSTEM_CONTRACT), 'runtime verify finish line');
 assert(/After diagnosing|bug list/i.test(toolDescription('edit')), 'edit pushes apply after diagnosis');
 
 const coreOnly = buildToolSystemContract(CORE);
@@ -43,6 +44,14 @@ assert(/Files only/.test(toolDescription('rename')), 'rename tool is file-only')
 assert(
 	/del \(not rm\)/.test(toolDescription('shell')) && /%TEMP% \(not \/tmp\)/.test(toolDescription('shell')),
 	'shell contract maps Unix habits to cmd.exe'
+);
+assert(
+	!/del \(not rm\)/.test(toolDescription('shell', { shellCmdExeHints: false })),
+	'shell Unix hints can be disabled via profile'
+);
+assert(
+	!/Renaming or removing/.test(buildToolSystemContract(CORE, { renameSearchRule: false })),
+	'rename rule can be disabled via profile'
 );
 
 const withBrowser = buildToolSystemContract([...CORE, 'browser_snapshot', 'browser_click']);
@@ -99,10 +108,12 @@ const expected = [
 	'skill',
 ] as const;
 
-const keys = Object.keys(TOOL_DESCRIPTIONS).sort();
+const keys = Object.keys(TOOL_DESCRIPTIONS)
+	.filter(k => k !== 'shellUnixHints')
+	.sort();
 assert(keys.length === expected.length, `description count ${keys.length} !== ${expected.length}`);
 for (const name of expected) {
-	const d = toolDescription(name);
+	const d = toolDescription(name as typeof expected[number]);
 	assert(typeof d === 'string' && d.trim().length > 20, `thin description: ${name}`);
 }
 assert(/old_string/i.test(toolDescription('edit')), 'edit contract mentions old_string');

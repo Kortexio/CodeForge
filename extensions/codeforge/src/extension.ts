@@ -17,6 +17,7 @@ import { TabEngine } from './tab/tabEngine';
 import { AiSettingsStore } from './settings/aiSettingsStore';
 import { AiSettingsPanel } from './settings/aiSettingsPanel';
 import { showModelQuickPick } from './settings/modelQuickPick';
+import { promptAndRunCalibration, promptAndRunHarnessRevision } from './settings/modelProfileCalibrate';
 import { initApprovalPolicy, getApprovalPolicy } from './policy/approvalPolicy';
 import { initEditJournal, OriginalContentProvider } from './agent/editJournal';
 import { SessionStore } from './sessions/sessionStore';
@@ -64,6 +65,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<CodeFo
     bridge = new VSCodeAIBridge(outputChannel);
     settingsStore = new AiSettingsStore(context);
     setEmbeddingsSettingsStore(settingsStore);
+    await settingsStore.bootstrapSecrets();
     await settingsStore.unifyProfiles(line => outputChannel.appendLine(line));
     sessionStore = new SessionStore(context);
     initApprovalPolicy(context);
@@ -227,6 +229,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<CodeFo
     );
 
     context.subscriptions.push(
+        vscode.commands.registerCommand('codeforge.revokePermissions', async () => {
+            await getApprovalPolicy().revokeAllPermissions();
+            void vscode.window.showInformationMessage(
+                'CodeForge: revoked Allow all, auto-approve tools, and auto-approve edits.'
+            );
+        })
+    );
+
+    context.subscriptions.push(
         vscode.commands.registerCommand('codeforge.toggleAutoApproveEdits', async () => {
             const cfg = vscode.workspace.getConfiguration('codeforge.ai');
             const current = cfg.get<boolean>('autoApproveEdits') === true;
@@ -264,8 +275,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<CodeFo
 
     context.subscriptions.push(
         vscode.commands.registerCommand('codeforge.openSettings', (tab?: string) => {
-            const allowed = new Set(['models', 'mcp', 'guardrails', 'agent']);
-            const initial = allowed.has(String(tab)) ? (tab as 'models' | 'mcp' | 'guardrails' | 'agent') : 'models';
+            const allowed = new Set(['models', 'mcp', 'guardrails', 'agent', 'benchmark']);
+            const initial = allowed.has(String(tab))
+                ? (tab as 'models' | 'mcp' | 'guardrails' | 'agent' | 'benchmark')
+                : 'models';
             AiSettingsPanel.show(context, settingsStore, governance, initial);
         })
     );
@@ -280,6 +293,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<CodeFo
     context.subscriptions.push(
         vscode.commands.registerCommand('codeforge.configureProvider', () => {
             AiSettingsPanel.show(context, settingsStore, governance);
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('codeforge.calibrateModelProfiles', async () => {
+            await promptAndRunCalibration(settingsStore, context.extensionPath, outputChannel);
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('codeforge.reviseHarness', async () => {
+            await promptAndRunHarnessRevision(settingsStore, context.extensionPath, outputChannel);
         })
     );
 

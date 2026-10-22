@@ -49,9 +49,10 @@ export const MAX_STEPS_PROMPT = [
 	'',
 	'STRICT REQUIREMENTS:',
 	'1. Do NOT make any tool calls',
-	'2. State clearly that maximum steps for this agent have been reached',
+	'2. State clearly that the step budget for this turn was reached',
 	'3. Summarize what was actually done (files written/edited, commands run) — do not invent applied patches',
 	'4. List remaining work as concrete next steps (file + change), not as unapplied code blocks',
+	'5. Do not ask the user to type "continue" — the UI offers a Continue button when the budget ends',
 	'',
 	'Any attempt to use tools is a critical violation. Respond with text ONLY.',
 ].join('\n');
@@ -71,7 +72,7 @@ export function stuckWrapPrompt(cause: string): string {
 		'1. Do NOT make any tool calls',
 		'2. State the stop reason above',
 		'3. Summarize what is already known from tool results',
-		'4. Give one concrete next step for the user (file path + change), without pasting a full unapplied patch',
+		'4. Tell the user the next turn must use edit, write, shell, or browser (not only re-read)',
 		'',
 		'Respond with text ONLY.',
 	].join('\n');
@@ -156,6 +157,27 @@ export const DIAG_ONLY_FINISH_NOTE = [
 	'A bug list or plan alone does not finish the task.',
 ].join('\n');
 
+/**
+ * One-shot: build/test green is not enough for runnable apps — launch and observe.
+ * Structural (tool counts) — not reply-text sniffing.
+ */
+export function runtimeVerifyNote(opts?: { sourcePaths?: string[] }): string {
+	const sources = (opts?.sourcePaths ?? []).slice(0, 12).join(', ') || '(changed sources)';
+	return [
+		'RUNTIME VERIFY (one-shot)',
+		`Source files changed: ${sources}`,
+		'Build/test green is not enough. Launch the app (or open it in the browser), then observe the result.',
+		'Do one of:',
+		'- Web / UI: browser_navigate (or click through the flow) then browser_snapshot or browser_screenshot; use the After-state as ground truth.',
+		'- Desktop / local: shell with the project run/start script (or the existing launch command), then check process output or reopen and confirm the feature works.',
+		'Do not treat `npm test` / `dotnet test` / oracle build as this check — those already ran.',
+		'Do not create or edit files under test directories for this check. Prefer existing start/dev/run scripts.',
+		'If the app opens but the feature still fails, call edit and fix, then re-verify.',
+		'If you cannot launch (missing runtime, no display), reply `blocked: <reason>`.',
+		'Only after a successful launch+observe, reply with a short summary.',
+	].join('\n');
+}
+
 /** Finish refused: the oracle is red. `oracleText` is the formatted oracle result. */
 export function oracleRejectNote(oracleText: string): string {
 	return [
@@ -172,9 +194,28 @@ export function finalReplyNote(kind: 'still-red' | 'unverified', command?: strin
 		: '\n\n---\nNote: no build/test was verified after the last changes.';
 }
 
+/** Empty / placeholder blocked reasons the model invents — not real blockers. */
+const EMPTY_BLOCKED_REASONS = new Set([
+	'none',
+	'nothing',
+	'n/a',
+	'na',
+	'-',
+	'—',
+	'.',
+	'no',
+	'ok',
+	'null',
+	'undefined',
+]);
+
 /** The model explicitly declares it cannot finish (`blocked: <reason>`). */
 export function parseBlockedClaim(text: string): string | undefined {
 	const m = /(?:^|\n)\s*(?:\*\*)?(?:blocked|bloqueado)(?:\*\*)?\s*:\s*(.+)/i.exec(String(text || ''));
-	return m ? m[1].trim().slice(0, 400) : undefined;
+	if (!m) return undefined;
+	const reason = m[1].trim().slice(0, 400);
+	const normalized = reason.replace(/[*_`]+/g, '').trim().toLowerCase();
+	if (!normalized || EMPTY_BLOCKED_REASONS.has(normalized)) return undefined;
+	return reason;
 }
 

@@ -7,6 +7,7 @@ import * as vscode from 'vscode';
 
 const GLOBAL_KEY = 'codeforge.ai.approvals.always';
 const EDITS_ALWAYS_KEY = 'codeforge.ai.approvals.editsAlways';
+const MIGRATED_KEY = 'codeforge.ai.approvals.migratedToSettings';
 
 /** File-modification tools that share "Allow all edits". */
 export const EDIT_TOOLS = new Set(['edit', 'write', 'apply_patch', 'rename', 'delete']);
@@ -16,31 +17,37 @@ export type PermissionLevel = 'default' | 'assisted' | 'allowAll';
 export class ApprovalPolicy {
 	private readonly sessionAllowed = new Set<string>();
 	private sessionAllowAllEdits = false;
-	private sessionAllowAll = false;
 
 	constructor(private readonly context: vscode.ExtensionContext) {}
 
+	private cfg() {
+		return vscode.workspace.getConfiguration('codeforge.ai');
+	}
+
+	globalAllowAllEnabled(): boolean {
+		if (this.cfg().get<boolean>('allowAll') === true) return true;
+		if (this.cfg().get<boolean>('fullAgentFreedom') === true) return true;
+		return false;
+	}
+
 	private alwaysAllowed(): Set<string> {
-		const fromState = this.context.globalState.get<string[]>(GLOBAL_KEY) ?? [];
-		const fromConfig =
-			vscode.workspace.getConfiguration('codeforge.ai').get<string[]>('autoApprove') ?? [];
-		return new Set([...fromState, ...fromConfig].map(normalizeTool));
+		const fromConfig = this.cfg().get<string[]>('autoApprove') ?? [];
+		return new Set(fromConfig.map(normalizeTool));
 	}
 
 	/** Setting or persisted "always allow all file edits". */
 	autoApproveEditsEnabled(): boolean {
-		const cfg = vscode.workspace.getConfiguration('codeforge.ai');
-		if (cfg.get<boolean>('autoApproveEdits') === true) {
+		if (this.cfg().get<boolean>('autoApproveEdits') === true) {
 			return true;
 		}
-		return this.context.globalState.get<boolean>(EDITS_ALWAYS_KEY) === true;
+		return false;
 	}
 
 	isAutoApproved(tool: string): boolean {
-		const key = normalizeTool(tool);
-		if (this.sessionAllowAll) {
+		if (this.globalAllowAllEnabled()) {
 			return true;
 		}
+		const key = normalizeTool(tool);
 		if (EDIT_TOOLS.has(key) && (this.sessionAllowAllEdits || this.autoApproveEditsEnabled())) {
 			return true;
 		}
@@ -58,13 +65,19 @@ export class ApprovalPolicy {
 		}
 
 		this.sessionAllowed.add(key);
-		const next = Array.from(new Set([...this.alwaysAllowed(), key]));
-		await this.context.globalState.update(GLOBAL_KEY, next);
-
-		const cfg = vscode.workspace.getConfiguration('codeforge.ai');
+		const cfg = this.cfg();
 		const current = cfg.get<string[]>('autoApprove') ?? [];
 		if (!current.map(normalizeTool).includes(key)) {
 			await cfg.update('autoApprove', [...current, key], vscode.ConfigurationTarget.Global);
+		}
+	}
+
+	async setGlobalAllowAll(enabled: boolean): Promise<void> {
+		await this.cfg().update('allowAll', enabled, vscode.ConfigurationTarget.Global);
+		if (enabled) {
+			await this.allowAutoSession();
+		} else {
+			this.clearSession();
 		}
 	}
 
@@ -75,15 +88,9 @@ export class ApprovalPolicy {
 			this.sessionAllowed.add(t);
 		}
 		if (scope === 'always') {
-			await this.context.globalState.update(EDITS_ALWAYS_KEY, true);
-			await vscode.workspace
-				.getConfiguration('codeforge.ai')
-				.update('autoApproveEdits', true, vscode.ConfigurationTarget.Global);
+			await this.cfg().update('autoApproveEdits', true, vscode.ConfigurationTarget.Global);
 			const next = Array.from(new Set([...this.alwaysAllowed(), ...EDIT_TOOLS]));
-			await this.context.globalState.update(GLOBAL_KEY, Array.from(next));
-			await vscode.workspace
-				.getConfiguration('codeforge.ai')
-				.update('autoApprove', Array.from(next), vscode.ConfigurationTarget.Global);
+			await this.cfg().update('autoApprove', Array.from(next), vscode.ConfigurationTarget.Global);
 		}
 	}
 
@@ -91,20 +98,17 @@ export class ApprovalPolicy {
 	async allowAutoSession(): Promise<void> {
 		await this.allowAllEdits('session');
 		this.sessionAllowed.add('shell');
-		this.sessionAllowAll = true;
 	}
 
 	clearSession(): void {
 		this.sessionAllowed.clear();
 		this.sessionAllowAllEdits = false;
-		this.sessionAllowAll = false;
 	}
 
 	/** Composer permission chip level (does not replace Ask mode). */
 	getPermissionLevel(_mode?: string): PermissionLevel {
-		if (this.sessionAllowAll) return 'allowAll';
-		const preview =
-			vscode.workspace.getConfiguration('codeforge.ai').get<boolean>('previewEdits') === true;
+		if (this.globalAllowAllEnabled()) return 'allowAll';
+		const preview = this.cfg().get<boolean>('previewEdits') === true;
 		if (preview) return 'assisted';
 		return 'default';
 	}
@@ -114,12 +118,14 @@ export class ApprovalPolicy {
 	 * Default/Assisted/Allow all — Auto is no longer a mode).
 	 */
 	async applyPermissionLevel(level: PermissionLevel): Promise<'agent'> {
-		const cfg = vscode.workspace.getConfiguration('codeforge.ai');
+		const cfg = this.cfg();
 		if (level === 'allowAll') {
-			await this.allowAutoSession();
+			await cfg.update('allowAll', true, vscode.ConfigurationTarget.Global);
 			await cfg.update('previewEdits', false, vscode.ConfigurationTarget.Global);
+			await this.allowAutoSession();
 			return 'agent';
 		}
+		await cfg.update('allowAll', false, vscode.ConfigurationTarget.Global);
 		this.clearSession();
 		if (level === 'assisted') {
 			await cfg.update('previewEdits', true, vscode.ConfigurationTarget.Global);
@@ -139,21 +145,42 @@ export class ApprovalPolicy {
 		const key = normalizeTool(tool);
 		this.sessionAllowed.delete(key);
 		const next = Array.from(this.alwaysAllowed()).filter(t => t !== key);
-		await this.context.globalState.update(GLOBAL_KEY, next);
-		await vscode.workspace
-			.getConfiguration('codeforge.ai')
-			.update('autoApprove', next, vscode.ConfigurationTarget.Global);
+		await this.cfg().update('autoApprove', next, vscode.ConfigurationTarget.Global);
 	}
 
 	async revokeAllEditsAlways(): Promise<void> {
 		this.sessionAllowAllEdits = false;
-		await this.context.globalState.update(EDITS_ALWAYS_KEY, false);
-		await vscode.workspace
-			.getConfiguration('codeforge.ai')
-			.update('autoApproveEdits', false, vscode.ConfigurationTarget.Global);
+		await this.cfg().update('autoApproveEdits', false, vscode.ConfigurationTarget.Global);
 		for (const t of EDIT_TOOLS) {
 			await this.revokeAlways(t);
 		}
+	}
+
+	async revokeAllPermissions(): Promise<void> {
+		await this.cfg().update('allowAll', false, vscode.ConfigurationTarget.Global);
+		await this.revokeAllEditsAlways();
+		this.clearSession();
+		await this.cfg().update('autoApprove', [], vscode.ConfigurationTarget.Global);
+	}
+
+	/** Move legacy globalState approval lists into workspace settings once. */
+	async migrateLegacyGlobalState(): Promise<void> {
+		if (this.context.globalState.get<boolean>(MIGRATED_KEY)) return;
+
+		const fromState = this.context.globalState.get<string[]>(GLOBAL_KEY) ?? [];
+		const editsAlways = this.context.globalState.get<boolean>(EDITS_ALWAYS_KEY) === true;
+		const cfg = this.cfg();
+		const current = cfg.get<string[]>('autoApprove') ?? [];
+		const merged = Array.from(new Set([...current, ...fromState].map(normalizeTool)));
+		if (merged.length) {
+			await cfg.update('autoApprove', merged, vscode.ConfigurationTarget.Global);
+		}
+		if (editsAlways) {
+			await cfg.update('autoApproveEdits', true, vscode.ConfigurationTarget.Global);
+		}
+		await this.context.globalState.update(GLOBAL_KEY, undefined);
+		await this.context.globalState.update(EDITS_ALWAYS_KEY, undefined);
+		await this.context.globalState.update(MIGRATED_KEY, true);
 	}
 }
 
@@ -165,6 +192,7 @@ let shared: ApprovalPolicy | undefined;
 
 export function initApprovalPolicy(context: vscode.ExtensionContext): ApprovalPolicy {
 	shared = new ApprovalPolicy(context);
+	void shared.migrateLegacyGlobalState();
 	return shared;
 }
 

@@ -1,0 +1,85 @@
+name: announce-release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Print posts without publishing"
+        required: false
+        default: "true"
+      release_tag:
+        description: "Tag for manual dispatch (optional)"
+        required: false
+        default: ""
+      skip_announce:
+        description: "Skip LinkedIn (true/false)"
+        required: false
+        default: "false"
+
+permissions:
+  contents: read
+
+jobs:
+  linkedin:
+    if: github.repository == 'Kortexio/CodeForge'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 9.0.x
+      - name: Resolve release notes
+        id: notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ github.event.inputs.release_tag }}
+        run: |
+          TAG="${EVENT_TAG:-$INPUT_TAG}"
+          if [ -z "$TAG" ]; then
+            echo "tag=" >> "$GITHUB_OUTPUT"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          # Always fetch from the Releases API so multiline notes survive workflow_dispatch.
+          gh api "repos/${{ github.repository }}/releases/tags/${TAG}" --jq .body > /tmp/release-body.md
+          {
+            echo "body<<EOF"
+            cat /tmp/release-body.md
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          if grep -qiE '\[skip[[:space:]-]?announce\]|skip-announce:\s*true' /tmp/release-body.md; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Publish LinkedIn
+        env:
+          LINKEDIN_CLIENT_ID: ${{ secrets.LINKEDIN_CLIENT_ID }}
+          LINKEDIN_CLIENT_SECRET: ${{ secrets.LINKEDIN_CLIENT_SECRET }}
+          LINKEDIN_REFRESH_TOKEN: ${{ secrets.LINKEDIN_REFRESH_TOKEN }}
+          LINKEDIN_ACCESS_TOKEN: ${{ secrets.LINKEDIN_ACCESS_TOKEN }}
+          LINKEDIN_PERSON_URN: ${{ secrets.LINKEDIN_PERSON_URN }}
+          LINKEDIN_ORG_URN: ${{ secrets.LINKEDIN_ORG_URN }}
+          RELEASE_TAG: ${{ steps.notes.outputs.tag }}
+          RELEASE_BODY: ${{ steps.notes.outputs.body }}
+          REPO_URL: ${{ github.event.repository.html_url }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+          SKIP_ANNOUNCE: ${{ github.event.inputs.skip_announce || steps.notes.outputs.skip || 'false' }}
+        run: |
+          if [ "$SKIP_ANNOUNCE" = "true" ]; then
+            echo "skip-announce requested — skipping LinkedIn."
+            exit 0
+          fi
+          if [ -z "$LINKEDIN_PERSON_URN" ] || [ -z "$RELEASE_TAG" ]; then
+            echo "LINKEDIN_PERSON_URN or RELEASE_TAG missing — skipping."
+            exit 0
+          fi
+          if [ -z "$LINKEDIN_REFRESH_TOKEN" ] && [ -z "$LINKEDIN_ACCESS_TOKEN" ]; then
+            echo "LINKEDIN_REFRESH_TOKEN or LINKEDIN_ACCESS_TOKEN missing — skipping."
+            exit 0
+          fi
+          dotnet run --project tools/linkedin-announcer -- post

@@ -149,6 +149,51 @@ export function normalizeToolProtocolHistory(messages: ToolHistoryMessage[]): nu
 	return changes;
 }
 
+const WIRE_ARG_STRING_MAX = 2000;
+
+function isJsonObject(raw: string): boolean {
+	try {
+		const v = JSON.parse(raw) as unknown;
+		return !!v && typeof v === 'object' && !Array.isArray(v);
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Gateways such as llama-server re-parse every `tool_calls[].function.arguments` in the request
+ * and reject the whole request (HTTP 500) when one of them is not a JSON object. A truncated
+ * write kept verbatim in history therefore fails every later round, including retries.
+ * Valid arguments pass through untouched; invalid ones are repaired (long strings clipped) or
+ * replaced by a small valid stand-in.
+ */
+export function toWireToolArguments(
+	raw: string,
+	repair?: (raw: string) => Record<string, unknown>
+): string {
+	if (isJsonObject(raw)) return raw;
+	let repaired: Record<string, unknown> | undefined;
+	try {
+		repaired = repair?.(raw);
+	} catch {
+		repaired = undefined;
+	}
+	if (repaired && typeof repaired === 'object' && !Array.isArray(repaired)) {
+		const clipped: Record<string, unknown> = {};
+		for (const [k, v] of Object.entries(repaired)) {
+			clipped[k] =
+				typeof v === 'string' && v.length > WIRE_ARG_STRING_MAX
+					? `${v.slice(0, WIRE_ARG_STRING_MAX)}\n…[clipped: showing ${WIRE_ARG_STRING_MAX} of ${v.length} chars of invalid tool arguments]`
+					: v;
+		}
+		return JSON.stringify(clipped);
+	}
+	return JSON.stringify({
+		invalid_arguments: clipData(raw, 400),
+		note: `…[clipped: tool arguments were not valid JSON (${raw.length} chars)]`,
+	});
+}
+
 /**
  * Mid-compact must not start the kept tail on a lone tool message
  * (orphan tool_result after digest drops the owning assistant).

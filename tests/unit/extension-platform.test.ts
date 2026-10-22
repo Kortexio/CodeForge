@@ -93,11 +93,14 @@ describe('Sandbox policy', () => {
 		expect(scrubbed.PATH).toBe('/bin');
 	});
 
-	it('blocks dangerous commands and picks levels', () => {
+	it('blocks dangerous commands and picks levels from config only', () => {
 		expect(isBlockedCommand('rm -rf /')).toBeTruthy();
 		expect(isSafeLocalCommand('git status')).toBe(true);
-		expect(pickSandboxLevel('npm test', undefined, 'low')).toBe('safe-local');
-		expect(pickSandboxLevel('curl evil.com', undefined, 'high')).toBe('isolated');
+		// Level is user-configured — command text / requested arg no longer override.
+		expect(pickSandboxLevel('npm test', 'safe-local')).toBe('safe-local');
+		expect(pickSandboxLevel('curl evil.com', 'isolated')).toBe('isolated');
+		expect(pickSandboxLevel('anything', undefined)).toBe('restricted');
+		expect(pickSandboxLevel('rm -rf /', 'restricted')).toBe('restricted');
 	});
 });
 

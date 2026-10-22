@@ -363,12 +363,26 @@ export function applyEdit(
 
 	if (count === 0) {
 		// Model often invents a broken old_string when the desired new_string is already on disk.
+		// Require a non-empty new_string that is not a substring of old_string and matches on a line boundary.
 		const view = fileText.replaceAll(CRLF, '\n');
 		const neu = newString.replaceAll(CRLF, '\n');
-		const already =
-			view.includes(neu) ||
-			normalizeForMatch(view).includes(normalizeForMatch(neu));
-		if (already) {
+		const neuTrim = neu.trim();
+		const oldView = oldString.replaceAll(CRLF, '\n');
+		const meaningful =
+			neuTrim.length > 0 &&
+			!oldView.includes(neu) &&
+			!normalizeForMatch(oldView).includes(normalizeForMatch(neu));
+		const lineBoundary =
+			meaningful &&
+			(view === neu ||
+				view.startsWith(`${neu}\n`) ||
+				view.endsWith(`\n${neu}`) ||
+				view.includes(`\n${neu}\n`) ||
+				normalizeForMatch(view).includes(`\n${normalizeForMatch(neu)}\n`) ||
+				normalizeForMatch(view) === normalizeForMatch(neu) ||
+				normalizeForMatch(view).startsWith(`${normalizeForMatch(neu)}\n`) ||
+				normalizeForMatch(view).endsWith(`\n${normalizeForMatch(neu)}`));
+		if (lineBoundary) {
 			const idx = view.indexOf(neu);
 			const firstLine =
 				idx >= 0 ? view.slice(0, idx).split('\n').length : 1;

@@ -8,7 +8,10 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
-import { resolveSandboxLevel, runSandboxed, type SandboxLevel } from '../sandbox/runtime';
+import { resolveSandboxLevel, runSandboxed } from '../sandbox/runtime';
+import { killProcessTree } from '../sandbox/processKill';
+import { prepareWindowsCommand } from './shellPrep';
+import { assertWorkspaceWriteAllowed } from './workspaceWriteGate';
 import { clipBuildOutput, clipData, looksLikeBuildTestOutput } from '../agent/clip';
 import { applyEdit, excerptAround } from '../agent/editTool';
 import { applyPatchHunk, parsePatch } from '../agent/applyPatch';
@@ -129,11 +132,7 @@ export class VSCodeAIBridge {
             case 'diagnostics':
                 return this.getDiagnostics(args.path ? String(args.path) : undefined);
             case 'shell':
-                return this.runInTerminal(
-                    String(args.command),
-                    toolCall.abortSignal,
-                    args.sandbox ? (String(args.sandbox) as SandboxLevel) : undefined
-                );
+                return this.runInTerminal(String(args.command), toolCall.abortSignal);
             default:
                 throw new Error(`Unknown bridge tool: ${toolCall.name}`);
         }
@@ -286,6 +285,7 @@ export class VSCodeAIBridge {
 	}
 
     private async writeFile(filePath: string, content: string): Promise<string> {
+        await assertWorkspaceWriteAllowed('write', [filePath], this.getWorkspaceRoot());
         try {
             await getEditJournal().recordBeforeWrite(filePath, p => this.readRaw(p));
         } catch {
@@ -326,6 +326,7 @@ export class VSCodeAIBridge {
         newString: string,
         replaceAll: boolean
     ): Promise<string> {
+        await assertWorkspaceWriteAllowed('edit', [filePath], this.getWorkspaceRoot());
         try {
             await getEditJournal().recordBeforeWrite(filePath, p => this.readRaw(p));
         } catch {
@@ -365,6 +366,10 @@ export class VSCodeAIBridge {
 		if (!parsed.ok) {
 			throw new Error(`apply_patch: ${parsed.error}`);
 		}
+		const patchPaths = parsed.hunks.flatMap(h =>
+			h.type === 'update' ? [h.path, h.movePath].filter(Boolean) as string[] : [h.path]
+		);
+		await assertWorkspaceWriteAllowed('apply_patch', patchPaths, this.getWorkspaceRoot());
 		const applied: string[] = [];
 		const diagPaths: string[] = [];
 		for (const hunk of parsed.hunks) {
@@ -597,6 +602,7 @@ export class VSCodeAIBridge {
     }
 
     private async deleteFile(filePath: string): Promise<string> {
+        await assertWorkspaceWriteAllowed('delete', [filePath], this.getWorkspaceRoot());
         try {
             await getEditJournal().recordBeforeWrite(filePath, p => this.readRaw(p), { deleting: true });
         } catch {
@@ -608,6 +614,7 @@ export class VSCodeAIBridge {
     }
 
     private async renameFile(oldPath: string, newPath: string): Promise<string> {
+        await assertWorkspaceWriteAllowed('rename', [oldPath, newPath], this.getWorkspaceRoot());
         try {
             await getEditJournal().recordBeforeWrite(oldPath, p => this.readRaw(p), { deleting: true });
             await getEditJournal().recordBeforeWrite(newPath, p => this.readRaw(p));
@@ -764,11 +771,7 @@ export class VSCodeAIBridge {
             close: () => {
                 this.agentPty = undefined;
                 for (const child of this.backgroundChildren) {
-                    try {
-                        child.kill();
-                    } catch {
-                        /* ignore */
-                    }
+                    killProcessTree(child);
                 }
                 this.backgroundChildren = [];
             },
@@ -799,19 +802,11 @@ export class VSCodeAIBridge {
     /** Kill foreground + background agent shell processes (Stop). */
     abortRunningShells(): void {
         for (const child of this.backgroundChildren) {
-            try {
-                child.kill();
-            } catch {
-                /* ignore */
-            }
+            killProcessTree(child);
         }
         this.backgroundChildren = [];
         if (this.activeShellChild) {
-            try {
-                this.activeShellChild.kill();
-            } catch {
-                /* ignore */
-            }
+            killProcessTree(this.activeShellChild);
             this.activeShellChild = undefined;
         }
         try {
@@ -821,11 +816,7 @@ export class VSCodeAIBridge {
         }
     }
 
-    private async runInTerminal(
-        command: string,
-        abortSignal?: AbortSignal,
-        sandboxHint?: SandboxLevel
-    ): Promise<string> {
+    private async runInTerminal(command: string, abortSignal?: AbortSignal): Promise<string> {
         const cwd = this.getWorkspaceRoot();
         if (!cwd) {
             throw new Error('No workspace folder open — open a folder before running shell commands');
@@ -836,10 +827,12 @@ export class VSCodeAIBridge {
         }
 
         const prepared = prepareWindowsCommand(command, cwd);
+        if ('notRun' in prepared && prepared.notRun) {
+            this.output.appendLine(`[shell] ${prepared.message}`);
+            return prepared.message;
+        }
         const cfg = vscode.workspace.getConfiguration('codeforge.ai');
         const level = resolveSandboxLevel(prepared.command, {
-            requested: sandboxHint,
-            risk: 'medium',
             configured: cfg.get<string>('shellSandbox'),
             fullFreedom: cfg.get<boolean>('fullAgentFreedom') === true,
         });
@@ -909,7 +902,7 @@ export class VSCodeAIBridge {
                 }
                 abortSignal?.removeEventListener('abort', onAbort);
                 const raw = chunks.join('');
-                const exit = opts?.aborted ? 130 : code ?? 0;
+                const exit = opts?.aborted ? 130 : code ?? 1;
                 if (opts?.aborted) {
                     mirror.write('\x1b[33m[aborted by user]\x1b[0m\r\n');
                 } else if (!opts?.background) {
@@ -943,11 +936,7 @@ export class VSCodeAIBridge {
             this.activeShellChild = child;
 
             const onAbort = () => {
-                try {
-                    child.kill();
-                } catch {
-                    /* ignore */
-                }
+                killProcessTree(child);
                 finish(130, { aborted: true });
             };
             if (abortSignal) {
@@ -985,7 +974,7 @@ export class VSCodeAIBridge {
                 if (!settled) {
                     finish(code);
                 } else {
-                    mirror.write(`\x1b[90m[background exit ${code ?? 0}]\x1b[0m\r\n`);
+                    mirror.write(`\x1b[90m[background exit ${code ?? 1}]\x1b[0m\r\n`);
                 }
             });
 
@@ -1016,60 +1005,3 @@ export function summarizeShellOutput(raw: string, maxChars = 8000): string {
     return looksLikeBuildTestOutput(text) ? clipBuildOutput(text, maxChars) : clipData(text, maxChars);
 }
 
-/**
- * Prefer running under the right cwd instead of `cd path && …`.
- * Keeps && for cmd.exe chaining on Windows.
- */
-function prepareWindowsCommand(
-    command: string,
-    workspaceRoot: string
-): { command: string; cwd: string; display: string; note?: string } {
-    // Strip Unix pipes that fail on cmd.exe before any normalization.
-    const pipeStripped = command
-        .replace(/\s*\|\s*(tail|head|grep)\b[^|&;]*/gi, '')
-        .trim();
-    const pipeNote =
-        pipeStripped !== command.trim()
-            ? 'Removed Unix pipe (tail/head/grep) — shell is cmd.exe.'
-            : undefined;
-    const trimmed = pipeStripped;
-    // cd X && rest  |  cd /d X && rest  |  cd X; rest
-    const cdMatch = /^(?:cd(?:\s+\/d)?)\s+("([^"]+)"|([^\s&;]+))\s*(?:&&|;)\s*([\s\S]+)$/i.exec(
-        trimmed
-    );
-    if (cdMatch) {
-        const target = (cdMatch[2] || cdMatch[3] || '').trim();
-        const rest = (cdMatch[4] || '').trim();
-        if (target && rest) {
-            const abs = path.isAbsolute(target)
-                ? target
-                : path.resolve(workspaceRoot, target);
-            if (fs.existsSync(abs)) {
-                return {
-                    command: rest,
-                    cwd: abs,
-                    display: rest,
-                    note: [pipeNote, `normalized: cwd → ${abs}`].filter(Boolean).join(' | '),
-                };
-            }
-            return {
-                command: rest,
-                cwd: workspaceRoot,
-                display: rest,
-                note: [
-                    pipeNote,
-                    `cwd "${target}" does not exist — using workspace root`,
-                ]
-                    .filter(Boolean)
-                    .join(' | '),
-            };
-        }
-    }
-
-    return {
-        command: trimmed,
-        cwd: workspaceRoot,
-        display: trimmed,
-        note: pipeNote,
-    };
-}

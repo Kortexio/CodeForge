@@ -5,8 +5,10 @@
 
 export interface ChatViewAssets {
 	cspSource: string;
+	cspNonce: string;
 	markedJs: string;
 	hljsJs: string;
+	dompurifyJs: string;
 	hljsCss: string;
 	katexJs: string;
 	katexCss: string;
@@ -20,7 +22,7 @@ export function getChatViewHtml(assets: ChatViewAssets): string {
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${assets.cspSource} https: data:; style-src ${assets.cspSource} 'unsafe-inline'; script-src ${assets.cspSource} 'unsafe-inline'; font-src ${assets.cspSource} data:;">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${assets.cspSource} https: data:; style-src ${assets.cspSource} 'unsafe-inline'; script-src ${assets.cspSource} 'nonce-${assets.cspNonce}'; font-src ${assets.cspSource} data:;">
 <title>CodeForge AI</title>
 <link rel="stylesheet" href="${assets.hljsCss}" />
 <style>
@@ -200,6 +202,15 @@ export function getChatViewHtml(assets: ChatViewAssets): string {
     line-height: 1.4;
     opacity: 0.85;
   }
+  .continue-row { margin: 8px 0 4px; }
+  .continue-btn {
+    font: inherit; font-size: 12px; font-weight: 600;
+    padding: 6px 14px; border-radius: 6px; cursor: pointer;
+    border: 1px solid var(--vscode-button-border, transparent);
+    background: var(--vscode-button-background);
+    color: var(--vscode-button-foreground);
+  }
+  .continue-btn:hover { background: var(--vscode-button-hoverBackground); }
   .msg-actions {
     display: flex; align-items: center; gap: 2px; margin-top: 4px; opacity: 0.55;
   }
@@ -506,9 +517,10 @@ export function getChatViewHtml(assets: ChatViewAssets): string {
     </div>
   </div>
 
-<script src="${assets.markedJs}"></script>
-<script src="${assets.hljsJs}"></script>
-<script>
+<script nonce="${assets.cspNonce}" src="${assets.dompurifyJs}"></script>
+<script nonce="${assets.cspNonce}" src="${assets.markedJs}"></script>
+<script nonce="${assets.cspNonce}" src="${assets.hljsJs}"></script>
+<script nonce="${assets.cspNonce}">
   const vscode = acquireVsCodeApi();
   const LAZY = {
     katexCss: ${JSON.stringify(assets.katexCss)},
@@ -837,7 +849,7 @@ export function getChatViewHtml(assets: ChatViewAssets): string {
   });
   document.getElementById('canvasRunBtn').addEventListener('click', function () {
     canvasOut.textContent = '';
-    vscode.postMessage({ type: 'runPython', code: canvasCode.value });
+    vscode.postMessage({ type: 'runPython', code: canvasCode.value, fromRunButton: true });
   });
   document.getElementById('canvasStopBtn').addEventListener('click', function () {
     vscode.postMessage({ type: 'stopPython' });
@@ -1245,10 +1257,20 @@ export function getChatViewHtml(assets: ChatViewAssets): string {
         )) +
         renderThinking(reasoning, isPending, m.liveStatus) +
         (isPending ? '' : '<div class="msg-body md">' + renderMarkdown(normalizeAssistantContent(body)) + '</div>') +
+        (m.continueAvailable && !busy && !isPending
+          ? '<div class="continue-row"><button type="button" class="continue-btn" data-continue="1">Continue</button></div>'
+          : '') +
         renderActions(m, idx, isPending) +
         '</div>';
     });
     messagesEl.innerHTML = html;
+    messagesEl.querySelectorAll('.continue-btn').forEach(function (btn) {
+      btn.addEventListener('click', function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+        vscode.postMessage({ type: 'continueTurn' });
+      });
+    });
     messagesEl.querySelectorAll('.restore-btn').forEach(function (btn) {
       btn.addEventListener('click', function (e) {
         e.preventDefault();
@@ -1290,7 +1312,8 @@ export function getChatViewHtml(assets: ChatViewAssets): string {
     });
     messagesEl.querySelectorAll('button[data-run-python]').forEach(function (btn) {
       btn.addEventListener('click', function () {
-        showCanvas(btn.getAttribute('data-run-python') || '');
+        var code = btn._code || btn.getAttribute('data-run-python') || '';
+        vscode.postMessage({ type: 'runPython', code: code, fromRunButton: true });
       });
     });
     enhanceMathAndMermaid(messagesEl, messages);
@@ -1362,6 +1385,13 @@ export function getChatViewHtml(assets: ChatViewAssets): string {
     return text;
   }
 
+  function sanitizeHtml(dirty) {
+    if (window.DOMPurify && typeof window.DOMPurify.sanitize === 'function') {
+      return window.DOMPurify.sanitize(dirty, { USE_PROFILES: { html: true } });
+    }
+    return dirty;
+  }
+
   function renderMarkdown(src) {
     var text = preprocessLatex(src);
     if (window.marked) {
@@ -1381,7 +1411,7 @@ export function getChatViewHtml(assets: ChatViewAssets): string {
             return escapeHtml(code);
           },
         });
-        var rendered = marked.parse(text);
+        var rendered = sanitizeHtml(marked.parse(text));
         return postProcessMarkdownHtml(rendered);
       } catch (e) {
         /* fall through */
@@ -1392,7 +1422,7 @@ export function getChatViewHtml(assets: ChatViewAssets): string {
 
   function postProcessMarkdownHtml(html) {
     var div = document.createElement('div');
-    div.innerHTML = html;
+    div.innerHTML = sanitizeHtml(html);
     div.querySelectorAll('pre').forEach(function (pre) {
       var code = pre.querySelector('code');
       var cls = (code && code.className) || '';
@@ -1455,7 +1485,9 @@ export function getChatViewHtml(assets: ChatViewAssets): string {
       var copy = toolbar.querySelector('.copy-code');
       if (copy) copy.addEventListener('click', function () { copyText(raw); });
       var run = toolbar.querySelector('.run-py');
-      if (run) run.addEventListener('click', function () { showCanvas(raw); });
+      if (run) run.addEventListener('click', function () {
+        vscode.postMessage({ type: 'runPython', code: raw, fromRunButton: true });
+      });
     });
     return div.innerHTML;
   }

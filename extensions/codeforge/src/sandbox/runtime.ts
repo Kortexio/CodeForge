@@ -4,6 +4,7 @@
 
 import { spawn, SpawnOptionsWithoutStdio } from 'child_process';
 import * as path from 'path';
+import { killProcessTree } from './processKill';
 
 export type SandboxLevel =
 	| 'safe-local'
@@ -81,14 +82,24 @@ const SAFE_PREFIXES = [
 ];
 
 const BLOCKED_PATTERNS = [
+	/\brm\s+-rf\s+(?:~|\.\.|[\\/])/i,
 	/\brm\s+-rf\s+[\\/]/i,
+	/\brd\s+\/s\b/i,
+	/\brmdir\s+\/s\b/i,
+	/\bremove-item\b[^\n\r;|&]*-recurse\b/i,
+	/\bdel(?:ete)?\b(?:[^\n\r;|&]*\/[fqs]){2,}/i,
 	/\bformat\s+[a-z]:/i,
-	/\bdel\s+\/s\s+\/q\s+[a-z]:\\/i,
 	/\bshutdown\b/i,
 	/\breg\s+delete\b/i,
 	/\bcurl\s+.*\|\s*(sh|bash|powershell)/i,
 	/\bwget\s+.*\|\s*(sh|bash)/i,
 ];
+
+const SHELL_CHAIN_RE = /(?:&&|\|\||\||;)/;
+
+export function hasShellChaining(command: string): boolean {
+	return SHELL_CHAIN_RE.test(command);
+}
 
 const SECRET_ENV_KEYS = [
 	/api[_-]?key/i,
@@ -129,35 +140,24 @@ export function isBlockedCommand(command: string): string | undefined {
 	return undefined;
 }
 
-export function pickSandboxLevel(
-	command: string,
-	requested?: SandboxLevel,
-	risk: 'low' | 'medium' | 'high' = 'medium'
-): SandboxLevel {
-	if (requested) return requested;
-	if (isSafeLocalCommand(command) && risk === 'low') return 'safe-local';
-	if (risk === 'high') return 'isolated';
-	return 'restricted';
+export function pickSandboxLevel(_command: string, configured: SandboxLevel | undefined): SandboxLevel {
+	return configured ?? 'restricted';
 }
 
 /**
- * Resolve the effective sandbox level from settings + optional tool hint.
+ * Resolve the effective sandbox level from `codeforge.ai.shellSandbox` only.
  * `fullAgentFreedom` always wins as unrestricted.
  */
 export function resolveSandboxLevel(
 	command: string,
 	opts?: {
-		requested?: SandboxLevel;
-		risk?: 'low' | 'medium' | 'high';
 		configured?: string | null;
 		fullFreedom?: boolean;
 	}
 ): SandboxLevel {
 	if (opts?.fullFreedom) return 'unrestricted';
-	const configured = isSandboxLevel(opts?.configured) ? opts.configured : undefined;
-	// Tool hint wins over configured default (except unrestricted setting forces floor).
-	if (configured === 'unrestricted') return 'unrestricted';
-	return pickSandboxLevel(command, opts?.requested ?? configured, opts?.risk ?? 'medium');
+	const configured = isSandboxLevel(opts?.configured) ? opts.configured : 'restricted';
+	return pickSandboxLevel(command, configured);
 }
 
 export async function runSandboxed(opts: SandboxOptions): Promise<SandboxResult> {
@@ -168,6 +168,15 @@ export async function runSandboxed(opts: SandboxOptions): Promise<SandboxResult>
 			exitCode: 126,
 			stdout: '',
 			stderr: blocked,
+			level,
+		};
+	}
+
+	if (level === 'safe-local' && hasShellChaining(opts.command)) {
+		return {
+			exitCode: 126,
+			stdout: '',
+			stderr: 'safe-local refuses command chaining (&, &&, |, ;). Run one command at a time or use restricted+.',
 			level,
 		};
 	}
@@ -190,7 +199,7 @@ export async function runSandboxed(opts: SandboxOptions): Promise<SandboxResult>
 	const cmdDefault = isWin && !opts.shell && !opts.args ? cmdExeSpawn(opts.command) : undefined;
 	const args = opts.args ?? cmdDefault?.args ?? (isWin ? ['/d', '/s', '/c', opts.command] : ['-lc', opts.command]);
 	const env =
-		level === 'safe-local' || level === 'unrestricted'
+		level === 'unrestricted'
 			? { ...process.env, ...(opts.env ?? {}) }
 			: scrubEnv({ ...process.env, ...(opts.env ?? {}) });
 
@@ -279,21 +288,13 @@ function spawnOnce(
 		};
 
 		const onAbort = () => {
-			try {
-				child.kill();
-			} catch {
-				/* ignore */
-			}
+			killProcessTree(child);
 			finish(130, { aborted: true });
 		};
 		opts.abortSignal?.addEventListener('abort', onAbort);
 
 		const timer = setTimeout(() => {
-			try {
-				child.kill();
-			} catch {
-				/* ignore */
-			}
+			killProcessTree(child);
 			finish(124, { timedOut: true });
 		}, timeoutMs);
 
@@ -311,6 +312,6 @@ function spawnOnce(
 			chunksErr.push(err.message);
 			finish(1);
 		});
-		child.on('close', code => finish(code ?? 0));
+		child.on('close', code => finish(code ?? 1));
 	});
 }

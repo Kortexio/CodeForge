@@ -1,0 +1,13 @@
+{
+  "id": "CS2-feature-coupon",
+  "category": "feature",
+  "fixture": "billing",
+  "runtime": "dotnet",
+  "title": "Implement Coupons.ApplyCoupon from the docs",
+  "prompt": "Implement `Coupons.ApplyCoupon` as described in `docs/pricing.md` (Coupons section). The coupons are in `config/coupons.json`. Confirm with `dotnet test`.",
+  "protected": ["tests/", "config/"],
+  "checks": [
+    { "type": "contains", "file": "src/Acme.Billing/Coupons.cs", "pattern": "ApplyCoupon\\s*\\(", "why": "ApplyCoupon exists" }
+  ],
+  "bonus": []
+}
