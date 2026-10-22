@@ -23,6 +23,9 @@ let source = fs.readFileSync(preinstallPath, 'utf8');
 
 const oldVersions = `const supportedVersions = ['2022', '2019'];`;
 const newVersions = `const supportedVersions = ['2022', '2019', '18', '2026'];`;
+// Upstream (2026+) uses year/folder objects and already lists VS 2026.
+const upstreamObjectForm =
+	/const supportedVersions = \[[\s\S]*?\{ year: '2026', folder: '18' \}[\s\S]*?\];/.test(source);
 
 if (source.includes(oldVersions)) {
 	source = source.replace(oldVersions, newVersions);
@@ -32,8 +35,8 @@ if (source.includes(oldVersions)) {
 	);
 	fs.writeFileSync(preinstallPath, source, 'utf8');
 	console.log('Patched vscode/build/npm/preinstall.ts to accept Visual Studio 2026 (18)');
-} else if (source.includes(newVersions)) {
-	console.log('VS toolchain patch already applied');
+} else if (source.includes(newVersions) || upstreamObjectForm) {
+	console.log('VS toolchain patch already applied (or upstream includes VS 2026)');
 } else {
 	console.error('Could not find supportedVersions marker in preinstall.ts — upstream may have changed.');
 	process.exit(1);
