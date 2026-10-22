@@ -49,13 +49,18 @@ export function startBgShell(command: string, cwd?: string): BgShellJob {
 	};
 	jobs.set(id, job);
 
-	const cmd = cmdExeSpawn(command);
-	const child = spawn('cmd.exe', cmd.args, {
-		cwd: workDir,
-		windowsHide: true,
-		windowsVerbatimArguments: cmd.windowsVerbatimArguments,
-		env: process.env,
-	});
+	const isWin = process.platform === 'win32';
+	const cmd = isWin ? cmdExeSpawn(command) : undefined;
+	const child = spawn(
+		isWin ? 'cmd.exe' : '/bin/sh',
+		isWin ? cmd!.args : ['-lc', command],
+		{
+			cwd: workDir,
+			windowsHide: true,
+			...(cmd ? { windowsVerbatimArguments: cmd.windowsVerbatimArguments } : {}),
+			env: process.env,
+		}
+	);
 	child.stdout?.on('data', (b: Buffer) => {
 		job.stdout = clip(job.stdout + b.toString('utf8'));
 	});
