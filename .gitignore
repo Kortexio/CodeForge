@@ -89,3 +89,10 @@ vscode/
 BLUEPRINT-02-Open-Source-AI-IDE-Revised-Embedded-AI-Platform.md
 
 benchmarks/results/
+
+# .NET tool build outputs (linkedin-announcer, etc.)
+**/bin/
+**/obj/
+*.user
+*.suo
+
