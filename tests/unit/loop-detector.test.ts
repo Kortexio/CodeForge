@@ -1,4 +1,9 @@
-import { createLoopDetector, hashResult } from '../../extensions/codeforge/src/agent/loopDetector';
+import {
+	createLoopDetector,
+	hashResult,
+	isEffectfulToolName,
+	isExploreToolName,
+} from '../../extensions/codeforge/src/agent/loopDetector';
 
 describe('loopDetector', () => {
 	it('hashResult is stable and differs for different text', () => {
@@ -41,12 +46,31 @@ describe('loopDetector', () => {
 		expect(d.getConsecutiveIdenticalSteps()).toBe(0);
 	});
 
-	it('exploreOnlySteps >= 20 stops', () => {
+	it('many distinct reads do not stop the loop (no explore-step cap)', () => {
 		const d = createLoopDetector();
-		d.setExploreOnlySteps(20);
-		expect(d.getExploreOnlySteps()).toBe(20);
-		expect(d.shouldStop()).toBe(true);
-		expect(d.cause()).toMatch(/explore-only/i);
+		for (let i = 0; i < 40; i++) {
+			d.recordCall(`read:file-${i}`, `hash-${i}`);
+			d.endStep();
+		}
+		expect(d.shouldStop()).toBe(false);
+		expect(d.getConsecutiveIdenticalSteps()).toBe(0);
+	});
+
+	it('isExploreToolName covers read/list but not edit/shell', () => {
+		expect(isExploreToolName('read')).toBe(true);
+		expect(isExploreToolName('list')).toBe(true);
+		expect(isExploreToolName('edit')).toBe(false);
+		expect(isExploreToolName('shell')).toBe(false);
+		expect(isExploreToolName('browser_navigate')).toBe(false);
+	});
+
+	it('isEffectfulToolName is edit/shell/browser — not skill', () => {
+		expect(isEffectfulToolName('edit')).toBe(true);
+		expect(isEffectfulToolName('shell')).toBe(true);
+		expect(isEffectfulToolName('browser_snapshot')).toBe(true);
+		expect(isEffectfulToolName('skill')).toBe(false);
+		expect(isEffectfulToolName('read')).toBe(false);
+		expect(isEffectfulToolName('await_shell')).toBe(false);
 	});
 
 	it('unchangedStreak >= 3 stops', () => {

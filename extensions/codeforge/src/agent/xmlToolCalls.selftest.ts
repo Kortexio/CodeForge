@@ -54,4 +54,48 @@ assert(sh.length === 1 && sh[0].function.name === 'shell', 'json-in-xml');
 
 assert(parseXmlToolCalls('just prose').length === 0, 'no false positive');
 
+const leakedClosers = `<tool_call>
+<function=edit>
+<parameter=path>
+src/a.ts
+</old_string>
+<parameter=old_string>
+foo
+</old_string>
+<parameter=new_string>
+bar
+</new_string>
+</function>
+</tool_call>`;
+const leaked = parseXmlToolCalls(leakedClosers);
+assert(leaked.length === 1 && leaked[0].function.name === 'edit', 'leaked closer edit');
+const larg = JSON.parse(leaked[0].function.arguments) as Record<string, string>;
+assert(
+	larg.path === 'src/a.ts' && larg.old_string === 'foo' && larg.new_string === 'bar',
+	`leaked args=${JSON.stringify(larg)}`
+);
+
+const runaway = `<tool_call>
+<function=edit>
+<parameter=path>x.ts</parameter>
+<parameter=old_string>a</parameter>
+<parameter=new_string>b</parameter>
+</function>
+</tool_call>
+<tool_call>
+<function=edit>
+<parameter=path>x.ts</parameter>
+<parameter=old_string>a</parameter>
+<parameter=new_string>b</parameter>
+</function>
+</tool_call>
+<tool_call>
+<function=edit>
+<parameter=path>x.ts</parameter>
+<parameter=old_string>a</parameter>
+<parameter=new_string>b</parameter>
+</function>
+</tool_call>`;
+assert(parseXmlToolCalls(runaway).length === 1, 'dedupe identical edits');
+
 console.log('xmlToolCalls.selftest: ok');

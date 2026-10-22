@@ -163,8 +163,12 @@ export async function resolveCurrentPlan(
 	const bare = looksLikeBareContinue(opts.task);
 	const sameSession =
 		!opts.sessionId || !plan.sessionId || opts.sessionId === plan.sessionId;
-	const sameTask = plan.taskHash === hashTask(opts.task) || plan.taskHash === hashTask(plan.task);
+	const sameTask = plan.taskHash === hashTask(opts.task);
 
+	if (!sameSession && !bare) {
+		await archiveCurrentPlan(workspaceRoot);
+		return undefined;
+	}
 	if (bare && pending && sameSession) return plan;
 	if (sameTask && pending) return plan;
 	if (!pending) {
@@ -173,10 +177,6 @@ export async function resolveCurrentPlan(
 	}
 	// Unrelated new task: archive stale plan so it does not leak into context.
 	if (!bare && !sameTask) {
-		await archiveCurrentPlan(workspaceRoot);
-		return undefined;
-	}
-	if (!sameSession && !bare) {
 		await archiveCurrentPlan(workspaceRoot);
 		return undefined;
 	}

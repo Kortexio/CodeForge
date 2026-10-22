@@ -1,0 +1,8 @@
+[
+  {
+    "file": "src/pricing/coupons.js",
+    "replace": "module.exports = { COUPONS_FILE, loadCoupons };",
+    "with": "function applyCoupon(cart, code, now = new Date()) {\n\tconst { round2 } = require('../util/money');\n\tconst { subtotal } = require('../cart/totals');\n\tconst coupon = loadCoupons().find(c => c.code.toUpperCase() === String(code || '').toUpperCase());\n\tif (!coupon) throw new Error('INVALID_COUPON');\n\tconst day = now.toISOString().slice(0, 10);\n\tif (day > coupon.expires) throw new Error('EXPIRED_COUPON');\n\tconst sub = subtotal(cart);\n\treturn round2(coupon.type === 'percent' ? (sub * coupon.value) / 100 : Math.min(coupon.value, sub));\n}\n\nmodule.exports = { COUPONS_FILE, loadCoupons, applyCoupon };"
+  },
+  { "file": "src/index.js", "replace": "\tloadCoupons: coupons.loadCoupons,", "with": "\tloadCoupons: coupons.loadCoupons,\n\tapplyCoupon: coupons.applyCoupon," }
+]

@@ -46,12 +46,18 @@ import {
 } from '../agent/projectInstructions';
 import { isWeakModel, resolveWeakModelMode } from '../agent/weakModelProfile';
 import {
+	createProtocolAggregator,
+	flushRunTelemetry,
+	type ProtocolAggregator,
+} from '../agent/protocolTelemetry';
+import {
 	getEditJournal,
 	OriginalContentProvider,
 	absFromRel,
 	type JournalSummary,
 } from '../agent/editJournal';
 
+import { randomBytes } from 'crypto';
 import { getChatViewHtml } from './chatViewHtml';
 import type { ExternalChatHandle, ExternalChatSession } from '../api';
 
@@ -86,6 +92,8 @@ interface ChatMessage {
 	model?: string;
 	/** Live wait label shown while status === 'pending' (Cursor-style Thinking…). */
 	liveStatus?: string;
+	/** Show Continue when the tool loop hit the step budget. */
+	continueAvailable?: boolean;
 }
 
 interface WebviewMessage {
@@ -100,6 +108,7 @@ interface WebviewMessage {
 	id?: unknown;
 	messageIndex?: unknown;
 	code?: unknown;
+	fromRunButton?: unknown;
 }
 
 export class ChatViewProvider implements vscode.WebviewViewProvider {
@@ -137,10 +146,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 	private _pendingImages: Array<{ mime: string; dataUrl: string; label?: string }> = [];
 	private _hasAgentsMd = false;
 	private _running = false;
+	/** Last tool-loop exit reason from runAgentWithTools (for Continue button). */
+	private _lastLoopExit: 'budget' | 'stuck' | 'length' | 'done' | 'cancelled' | 'error' | undefined;
 	private _queue: Array<{ id: string; text: string; mode?: AgentMode }> = [];
 	/** Set by /cards, /plan-run and /review for the next run only. */
 	private _runKind?: 'cards' | 'plan-run' | 'review';
 	private _currentTurn = 0;
+	/** Protocol telemetry for the in-flight turn (flushed when the turn ends). */
+	private _protocolAgg: ProtocolAggregator | undefined;
+	private _protocolMeta:
+		| { serverId: string; model: string; startedAt: number }
+		| undefined;
 	private _openSessionIds: string[] = [];
 	private _turnReasoning = '';
 	private _turnTimings: MessageTimings | undefined;
@@ -235,8 +251,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		vscode.workspace.onDidChangeConfiguration(e => {
 			if (
 				e.affectsConfiguration('codeforge.ai.collapseToolCards') ||
-				e.affectsConfiguration('codeforge.ai.enabled')
+				e.affectsConfiguration('codeforge.ai.enabled') ||
+				e.affectsConfiguration('codeforge.ai.allowAll')
 			) {
+				if (e.affectsConfiguration('codeforge.ai.allowAll')) {
+					try {
+						this._permissions = getApprovalPolicy().getPermissionLevel(this._mode);
+					} catch {
+						/* ignore */
+					}
+					this.pushConfig();
+				}
 				this.updateView();
 			}
 		});
@@ -387,6 +412,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 						message.mode as AgentMode | undefined
 					);
 					break;
+				case 'continueTurn':
+					await this.handleContinueTurn();
+					break;
 				case 'setMode':
 					await this.setMode(normalizeMode(message.mode));
 					break;
@@ -477,6 +505,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 					await this.regenerateAt(Number(message.messageIndex ?? -1));
 					break;
 				case 'runPython':
+					if (message.fromRunButton !== true) {
+						break;
+					}
 					await this.runPython(String(message.code ?? ''));
 					break;
 				case 'stopPython':
@@ -661,30 +692,45 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		}
 		this._turnReasoning = '';
 		this._turnTimings = undefined;
+		this._protocolAgg = createProtocolAggregator();
+		this._protocolMeta = {
+			serverId: server?.id || 'unknown',
+			model: model || 'unknown',
+			startedAt: Date.now(),
+		};
 		this.updateView();
 		this.pushQueue();
 
+		this._lastLoopExit = undefined;
+		let loopExit = 'done';
 		try {
 			const reply = await this.executeLocalAgent(agentTask, images);
 			if (!this._cancelled) {
+				loopExit = this._lastLoopExit ?? 'done';
 				const extra = {
 					reasoning: this._turnReasoning || undefined,
 					timings: this._turnTimings,
+					continueAvailable: loopExit === 'budget',
 				};
 				this.updateLastMessage('assistant', reply, undefined, extra);
 				await this._sessions.appendMessage(
 					this._currentSessionId,
 					'assistant',
 					reply,
-					extra
+					{ reasoning: extra.reasoning, timings: extra.timings }
 				);
-				await this._sessions.updateState(this._currentSessionId, 'completed');
+				await this._sessions.updateState(
+					this._currentSessionId,
+					loopExit === 'budget' ? 'failed' : 'completed'
+				);
 			} else {
+				loopExit = 'cancelled';
 				await this._sessions.updateState(this._currentSessionId, 'cancelled');
 			}
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			if (this._cancelled || /abort/i.test(message)) {
+				loopExit = 'cancelled';
 				this.updateLastMessage('assistant', 'Cancelled.');
 				if (this._currentSessionId) {
 					const session = this._sessions.get(this._currentSessionId);
@@ -695,6 +741,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 					await this._sessions.updateState(this._currentSessionId, 'cancelled');
 				}
 			} else {
+				loopExit = 'error';
 				this.updateLastMessage('assistant', `Error: ${message}`);
 				if (this._currentSessionId) {
 					await this._sessions.appendMessage(
@@ -706,6 +753,23 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 				}
 			}
 		} finally {
+			try {
+				if (this._protocolAgg && this._protocolMeta) {
+					flushRunTelemetry({
+						serverId: this._protocolMeta.serverId,
+						model: this._protocolMeta.model,
+						source: 'chat',
+						sessionId: this._currentSessionId ?? undefined,
+						loopExit,
+						elapsedMs: Date.now() - this._protocolMeta.startedAt,
+						aggregator: this._protocolAgg,
+					});
+				}
+			} catch {
+				/* best-effort */
+			}
+			this._protocolAgg = undefined;
+			this._protocolMeta = undefined;
 			this._abort = undefined;
 			this._pendingImages = [];
 			this._running = false;
@@ -715,6 +779,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			this.updateView();
 			await this.drainQueue();
 		}
+	}
+
+	private observeActivity(ev: AgentActivityEvent): void {
+		this.pushActivity(ev);
+		this._protocolAgg?.observe(ev);
 	}
 
 	private enqueueMessage(text: string, mode?: AgentMode): void {
@@ -1206,8 +1275,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 				numCtx,
 				forceJson: server.forceJson === true,
 				sampling: server.sampling,
+				serverId: server.id,
 				onStatus: text => this.setPendingLiveStatus(text),
-				onActivity: ev => this.pushActivity(ev),
+				onActivity: ev => this.observeActivity(ev),
+				onLoopExit: exit => {
+					this._lastLoopExit = exit;
+				},
 				onContextBadge: badge => {
 					this._contextBadge = badge;
 					this.pushConfig();
@@ -1248,8 +1321,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 				numCtx,
 				forceJson: server.forceJson === true,
 				sampling: server.sampling,
+				serverId: server.id,
 				onStatus: text => this.setPendingLiveStatus(text),
-				onActivity: ev => this.pushActivity(ev),
+				onActivity: ev => this.observeActivity(ev),
+				onLoopExit: exit => {
+					this._lastLoopExit = exit;
+				},
 				onContextBadge: badge => {
 					this._contextBadge = badge;
 					this.pushConfig();
@@ -1303,8 +1380,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			numCtx,
 			forceJson: server.forceJson === true,
 			sampling: server.sampling,
+			serverId: server.id,
 			onStatus: text => this.setPendingLiveStatus(text),
-			onActivity: ev => this.pushActivity(ev),
+			onActivity: ev => this.observeActivity(ev),
+			onLoopExit: exit => {
+				this._lastLoopExit = exit;
+			},
 			onContextBadge: badge => {
 				this._contextBadge = badge;
 				this.pushConfig();
@@ -1671,7 +1752,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		role: 'user' | 'assistant',
 		content: string,
 		status?: string,
-		extra?: { reasoning?: string; timings?: MessageTimings }
+		extra?: { reasoning?: string; timings?: MessageTimings; continueAvailable?: boolean }
 	) {
 		const lastIndex = this._messages.length - 1;
 		if (lastIndex >= 0 && this._messages[lastIndex].role === role) {
@@ -1686,8 +1767,26 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			if (extra?.timings !== undefined) {
 				this._messages[lastIndex].timings = extra.timings;
 			}
+			if (extra?.continueAvailable) {
+				this._messages[lastIndex].continueAvailable = true;
+			} else {
+				delete this._messages[lastIndex].continueAvailable;
+			}
 		}
 		this.updateView();
+	}
+
+	/** Structured resume after step-budget exhaustion (Continue button — not text "continue"). */
+	private async handleContinueTurn(): Promise<void> {
+		if (this._running) return;
+		const last = this._messages[this._messages.length - 1];
+		if (last?.role === 'assistant') {
+			delete last.continueAvailable;
+			this.updateView();
+		}
+		await this.runTask(
+			'Continue the unfinished work from the previous turn. Pick up from the last tool results and remaining plan items.'
+		);
 	}
 
 	/** Cursor-style muted status line (e.g. "Planning next moves") — not a tool audit log. */
@@ -1898,6 +1997,23 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 	private async runPython(code: string): Promise<void> {
 		this.stopPython();
 		const trimmed = code.trim();
+		const confirmRun =
+			vscode.workspace.getConfiguration('codeforge.ai').get<boolean>('confirmRunPython') === true;
+		if (confirmRun) {
+			const ok = await vscode.window.showWarningMessage(
+				'Run this Python snippet from the chat?',
+				{ modal: true },
+				'Run'
+			);
+			if (ok !== 'Run') {
+				void this._view?.webview.postMessage({
+					type: 'pythonResult',
+					ok: false,
+					output: 'Run cancelled.',
+				});
+				return;
+			}
+		}
 		if (!trimmed) {
 			void this._view?.webview.postMessage({
 				type: 'pythonResult',
@@ -1998,8 +2114,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		const base = ['resources', 'webview'] as const;
 		return getChatViewHtml({
 			cspSource: webview.cspSource,
+			cspNonce: randomBytes(16).toString('base64'),
 			markedJs: asUri(...base, 'marked.umd.js'),
 			hljsJs: asUri(...base, 'highlight.min.js'),
+			dompurifyJs: asUri(...base, 'purify.min.js'),
 			hljsCss: asUri(...base, 'github-dark.min.css'),
 			katexJs: asUri(...base, 'katex.min.js'),
 			katexCss: asUri(...base, 'katex.min.css'),

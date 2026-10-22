@@ -1,15 +1,17 @@
 /**
  * CodeForge AI Settings — Cursor-like editor panel
  *
- * Tabs: Models · MCP · Guardrails · Agent · Plugins
+ * Tabs: Models · MCP · Guardrails · Agent · Benchmark · Plugins
  * - Models / MCP / Guardrails: catalog UIs (same surface the Settings TOC opens)
  * - Agent: codeforge.ai.* prefs (shared with Settings TOC → AI → Agent)
+ * - Benchmark: calibrate weak vs strong model profiles (packaged harness suite)
  * - Plugins: marketplace (Discover / Featured) — Cursor Customize layout
  *
  * Quick model switch while coding stays on QuickPick (separate command).
  */
 
 import * as vscode from 'vscode';
+import { randomBytes } from 'crypto';
 import {
 	AiSettingsStore,
 	AiSettingsState,
@@ -27,8 +29,15 @@ import {
 	isPluginInstalled,
 } from './pluginsCatalog';
 import { getApprovalPolicy } from '../policy/approvalPolicy';
+import { maskStateForWebview, MASKED_SECRET } from './aiSecrets';
+import {
+	calibrateUnavailableMessage,
+	findBenchScript,
+	runHarnessRevision,
+	runModelProfileCalibration,
+} from './modelProfileCalibrate';
 
-export type AiSettingsTab = 'models' | 'mcp' | 'guardrails' | 'agent' | 'plugins';
+export type AiSettingsTab = 'models' | 'mcp' | 'guardrails' | 'agent' | 'benchmark' | 'plugins';
 
 type AgentPrefs = {
 	enabled: boolean;
@@ -40,6 +49,9 @@ type AgentPrefs = {
 	previewEdits: boolean;
 	shellSandbox: string;
 	fullAgentFreedom: boolean;
+	allowAll: boolean;
+	confirmRunPython: boolean;
+	outsideWorkspaceWrites: string;
 	traceLevel: string;
 	tabCompletion: boolean;
 	agentCheckpointSteps: number;
@@ -68,6 +80,9 @@ function readAgentPrefs(): AgentPrefs {
 				? shellSandbox
 				: 'restricted',
 		fullAgentFreedom: cfg.get<boolean>('fullAgentFreedom', false),
+		allowAll: cfg.get<boolean>('allowAll', false),
+		confirmRunPython: cfg.get<boolean>('confirmRunPython', false),
+		outsideWorkspaceWrites: cfg.get<string>('outsideWorkspaceWrites', 'ask'),
 		traceLevel: cfg.get<string>('traceLevel', 'basic'),
 		tabCompletion: cfg.get<boolean>('tabCompletion', true),
 		agentCheckpointSteps: cfg.get<number>('agentCheckpointSteps', 30),
@@ -109,15 +124,28 @@ export class AiSettingsPanel {
 			}
 		);
 
-		AiSettingsPanel.current = new AiSettingsPanel(panel, store, governance, tab);
+		AiSettingsPanel.current = new AiSettingsPanel(
+			panel,
+			store,
+			governance,
+			tab,
+			context.extensionPath,
+			context
+		);
 		return AiSettingsPanel.current;
 	}
+
+	private calibrateBusy = false;
+	private readonly webviewNonce = randomBytes(16).toString('base64');
+	private readonly freedomSnapshotKey = 'codeforge.ai.fullFreedom.snapshot';
 
 	private constructor(
 		panel: vscode.WebviewPanel,
 		private readonly store: AiSettingsStore,
 		private readonly governance: GovernanceStore,
-		initialTab: AiSettingsTab
+		initialTab: AiSettingsTab,
+		private readonly extensionPath: string,
+		private readonly extensionContext: vscode.ExtensionContext
 	) {
 		this.panel = panel;
 		this.panel.iconPath = undefined;
@@ -150,6 +178,10 @@ export class AiSettingsPanel {
 			state: sanitizeForWebview(state),
 			governance: this.governance.getState(),
 			agent: readAgentPrefs(),
+			calibrate: {
+				available: !!findBenchScript(this.extensionPath),
+				busy: this.calibrateBusy,
+			},
 		});
 	}
 
@@ -161,13 +193,34 @@ export class AiSettingsPanel {
 				this.postState();
 				return;
 
+			case 'revokePermissions':
+				await getApprovalPolicy().revokeAllPermissions();
+				this.postState();
+				return;
+
+			case 'revokeAutoApproveTool': {
+				const tool = String(msg.tool ?? '').trim();
+				if (tool) await getApprovalPolicy().revokeAlways(tool);
+				this.postState();
+				return;
+			}
+
 			case 'updateAgentPrefs': {
 				const prefs = msg.prefs as Partial<AgentPrefs>;
 				const cfg = vscode.workspace.getConfiguration('codeforge.ai');
+				const wasFreedom = cfg.get<boolean>('fullAgentFreedom') === true;
 				let next = { ...prefs };
-				if (next.fullAgentFreedom === true) {
+				if (next.fullAgentFreedom === true && !wasFreedom) {
+					await this.extensionContext.globalState.update(this.freedomSnapshotKey, {
+						allowAll: cfg.get<boolean>('allowAll'),
+						shellSandbox: cfg.get<string>('shellSandbox'),
+						autoApproveEdits: cfg.get<boolean>('autoApproveEdits'),
+						previewEdits: cfg.get<boolean>('previewEdits'),
+						autoApprove: cfg.get<string[]>('autoApprove') ?? [],
+					});
 					next = {
 						...next,
+						allowAll: true,
 						shellSandbox: 'unrestricted',
 						autoApproveEdits: true,
 						previewEdits: false,
@@ -176,10 +229,42 @@ export class AiSettingsPanel {
 						),
 					};
 					try {
-						await getApprovalPolicy().allowAutoSession();
+						await getApprovalPolicy().setGlobalAllowAll(true);
 					} catch {
 						/* policy may not be ready in settings-only path */
 					}
+				}
+				if (next.fullAgentFreedom === false && wasFreedom) {
+					const snap = this.extensionContext.globalState.get<{
+						allowAll?: boolean;
+						shellSandbox?: string;
+						autoApproveEdits?: boolean;
+						previewEdits?: boolean;
+						autoApprove?: string[];
+					}>(this.freedomSnapshotKey);
+					if (snap) {
+						if (snap.allowAll !== undefined) next.allowAll = snap.allowAll;
+						if (snap.shellSandbox) next.shellSandbox = snap.shellSandbox;
+						if (snap.autoApproveEdits !== undefined) next.autoApproveEdits = snap.autoApproveEdits;
+						if (snap.previewEdits !== undefined) next.previewEdits = snap.previewEdits;
+						if (snap.autoApprove) next.autoApprove = snap.autoApprove;
+					}
+					try {
+						getApprovalPolicy().clearSession();
+					} catch {
+						/* ignore */
+					}
+					await this.extensionContext.globalState.update(this.freedomSnapshotKey, undefined);
+				}
+				if (next.allowAll === true && next.fullAgentFreedom !== true) {
+					try {
+						await getApprovalPolicy().setGlobalAllowAll(true);
+					} catch {
+						/* ignore */
+					}
+				}
+				if (next.allowAll === false) {
+					await cfg.update('allowAll', false, vscode.ConfigurationTarget.Global);
 				}
 				const entries: Array<[keyof AgentPrefs, unknown]> = [
 					['enabled', next.enabled],
@@ -191,6 +276,9 @@ export class AiSettingsPanel {
 					['previewEdits', next.previewEdits],
 					['shellSandbox', next.shellSandbox],
 					['fullAgentFreedom', next.fullAgentFreedom],
+					['allowAll', next.allowAll],
+					['confirmRunPython', next.confirmRunPython],
+					['outsideWorkspaceWrites', next.outsideWorkspaceWrites],
 					['traceLevel', next.traceLevel],
 					['tabCompletion', next.tabCompletion],
 					['agentCheckpointSteps', next.agentCheckpointSteps],
@@ -224,7 +312,7 @@ export class AiSettingsPanel {
 				if (idx < 0) return;
 				// Preserve apiKey if webview sent masked placeholder
 				const prev = state.servers[idx];
-				if (server.apiKey === '••••••••' || server.apiKey === undefined) {
+				if (server.apiKey === MASKED_SECRET || server.apiKey === undefined) {
 					server.apiKey = prev.apiKey;
 				}
 				state.servers[idx] = server;
@@ -485,6 +573,166 @@ export class AiSettingsPanel {
 				void vscode.window.showInformationMessage('Reset to built-in defaults');
 				return;
 			}
+			case 'calibrateProfiles': {
+				await this.runCalibrateFromUi({
+					model: String(msg.model || ''),
+					reps: Number(msg.reps) || 3,
+				});
+				return;
+			}
+			case 'reviseHarness': {
+				await this.runReviseFromUi({
+					model: String(msg.model || ''),
+					reps: Number(msg.reps) || 3,
+				});
+				return;
+			}
+			case 'openCalibrateReport': {
+				const p = String(msg.path || '');
+				if (p) {
+					try {
+						await vscode.window.showTextDocument(vscode.Uri.file(p));
+					} catch (err) {
+						void vscode.window.showWarningMessage(
+							err instanceof Error ? err.message : String(err)
+						);
+					}
+				}
+				return;
+			}
+		}
+	}
+
+	private async runReviseFromUi(opts: { model: string; reps: number }): Promise<void> {
+		if (this.calibrateBusy) {
+			void vscode.window.showWarningMessage('A benchmark is already running.');
+			return;
+		}
+		if (!findBenchScript(this.extensionPath)) {
+			void vscode.window.showErrorMessage(calibrateUnavailableMessage());
+			return;
+		}
+		const state = this.store.getState();
+		this.calibrateBusy = true;
+		this.postState();
+		this.panel.webview.postMessage({
+			type: 'calibrateProgress',
+			message: 'Revising harness: proposer, then T2 and T4 × 3…',
+		});
+		const result = await vscode.window.withProgress(
+			{
+				location: vscode.ProgressLocation.Notification,
+				title: 'Revising harness',
+				cancellable: true,
+			},
+			async (progress, token) => {
+				progress.report({ message: 'Starting…' });
+				return runHarnessRevision({
+					model: opts.model,
+					reps: Math.max(3, opts.reps || 3),
+					serverId: state.activeServerId ?? undefined,
+					extensionPath: this.extensionPath,
+					token,
+					onLine: line => {
+						const noteworthy =
+							line.startsWith('===') ||
+							/^(PASS|FAIL|KEPT|REVERTED|Diagnosis|Harness file|Harness revision|Selection suite|Protocol )/.test(
+								line
+							);
+						if (noteworthy) {
+							this.panel.webview.postMessage({ type: 'calibrateProgress', message: line });
+						}
+						if (line.startsWith('=== revise') || line.startsWith('KEPT') || line.startsWith('REVERTED')) {
+							progress.report({ message: line.replace(/^===\s*/, '').replace(/\s*===$/, '') });
+						}
+					},
+				});
+			}
+		);
+		this.calibrateBusy = false;
+		this.postState();
+		this.panel.webview.postMessage({
+			type: 'calibrateResult',
+			ok: result.ok,
+			summary: result.summary,
+			error: result.error,
+		});
+	}
+
+	private async runCalibrateFromUi(opts: {
+		model: string;
+		reps: number;
+	}): Promise<void> {
+		if (this.calibrateBusy) {
+			void vscode.window.showWarningMessage('Calibration is already running.');
+			return;
+		}
+		if (!findBenchScript(this.extensionPath)) {
+			void vscode.window.showErrorMessage(calibrateUnavailableMessage());
+			this.panel.webview.postMessage({
+				type: 'calibrateResult',
+				ok: false,
+				error: calibrateUnavailableMessage(),
+			});
+			return;
+		}
+		const state = this.store.getState();
+		this.calibrateBusy = true;
+		this.postState();
+		this.panel.webview.postMessage({
+			type: 'calibrateProgress',
+			message: 'Starting suite (T2, T4, CS2, CS3)…',
+		});
+
+		const result = await vscode.window.withProgress(
+			{
+				location: vscode.ProgressLocation.Notification,
+				title: 'Calibrating model profiles',
+				cancellable: true,
+			},
+			async (progress, token) => {
+				progress.report({ message: 'Starting…' });
+				return runModelProfileCalibration({
+					model: opts.model,
+					reps: opts.reps,
+					serverId: state.activeServerId ?? undefined,
+					extensionPath: this.extensionPath,
+					token,
+					onLine: line => {
+						// Skip bulky headless JSON dumps; keep suite progress lines for the UI.
+						const noteworthy =
+							line.startsWith('===') ||
+							/^(PASS|FAIL|Merged|Wrote|# Calibration)/.test(line) ||
+							line.startsWith('| ');
+						if (noteworthy) {
+							this.panel.webview.postMessage({ type: 'calibrateProgress', message: line });
+						}
+						if (line.startsWith('=== calibrate')) {
+							progress.report({
+								message: line.replace(/^===\s*/, '').replace(/\s*===$/, ''),
+							});
+						}
+					},
+				});
+			}
+		);
+
+		this.calibrateBusy = false;
+		this.postState();
+		this.panel.webview.postMessage({
+			type: 'calibrateResult',
+			ok: result.ok,
+			summary: result.summary,
+			reportPath: result.reportPath,
+			reportMarkdown: result.reportMarkdown,
+			error: result.error,
+		});
+		if (result.ok) {
+			void vscode.window.showInformationMessage(
+				'Calibration finished. Profiles updated under ~/.CodeForge/ai/model-profiles/.'
+			);
+		} else if (result.error && result.error !== 'Calibration cancelled.') {
+			void vscode.window.showErrorMessage(result.error);
 		}
 	}
 
@@ -508,6 +756,7 @@ export class AiSettingsPanel {
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${this.webviewNonce}';">
 <title>CodeForge Settings</title>
 <style>
   :root {
@@ -726,6 +975,7 @@ export class AiSettingsPanel {
     <button class="${tabActive('mcp')}" data-tab="mcp">MCP</button>
     <button class="${tabActive('guardrails')}" data-tab="guardrails">Guardrails</button>
     <button class="${tabActive('agent')}" data-tab="agent">Agent</button>
+    <button class="${tabActive('benchmark')}" data-tab="benchmark">Benchmark</button>
     <button class="${tabActive('plugins')}" data-tab="plugins">Plugins</button>
   </aside>
   <main class="main${initialTab === 'plugins' ? ' plugins-wide' : ''}" id="settingsMain">
@@ -802,6 +1052,19 @@ export class AiSettingsPanel {
         <div class="row"><label>Auto-approve tools (comma-separated)</label><input type="text" id="agentAutoApprove" placeholder="read, list, grep" /></div>
         <div class="row"><label><input type="checkbox" id="agentAutoApproveEdits" /> Auto-approve file edits</label></div>
         <div class="row"><label><input type="checkbox" id="agentPreviewEdits" /> Preview edits before write</label></div>
+        <div class="row"><label><input type="checkbox" id="agentAllowAll" /> Allow all tools (no approval prompts)</label></div>
+        <div class="row"><label><input type="checkbox" id="agentConfirmRunPython" /> Confirm before Run Python</label></div>
+        <div class="row"><label>Outside workspace writes</label>
+          <select id="agentOutsideWrites">
+            <option value="ask">ask</option>
+            <option value="allow">allow</option>
+            <option value="deny">deny</option>
+          </select>
+        </div>
+        <div class="actions">
+          <button class="secondary" id="agentRevokePermissions">Revoke all permissions</button>
+        </div>
+        <div id="autoApproveRevokeList" class="hint"></div>
         <h2>Shell sandbox</h2>
         <p class="subtitle" style="margin-top:0">Controls how agent shell commands run. Does not replace the chat Allow all chip for approvals.</p>
         <div class="row"><label>Default sandbox</label>
@@ -829,6 +1092,33 @@ export class AiSettingsPanel {
           <button class="primary" id="agentSave">Save</button>
         </div>
       </div></div>
+      <p class="subtitle" style="margin-top:16px">Per-model harness calibration lives under <strong>Benchmark</strong>.</p>
+    </section>
+
+    <section id="tab-benchmark" class="split ${tabActive('benchmark')}">
+      <h1>Benchmark</h1>
+      <p class="subtitle">Pick a model. The harness runs the suite and classifies it as weak or strong from protocol results (not from the name). Profile stays local under ~/.CodeForge/ai/model-profiles/.</p>
+      <div class="card" id="calibrateCard"><div class="card-body">
+        <h2>Calibrate model profile</h2>
+        <p class="subtitle" style="margin-top:0">Suite: T2, T4, CS2, CS3. Clean tool protocol → strong knobs (less overhead); otherwise weak defaults. Long-running — notification progress; cancel anytime.</p>
+        <div class="row"><label>Model</label>
+          <select id="calibrateModel"></select>
+        </div>
+        <div class="row"><label>Reps per task</label>
+          <select id="calibrateReps">
+            <option value="1">1 (faster smoke · 4 runs)</option>
+            <option value="3" selected>3 (full · 12 runs)</option>
+          </select>
+        </div>
+        <p id="calibrateHint" class="subtitle" style="margin-top:0"></p>
+        <div class="actions">
+          <button class="primary" id="calibrateRun">Run benchmark &amp; calibrate</button>
+          <button type="button" id="reviseHarness">Revise harness</button>
+          <button type="button" id="calibrateOpenReport" style="display:none">Open last report</button>
+        </div>
+        <pre id="calibrateLog" style="margin-top:12px;max-height:220px;overflow:auto;font-size:11px;white-space:pre-wrap;display:none"></pre>
+        <div id="calibrateSummary" class="subtitle" style="margin-top:8px;white-space:pre-wrap"></div>
+      </div></div>
     </section>
 
     <section id="tab-plugins" class="split ${tabActive('plugins')}">
@@ -852,12 +1142,14 @@ export class AiSettingsPanel {
     </section>
   </main>
 </div>
-<script>
+<script nonce="${this.webviewNonce}">
   const vscode = acquireVsCodeApi();
   const PLUGIN_CATALOG = ${JSON.stringify(PLUGIN_CATALOG)};
   let state = { servers: [], activeServerId: null, activeModel: null, mcpServers: [] };
   let governance = { skills: [], rules: [], policies: [], guardrails: [] };
   let agent = {};
+  let calibrateMeta = { available: false, busy: false };
+  let lastCalibrateReport = '';
   let govKind = 'skills';
   let agentDirty = false;
   let pluginsFilter = 'all';
@@ -875,6 +1167,7 @@ export class AiSettingsPanel {
     const main = document.getElementById('settingsMain');
     if (main) main.classList.toggle('plugins-wide', tab === 'plugins');
     if (tab === 'plugins') renderPlugins();
+    if (tab === 'benchmark') renderCalibrate();
   }
 
   document.querySelectorAll('.nav button').forEach(btn => {
@@ -960,6 +1253,9 @@ export class AiSettingsPanel {
         previewEdits: document.getElementById('agentPreviewEdits').checked,
         shellSandbox: document.getElementById('agentShellSandbox').value,
         fullAgentFreedom: document.getElementById('agentFullFreedom').checked,
+        allowAll: document.getElementById('agentAllowAll').checked,
+        confirmRunPython: document.getElementById('agentConfirmRunPython').checked,
+        outsideWorkspaceWrites: document.getElementById('agentOutsideWrites').value,
         traceLevel: document.getElementById('agentTrace').value,
         tabCompletion: document.getElementById('agentTabCompletion').checked,
         agentCheckpointSteps: Number(document.getElementById('agentCheckpoint').value),
@@ -968,6 +1264,39 @@ export class AiSettingsPanel {
       }
     });
     agentDirty = false;
+  });
+
+  function renderAutoApproveRevoke(tools) {
+    const host = document.getElementById('autoApproveRevokeList');
+    if (!host) return;
+    host.innerHTML = '';
+    if (!tools || !tools.length) {
+      host.textContent = 'No per-tool always-allow entries.';
+      return;
+    }
+    tools.forEach(function (tool) {
+      const row = document.createElement('div');
+      row.style.display = 'flex';
+      row.style.gap = '8px';
+      row.style.alignItems = 'center';
+      row.style.marginTop = '4px';
+      const name = document.createElement('code');
+      name.textContent = tool;
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'secondary';
+      btn.textContent = 'Revoke';
+      btn.addEventListener('click', function () {
+        vscode.postMessage({ type: 'revokeAutoApproveTool', tool: tool });
+      });
+      row.appendChild(name);
+      row.appendChild(btn);
+      host.appendChild(row);
+    });
+  }
+
+  document.getElementById('agentRevokePermissions').addEventListener('click', function () {
+    vscode.postMessage({ type: 'revokePermissions' });
   });
 
   function renderAgent() {
@@ -985,9 +1314,88 @@ export class AiSettingsPanel {
     document.getElementById('agentPreviewEdits').checked = !!agent.previewEdits;
     document.getElementById('agentShellSandbox').value = agent.shellSandbox || 'restricted';
     document.getElementById('agentFullFreedom').checked = !!agent.fullAgentFreedom;
+    document.getElementById('agentAllowAll').checked = !!agent.allowAll;
+    document.getElementById('agentConfirmRunPython').checked = !!agent.confirmRunPython;
+    document.getElementById('agentOutsideWrites').value = agent.outsideWorkspaceWrites || 'ask';
+    renderAutoApproveRevoke(agent.autoApprove || []);
     document.getElementById('agentContextBudget').value = String(agent.contextBudget ?? 32768);
     document.getElementById('agentTabCompletion').checked = !!agent.tabCompletion;
   }
+
+  function activeServerModels() {
+    const sid = state.activeServerId;
+    const server = (state.servers || []).find(s => s.id === sid);
+    return (server && server.models) ? server.models.filter(Boolean) : [];
+  }
+
+  function fillModelSelect(sel, models, preferred) {
+    if (!sel) return;
+    const prev = sel.value;
+    sel.innerHTML = '';
+    if (!models.length) {
+      const o = document.createElement('option');
+      o.value = '';
+      o.textContent = '(fetch models on the Models tab)';
+      sel.appendChild(o);
+      return;
+    }
+    for (const m of models) {
+      const o = document.createElement('option');
+      o.value = m;
+      o.textContent = m;
+      sel.appendChild(o);
+    }
+    const pick = models.includes(prev) ? prev : (models.includes(preferred) ? preferred : models[0]);
+    sel.value = pick;
+  }
+
+  function renderCalibrate() {
+    const models = activeServerModels();
+    const preferred = state.activeModel || models[0] || '';
+    fillModelSelect(document.getElementById('calibrateModel'), models, preferred);
+    const runBtn = document.getElementById('calibrateRun');
+    const reviseBtn = document.getElementById('reviseHarness');
+    const hint = document.getElementById('calibrateHint');
+    const available = !!calibrateMeta.available;
+    const busy = !!calibrateMeta.busy;
+    if (runBtn) {
+      runBtn.disabled = busy || !available || models.length < 1;
+      runBtn.textContent = busy ? 'Running benchmark…' : 'Run benchmark & calibrate';
+      if (reviseBtn) reviseBtn.disabled = busy || !available || models.length < 1;
+    }
+    if (hint) {
+      hint.textContent = !available
+        ? 'Benchmark suite missing — rebuild the extension (syncs resources/calibrate-bench).'
+        : !models.length
+          ? 'Fetch models on the Models tab first.'
+          : 'Calibrate classifies weak vs strong from protocol. Revise harness asks this model for one change and keeps it only if T2 and T4 improve over 3 reps.';
+    }
+    const openBtn = document.getElementById('calibrateOpenReport');
+    if (openBtn) openBtn.style.display = lastCalibrateReport ? '' : 'none';
+  }
+
+  document.getElementById('reviseHarness').addEventListener('click', () => {
+    const model = document.getElementById('calibrateModel').value;
+    const reps = Number(document.getElementById('calibrateReps').value) || 3;
+    const log = document.getElementById('calibrateLog');
+    const summary = document.getElementById('calibrateSummary');
+    log.style.display = 'block';
+    log.textContent = '';
+    summary.textContent = '';
+    vscode.postMessage({ type: 'reviseHarness', model, reps });
+  });
+  document.getElementById('calibrateRun').addEventListener('click', () => {
+    const model = document.getElementById('calibrateModel').value;
+    const reps = Number(document.getElementById('calibrateReps').value) || 3;
+    const log = document.getElementById('calibrateLog');
+    const summary = document.getElementById('calibrateSummary');
+    if (log) { log.style.display = 'block'; log.textContent = ''; }
+    if (summary) summary.textContent = '';
+    vscode.postMessage({ type: 'calibrateProfiles', model, reps });
+  });
+  document.getElementById('calibrateOpenReport').addEventListener('click', () => {
+    if (lastCalibrateReport) vscode.postMessage({ type: 'openCalibrateReport', path: lastCalibrateReport });
+  });
 
   function pluginInstalled(plugin) {
     if (plugin.kind !== 'mcp' || !plugin.matchMcp) return false;
@@ -1158,14 +1566,39 @@ export class AiSettingsPanel {
       selectTab(e.data.tab);
       return;
     }
+    if (e.data.type === 'calibrateProgress') {
+      const log = document.getElementById('calibrateLog');
+      if (log) {
+        log.style.display = 'block';
+        log.textContent = (log.textContent ? log.textContent + '\\n' : '') + (e.data.message || '');
+        log.scrollTop = log.scrollHeight;
+      }
+      return;
+    }
+    if (e.data.type === 'calibrateResult') {
+      const summary = document.getElementById('calibrateSummary');
+      if (summary) {
+        summary.textContent = e.data.ok
+          ? (e.data.summary || e.data.reportMarkdown || 'Done.')
+          : (e.data.error || 'Failed.');
+      }
+      if (e.data.reportPath) {
+        lastCalibrateReport = e.data.reportPath;
+        const openBtn = document.getElementById('calibrateOpenReport');
+        if (openBtn) openBtn.style.display = '';
+      }
+      return;
+    }
     if (e.data.type === 'state') {
       state = e.data.state;
       governance = e.data.governance || governance;
       agent = e.data.agent || agent;
+      if (e.data.calibrate) calibrateMeta = e.data.calibrate;
       withPreservedScroll(() => {
         render();
         renderGov();
         renderAgent();
+        renderCalibrate();
         renderPlugins();
       });
     }
@@ -1434,9 +1867,16 @@ export class AiSettingsPanel {
         chip.dataset.model = m;
         chip.className = 'chip' + (isActive && state.activeModel === m ? ' active' : '');
         chip.setAttribute('aria-pressed', isActive && state.activeModel === m ? 'true' : 'false');
-        chip.innerHTML = m + '<span class="x" title="Remove">×</span>';
+        const label = document.createElement('span');
+        label.textContent = m;
+        chip.appendChild(label);
+        const remove = document.createElement('span');
+        remove.className = 'x';
+        remove.title = 'Remove';
+        remove.textContent = '×';
+        chip.appendChild(remove);
         chip.addEventListener('click', (ev) => {
-          if (ev.target.classList.contains('x')) {
+          if (ev.target === remove || (ev.target && ev.target.classList && ev.target.classList.contains('x'))) {
             const next = readServer(card, server);
             next.models = (next.models || []).filter(x => x !== m);
             vscode.postMessage({ type: 'updateServer', server: next });
@@ -1612,11 +2052,8 @@ export class AiSettingsPanel {
 function sanitizeForWebview(state: AiSettingsState): AiSettingsState {
 	return {
 		...state,
-		servers: state.servers.map(s => ({
-			...s,
-			// Keep key editable in password field; don't strip so users can see length via dots.
-			apiKey: s.apiKey ? s.apiKey : '',
-		})),
+		servers: state.servers.map(s => maskStateForWebview(s)),
+		mcpServers: state.mcpServers.map(m => maskStateForWebview(m)),
 	};
 }
 

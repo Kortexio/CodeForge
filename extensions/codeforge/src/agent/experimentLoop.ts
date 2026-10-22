@@ -41,12 +41,23 @@ export interface RoundResult {
 }
 
 export function normalizeRelPath(p: string): string {
-	return String(p ?? '')
+	const raw = String(p ?? '')
 		.replace(/\\/g, '/')
 		.replace(/^\.\//, '')
 		.replace(/\/+/g, '/')
 		.replace(/^\//, '')
 		.trim();
+	if (!raw) return '';
+	const parts: string[] = [];
+	for (const seg of raw.split('/')) {
+		if (!seg || seg === '.') continue;
+		if (seg === '..') {
+			if (parts.length) parts.pop();
+			continue;
+		}
+		parts.push(seg);
+	}
+	return parts.join('/');
 }
 
 export function parseChecksLock(text: string): ChecksLock | undefined {
@@ -148,14 +159,39 @@ export function isLockedScorePath(relPath: string, locked: string[]): boolean {
 	return locked.some(p => normalizeRelPath(p).toLowerCase() === n);
 }
 
+/** Paths mentioned in apply_patch body (*** Update/Add/Delete File: …). */
+function pathsFromPatchText(patch: string): string[] {
+	const out: string[] = [];
+	const re = /^\*\*\*\s+(?:Update|Add|Delete|Move)\s+File:\s*(.+)$/gim;
+	let m: RegExpExecArray | null;
+	while ((m = re.exec(String(patch || ''))) !== null) {
+		const p = normalizeRelPath(m[1].trim());
+		if (p) out.push(p);
+	}
+	return out;
+}
+
 /** Paths a mutating tool would touch. */
 export function pathsTouchedByTool(tool: string, args: Record<string, unknown>): string[] {
 	switch (tool) {
 		case 'write':
 		case 'edit':
-		case 'apply_patch':
 		case 'delete':
 			return [normalizeRelPath(String(args.path ?? ''))].filter(Boolean);
+		case 'apply_patch': {
+			const fromArg = normalizeRelPath(String(args.path ?? ''));
+			const fromBody = pathsFromPatchText(String(args.patch ?? args.patchText ?? args.patch_text ?? ''));
+			const seen = new Set<string>();
+			const out: string[] = [];
+			for (const p of [fromArg, ...fromBody]) {
+				if (!p) continue;
+				const key = p.toLowerCase();
+				if (seen.has(key)) continue;
+				seen.add(key);
+				out.push(p);
+			}
+			return out;
+		}
 		case 'rename': {
 			const oldP = normalizeRelPath(String(args.oldPath ?? args.path ?? ''));
 			const newP = normalizeRelPath(String(args.newPath ?? args.to ?? ''));

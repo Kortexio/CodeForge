@@ -1,0 +1,4 @@
+[
+  { "file": "src/Acme.Billing/PricingRules.cs", "replace": "private const decimal VipRate = 0.1m;", "with": "private const decimal VipRate = 0.15m;" },
+  { "file": "docs/pricing.md", "replace": "| vip      | 10%      |", "with": "| vip      | 15%      |" }
+]

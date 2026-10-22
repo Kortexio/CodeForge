@@ -3,6 +3,11 @@
  * Behavior comes from these schemas/prompts — not from chat-phrase crutches.
  */
 
+export type ToolContractPromptKnobs = {
+	renameSearchRule?: boolean;
+	shellCmdExeHints?: boolean;
+};
+
 /** @deprecated Prefer buildToolSystemContract(activeNames). Kept for callers that need the full text. */
 export const TOOL_SYSTEM_CONTRACT = buildToolSystemContract(undefined);
 
@@ -10,9 +15,14 @@ export const TOOL_SYSTEM_CONTRACT = buildToolSystemContract(undefined);
  * System tool contract mentioning only tools that are active this run.
  * Pass undefined/empty to include every optional section (legacy full surface).
  */
-export function buildToolSystemContract(activeNames?: Iterable<string>): string {
+export function buildToolSystemContract(
+	activeNames?: Iterable<string>,
+	prompt?: ToolContractPromptKnobs
+): string {
 	const active = activeNames ? new Set(activeNames) : undefined;
 	const has = (...names: string[]) => !active || names.some(n => active.has(n));
+	const renameRule = prompt?.renameSearchRule !== false;
+	const shellHints = prompt?.shellCmdExeHints !== false;
 
 	const lines: string[] = [
 		'### Tool contract',
@@ -86,7 +96,14 @@ export function buildToolSystemContract(activeNames?: Iterable<string>): string 
 	lines.push(
 		`Implementation finish: exploration-only (read/search/list/…) is not done. After a short look, call ${effectPhrase} or reply \`blocked: <reason>\`. A bug list or plan is not a substitute for applying the change.`
 	);
-	if (has('search') && (has('edit') || has('write') || has('apply_patch'))) {
+	lines.push(
+		'Runnable UI/apps: build/test green is not done — launch the app (shell start/dev or browser_navigate) and observe (snapshot/screenshot/After-state or process output) before the final summary. Opening a window that still fails at runtime is not done.'
+	);
+	if (
+		renameRule &&
+		has('search') &&
+		(has('edit') || has('write') || has('apply_patch'))
+	) {
 		lines.push(
 			'Renaming or removing an identifier is done only when a search for the old name in the requested scope returns no hits — definitions, imports, call sites and object/export keys (`oldName: x.newName` still exposes oldName). Passing tests do not prove a rename. Keep the old name only if the task asks for an alias.'
 		);
@@ -101,7 +118,7 @@ export function buildToolSystemContract(activeNames?: Iterable<string>): string 
 /** Per-tool OpenAI function descriptions (and key parameter notes). */
 export const TOOL_DESCRIPTIONS = {
 	read:
-		'Read a file slice (numbered lines). Use before edit so old_string matches disk. path required; startLine/limit optional (default ~120 lines, max 400).',
+		'Read a file slice (numbered lines). Use before edit so old_string matches disk. Do not re-read the same span after it is already in tool results — call edit/shell/browser instead. path required; startLine/limit optional (default ~120 lines, max 400).',
 	write:
 		'Create a new file or replace an entire file body. Prefer a short body: for large new files write a minimal skeleton (<60 lines) then grow with edit; for .NET projects prefer the dotnet tool. For small changes to an existing file use edit instead. After a short diagnosis, call write/edit to apply — do not stop at a bug list. Requires path and full content.',
 	edit: [
@@ -124,10 +141,11 @@ export const TOOL_DESCRIPTIONS = {
 	open: 'Reveal/open a file in the editor UI. Does not modify contents. path required.',
 	shell: [
 		'Run a cmd.exe command in the workspace (&& chaining OK; no PowerShell/Unix pipes).',
-		'cmd.exe has no Unix tools or heredocs: use del (not rm), type (not cat), findstr (not grep/tail/head), %TEMP% (not /tmp); create files with write, not `cat > file << EOF`; PowerShell cmdlets (Set-Content, Out-File) do not run here.',
 		'Use for builds/tests/dev servers. Prefer web_search/web_fetch for HTTP and dedicated tools for file/git ops.',
 		'Long jobs: background=true then await_shell. command required.',
 	].join(' '),
+	shellUnixHints:
+		'cmd.exe has no Unix tools or heredocs: use del (not rm), type (not cat), findstr (not grep/tail/head), %TEMP% (not /tmp); create files with write, not `cat > file << EOF`; PowerShell cmdlets (Set-Content, Out-File) do not run here.',
 	await_shell:
 		'Wait/poll a background shell job. id required (from shell background). Optional pattern regex on output; optional block_until_ms.',
 	web_search:
@@ -201,8 +219,14 @@ export const TOOL_DESCRIPTIONS = {
 		'Load a playbook/skill by id or title when you need domain conventions or a workflow. name required. Catalog is injected at runtime.',
 } as const;
 
-export type ToolDescriptionName = keyof typeof TOOL_DESCRIPTIONS;
+export type ToolDescriptionName = Exclude<keyof typeof TOOL_DESCRIPTIONS, 'shellUnixHints'>;
 
-export function toolDescription(name: ToolDescriptionName): string {
+export function toolDescription(
+	name: ToolDescriptionName,
+	prompt?: ToolContractPromptKnobs
+): string {
+	if (name === 'shell' && prompt?.shellCmdExeHints !== false) {
+		return `${TOOL_DESCRIPTIONS.shell} ${TOOL_DESCRIPTIONS.shellUnixHints}`;
+	}
 	return TOOL_DESCRIPTIONS[name];
 }

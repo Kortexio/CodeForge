@@ -56,6 +56,7 @@ export class ApprovalDialog {
 		const accept: vscode.MessageItem = { title: 'Accept' };
 		const allowSession: vscode.MessageItem = { title: 'Allow All Edits (Session)' };
 		const allowAlways: vscode.MessageItem = { title: 'Allow All Edits (Always)' };
+		const allowAll: vscode.MessageItem = { title: 'Allow All' };
 		const deny: vscode.MessageItem = { title: 'Reject', isCloseAffordance: true };
 
 		const result = await vscode.window.showInformationMessage(
@@ -64,11 +65,18 @@ export class ApprovalDialog {
 			accept,
 			allowSession,
 			allowAlways,
+			allowAll,
 			deny
 		);
 
 		if (!result || result === deny || result.title === 'Reject') {
 			return { approved: false, scope: 'once' };
+		}
+
+		if (result === allowAll || result.title === 'Allow All') {
+			await policy.setGlobalAllowAll(true);
+			void vscode.window.setStatusBarMessage('CodeForge: Allow all tools enabled', 4000);
+			return { approved: true, scope: 'always' };
 		}
 
 		if (result === allowAlways || result.title === 'Allow All Edits (Always)') {
@@ -106,6 +114,7 @@ export class ApprovalDialog {
 		const allowOnce: vscode.MessageItem = { title: 'Allow Once' };
 		const allowSession: vscode.MessageItem = { title: 'Allow for Session' };
 		const allowAlways: vscode.MessageItem = { title: 'Always Allow' };
+		const allowAll: vscode.MessageItem = { title: 'Allow All' };
 		const deny: vscode.MessageItem = { title: 'Deny', isCloseAffordance: true };
 
 		const result = await vscode.window.showWarningMessage(
@@ -114,11 +123,18 @@ export class ApprovalDialog {
 			allowOnce,
 			allowSession,
 			allowAlways,
+			allowAll,
 			deny
 		);
 
 		if (!result || result === deny || result.title === 'Deny') {
 			return { approved: false, scope: 'once' };
+		}
+
+		if (result === allowAll || result.title === 'Allow All') {
+			await policy.setGlobalAllowAll(true);
+			void vscode.window.setStatusBarMessage('CodeForge: Allow all tools enabled', 4000);
+			return { approved: true, scope: 'always' };
 		}
 
 		let scope: 'once' | 'session' | 'always' = 'once';

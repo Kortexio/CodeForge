@@ -63,22 +63,39 @@ export function llmThinkingRequestFields(input: ThinkingRoundInput): Record<stri
 	return {};
 }
 
-/** Sampling aligned with Qwen non-thinking vs thinking recommendations. */
-export function llmSamplingOptions(input: ThinkingRoundInput): {
+export type SamplingProfileSlice = {
+	plan: { temperature: number; top_p: number };
+	toolThinking: { temperature: number; top_p: number; presence_penalty: number };
+	plain: { temperature: number; top_p: number };
+};
+
+/** Sampling aligned with Qwen non-thinking vs thinking recommendations (or ModelProfile). */
+export function llmSamplingOptions(
+	input: ThinkingRoundInput,
+	profile?: SamplingProfileSlice
+): {
 	temperature: number;
 	top_p: number;
 	presence_penalty?: number;
 } {
+	const samp = profile ?? {
+		plan: { temperature: 0.6, top_p: 0.95 },
+		toolThinking: { temperature: 0.7, top_p: 0.8, presence_penalty: 0 },
+		plain: { temperature: 0.2, top_p: 1 },
+	};
 	if (shouldEnableThinking(input)) {
-		return { temperature: 0.6, top_p: 0.95 };
+		return { temperature: samp.plan.temperature, top_p: samp.plan.top_p };
 	}
 	if (shouldDisableThinking(input) || modelLikelySupportsThinking(input.model)) {
-		// Non-thinking / tool rounds. presence_penalty stays 0: tool calls must repeat tokens
-		// (</parameter>, old_string copied into new_string), and a penalty taxes exactly that.
-		return { temperature: 0.7, top_p: 0.8, presence_penalty: 0 };
+		// Non-thinking / tool rounds. presence_penalty stays 0 by default: tool calls must
+		// repeat tokens (</parameter>, old_string copied into new_string).
+		return {
+			temperature: samp.toolThinking.temperature,
+			top_p: samp.toolThinking.top_p,
+			presence_penalty: samp.toolThinking.presence_penalty,
+		};
 	}
-	// Non-reasoning models keep the historical deterministic default
-	return { temperature: 0.2, top_p: 1 };
+	return { temperature: samp.plain.temperature, top_p: samp.plain.top_p };
 }
 
 /**
@@ -87,7 +104,8 @@ export function llmSamplingOptions(input: ThinkingRoundInput): {
  */
 export function toolAwareMaxTokens(
 	completionCap: number,
-	input: ThinkingRoundInput & { tools?: Array<{ function?: { name?: string } }> }
+	input: ThinkingRoundInput & { tools?: Array<{ function?: { name?: string } }> },
+	limits?: { mutatingMaxTokens: number; readOnlyMaxTokens: number }
 ): number {
 	if (!input.withTools && !input.proseToolsOnly) return completionCap;
 	// Plan keeps thinking ON — do not starve the completion budget.
@@ -95,13 +113,15 @@ export function toolAwareMaxTokens(
 	if (!shouldDisableThinking(input) && !modelLikelySupportsThinking(input.model)) {
 		return completionCap;
 	}
+	const mutating = limits?.mutatingMaxTokens ?? 6144;
+	const readOnly = limits?.readOnlyMaxTokens ?? 3072;
 	const names = (input.tools ?? []).map(t => t.function?.name ?? '');
 	const mutates = names.some(n =>
 		/^(write|edit|apply_patch|notebook_edit|search_replace)$/i.test(n)
 	);
-	if (mutates) return Math.min(completionCap, 6144);
+	if (mutates) return Math.min(completionCap, mutating);
 	// Parallel tool rounds need room for several argument payloads.
-	return Math.min(completionCap, 3072);
+	return Math.min(completionCap, readOnly);
 }
 
 const THINK_BLOCK_RE = /<think\b[^>]*>[\s\S]*?<\/think>/gi;

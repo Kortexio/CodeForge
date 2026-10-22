@@ -4,26 +4,85 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![CI](https://img.shields.io/github/actions/workflow/status/Kortexio/CodeForge/ci.yml?branch=master&label=CI)](https://github.com/Kortexio/CodeForge/actions)
 
-**An open-source, model-independent, memory-native, agentic coding IDE.**
+**The open-source AI coding IDE that makes a consumer GPU feel like a coding agent — not a chatbot with tools bolted on.**
 
-CodeForge is an AI-native code editor built on [Code-OSS](https://github.com/microsoft/vscode). One Windows install, your own models (cloud or local), no Docker required.
+Built on [Code-OSS](https://github.com/microsoft/vscode). Your models. Your machine. No Docker. No vendor lock-in.
 
-Also discoverable via: *Cursor AI*, *Cursor-style AI IDE*, *open source AI coding IDE*, *Ollama coding agent*.
+> **Download:** [Latest Windows installer](https://github.com/Kortexio/CodeForge/releases/latest) · **Source:** [`extensions/codeforge/`](extensions/codeforge/)
 
-> **Download:** [Latest Windows installer](https://github.com/Kortexio/CodeForge/releases/latest) · **Source of truth:** [`extensions/codeforge/`](extensions/codeforge/)
+---
+
+## The AHA moment
+
+Most “local AI IDEs” stall when the model is small: they over-read, under-edit, or declare victory without verifying. **CodeForge fixes the agent loop itself** — read → edit → test → finish — and then adapts the harness to each model.
+
+On an **RTX 3060 12GB**, with **Qwen3.6-35B (IQ2_S)** via llama.cpp, the headless harness suite scored:
+
+| Task | Mean (3 reps) | Stuck |
+|------|---------------:|------:|
+| T1 — bugfix | **100** | 0 |
+| T2 — feature (coupon) | **97** | 0 |
+| T3 — multi-file | **100** | 0 |
+| T4 — rename refactor | **100** | 0 |
+
+**Zero stuck runs. Zero bad tool-args.** A ~Q2 35B completing real agentic coding tasks end-to-end on a gaming GPU.
+
+That is the product bet: **the model is not the product — the contract around the model is.**
+
+Frontier APIs still work. Local weak models stop being a demo and start being a workflow.
+
+---
+
+## What we actually built
+
+Not another chat sidebar. A **tool + system contract** that refuses to paper over failures with intent matchers.
+
+| Capability | Why it matters |
+|---|---|
+| **Agentic loop that finishes** | Unlimited exploration within the turn budget (Cursor/Claude Code style). Continue button when the step budget ends. No soft “explore cap” that refuses new reads. |
+| **Adaptive harness** | Per-model profiles (`~/.CodeForge/ai/model-profiles/`) — sampling, write gates, finish limits, optional `toolTransport` for XML-leaky locals. Calibrate once; hysteresis adjusts online. |
+| **Honest outcomes** | Stuck / truncated / oracle-red are **failed**, not “done”. Spec self-check and oracle before finish with writes. |
+| **You own the freedoms** | Sandbox level, Allow all, outside-workspace writes, MCP, Full agent freedom — all user settings, revocable. The model cannot grant itself permissions. |
+| **Measurable learning** | Harness revise proposes changes; keep only when paired bootstrap shows a real gain. No quiet contamination of `harness.json`. |
+| **Same IDE for weak and strong** | Compensations are per model. A clean 32B does not pay the IQ2_S tax. |
+
+---
+
+## Where we’re going
+
+**Near term**
+- Ship releases that treat the adaptive harness + agent loop as the core product story
+- Keep the calibrate suite (T2/T4/CS2/CS3) as the release gate for local models
+- Harden permissions, sandbox, and secrets for daily use without babysitting
+
+**Next**
+- Broader task suites (navigation, long multi-card, review) with the same failure taxonomy: harness / protocol / semantic
+- Profile knobs proven by A/B (thinking off on tool turns, one mutating call per step) — only when the bench says so
+- Packaging and onboarding so “install → pick local model → agent works” is a five-minute path
+
+**Not the roadmap**
+- Hardcoded intent crutches (“the user said fix, so nudge edit”)
+- One global “weak mode” that punishes strong models
+- Claiming 100% on every task — residual failures stay visible as model limits, not hidden by prose
+
+---
 
 ## Why CodeForge?
 
 | | CodeForge |
 |---|---|
-| Models | OpenAI, Anthropic, Gemini, xAI, OpenRouter, Ollama, vLLM, LM Studio, any OpenAI-compatible API |
-| Agent | Multi-file agent with approvals; composer modes Ask / Plan / Agent + permission chip (Default → Assisted → Allow all) |
-| Chat UI | Cursor-like sidebar: footer composer, context ring, clean tool rows, Undo/Review, Restore checkpoints |
-| Weak local models | Opt-in small-model harness (`codeforge.ai.weakModelMode`: on/off) |
-| Sandbox | Configurable shell sandbox + optional Full agent freedom |
-| Memory | Session wiki, project wiki, stable facts on disk (`~/.CodeForge/`) |
-| Governance | Editable skills, rules, policies, hard guardrails |
-| MCP | Inbound tools + outbound wiki server + Plugins catalog |
+| Models | OpenAI, Anthropic, Gemini, xAI, OpenRouter, Ollama, vLLM, LM Studio, llama.cpp / any OpenAI-compatible API |
+| Adaptive harness | Per-model profiles + calibrate + hysteresis |
+| Agent | Multi-file loop with approvals; Ask / Plan / Agent + permission chip |
+| Chat | Cursor-like sidebar: composer, context ring, tool rows, Undo/Review, Restore, Continue |
+| Sandbox | User-configured shell sandbox + optional Full agent freedom |
+| Memory | Session wiki, project wiki, stable facts |
+| Governance | Skills, rules, policies, hard guardrails |
+| MCP | Inbound tools + outbound wiki + Plugins catalog |
+
+Also discoverable as: *open source Cursor alternative*, *Ollama coding agent*, *llama.cpp coding IDE*, *local LLM agent IDE*.
+
+---
 
 ## Install (Windows)
 
@@ -33,126 +92,109 @@ Also discoverable via: *Cursor AI*, *Cursor-style AI IDE*, *open source AI codin
 
 Or build from source (below).
 
-## Quick Start (development)
+## Quick start (development)
 
 ```bash
 git clone https://github.com/Kortexio/CodeForge.git
 cd CodeForge
 npm install
 npm run vscode:setup      # clone Code-OSS, brand, install deps
-npm run build:extensions # compile AI extension
+npm run build:extensions # sync calibrate suite + compile AI extension
 npm run vscode:compile   # compile editor (first time is slow)
 npm run vscode:dev       # launch CodeForge with AI sidebar
 ```
 
-See [docs/code-oss-integration.md](docs/code-oss-integration.md) for details.
+Calibrate from the app: **CodeForge Settings → Benchmark**, or:
 
-## Features
+```bash
+node benchmarks/bench.mjs calibrate --model qwen3.6-35b --reps 3
+node benchmarks/bench.mjs run T2 --label smoke --model qwen3.6-35b
+```
 
-- **Embedded AI Platform** — agent, chat, settings, and tools inside the IDE
-- **Cursor-like composer** — Ask / Plan / Agent in the chat footer; Shift+Tab cycles mode; permissions chip separate from mode (Allow all ≈ former Auto)
-- **Context ring** — live prompt tokens vs window limit on the composer
-- **Tool timeline** — short Cursor-style labels (`Shell npm test`, `Read path`), exploration grouping, failures stay expanded
-- **Edit journal** — Undo All / Review Changes (`vscode.diff` against pre-edit snapshots)
-- **Restore checkpoint** — revert a user turn (messages + related tool traces + journaled files)
-- **Shell sandbox** — `codeforge.ai.shellSandbox` (restricted → unrestricted) and **Full agent freedom** in Agent settings
-- **Model Independence** — bring your own API keys or local servers
-- **Plan mode** — explore + write a wiki plan without mutating source
-- **Small-model harness** — opt-in phase tools + tighter guardrails for small/local LLMs
-- **Persistent Memory** — session/project wiki and temporal facts
-- **Code Intelligence** — hybrid search (lexical + semantic embeddings)
-- **MCP + Plugins** — inbound tools, outbound wiki server, marketplace-style plugins catalog
-- **Tab Completion** — inline completions with your model
-- **Browser Agent** — visual checks (Playwright optional)
-- **Git Intelligence** — status, diff, blame, conflicts, commit messages
+See [docs/code-oss-integration.md](docs/code-oss-integration.md) and [benchmarks/README.md](benchmarks/README.md).
+
+---
+
+## Benchmarks (llama.cpp, RTX 3060 12GB)
+
+| | |
+|---|---|
+| **GPU** | NVIDIA GeForce RTX 3060 **12GB** |
+| **Server** | llama.cpp OpenAI-compatible API |
+| **Primary local model** | `qwen3.6-35b` (Qwen3.6-35B-A3B **IQ2_S**) |
+| **Stronger local** | `Qwen3-32B-exl3-4.0bpw` (calibrate A/B) |
+| **Runner** | `benchmarks/bench.mjs` headless / packaged `resources/calibrate-bench/` |
+
+### Agent suite — post harness fix (2026-10-22)
+
+T1–T4 × 3 reps, learned harness off for isolation. Score 0–100.
+
+| Model | T1 | T2 | T3 | T4 | Stuck |
+|---|---:|---:|---:|---:|---:|
+| `qwen3.6-35b` (IQ2_S) | **100** | **97** | **100** | **100** | **0** |
+
+### Calibration suite — 2026-10-20
+
+T2 · T4 · CS2 · CS3 × 3 reps × 2 models. Protocol quality decides weak vs strong profile knobs — not the model name. Details: [`benchmarks/results/CALIBRATE-2026-10-20.md`](benchmarks/results/CALIBRATE-2026-10-20.md).
+
+Harness design notes: [`extensions/codeforge/HEURISTICS.md`](extensions/codeforge/HEURISTICS.md).
+
+---
 
 ## Architecture
 
 ```
 CodeForge/
-├── extensions/codeforge/   # Shipped AI platform (source of truth)
-│   ├── src/agent/               # Agent loop, edit journal, tool registry, harness
-│   ├── src/views/               # Chat host + chatViewHtml (Cursor-like UI)
-│   ├── src/memory/              # Session + project wiki + temporal facts
-│   ├── src/storage/             # ~/.CodeForge paths, sessions, artifacts, traces
-│   ├── src/context/             # Context budget / ranking
-│   ├── src/sandbox/             # Shell isolation + unrestricted / freedom
-│   ├── src/intelligence/        # Index, LSP, git, embeddings
-│   ├── src/browser/             # Browser agent
-│   ├── src/mcp/                 # Inbound + outbound MCP
-│   └── src/governance/          # Skills, rules, guardrails, HITL
-├── docs/                        # Documentation
-├── tests/                       # Test suites
-└── scripts/                     # Code-OSS setup / package
+├── extensions/codeforge/          # Shipped AI platform (source of truth)
+│   ├── src/agent/                 # Loop, profiles, telemetry, revise, tools
+│   ├── resources/calibrate-bench/ # Packaged calibrate suite
+│   ├── src/views/                 # Chat host + Cursor-like UI
+│   ├── src/memory/                # Session + project wiki
+│   ├── src/sandbox/               # Shell isolation
+│   ├── src/intelligence/          # Index, LSP, git, embeddings
+│   ├── src/mcp/                   # Inbound + outbound MCP
+│   └── src/governance/            # Skills, rules, guardrails
+├── benchmarks/                    # Full harness suite + CLI
+├── docs/
+└── scripts/                       # Code-OSS setup / package / sync
 ```
-
-See [docs/architecture.md](docs/architecture.md) for the full component model.
 
 ## Configuration
 
-Prefer **CodeForge Settings** (Models / MCP / Guardrails / Agent) in the app.
-
-Legacy mirrors (active server only):
+Prefer **CodeForge Settings** in the app (Models / Permissions / MCP / Guardrails / Agent).
 
 ```json
 {
   "codeforge.ai.mode": "agent",
-  "codeforge.ai.weakModelMode": "off",
   "codeforge.ai.shellSandbox": "restricted",
+  "codeforge.ai.allowAll": false,
+  "codeforge.ai.outsideWorkspaceWrites": "ask",
   "codeforge.ai.fullAgentFreedom": false
 }
 ```
 
-Supported providers: OpenAI, Anthropic, Google (Gemini), xAI, OpenRouter, Ollama, vLLM, LM Studio, custom OpenAI-compatible endpoints.
+Profiles live per machine under `~/.CodeForge/ai/model-profiles/` — calibrate once per model.
 
 ## Development
 
-### Prerequisites
-
-- Node.js matching `vscode/.nvmrc` (for full IDE builds)
-- npm, Git
-- On Windows: Visual Studio C++ workload + Spectre-mitigated libs
-
-### Building & tests
+**Prerequisites:** Node matching `vscode/.nvmrc`, npm, Git. On Windows: VS C++ workload + Spectre-mitigated libs.
 
 ```bash
-npm install
 npm run build:extensions
 npm test
+npm run vscode:package:win   # needs Inno Setup
 ```
-
-### Packaging (Windows)
-
-```bash
-# Installer + portable + zip (recommended for distribution)
-npm run vscode:package:win
-
-# Installer only (from existing portable build)
-npm run installer:win
-```
-
-Requires Inno Setup: `winget install JRSoftware.InnoSetup`
-
-Artifact: `dist/codeforge-win32-x64/CodeForge-Setup-<version>-win32-x64.exe`
-
-## Discoverability
-
-Search on GitHub for **CodeForge**, **AI coding IDE**, **Cursor AI**, or topics below.
-
-- Repo: [github.com/Kortexio/CodeForge](https://github.com/Kortexio/CodeForge)
-- Releases: [github.com/Kortexio/CodeForge/releases](https://github.com/Kortexio/CodeForge/releases)
-- Topics: `ide` · `ai` · `vscode` · `code-oss` · `openai` · `ollama` · `agent` · `mcp` · `electron` · `typescript` · `cursor` · `cursor-ai` · `ai-ide` · `ai-coding` · `coding-agent` · `llm`
 
 ## License
 
-MIT License — see [LICENSE](LICENSE) for details.
+MIT — see [LICENSE](LICENSE).
 
 ## Contributing
 
-Contributions are welcome! Please read our [Contributing Guide](CONTRIBUTING.md) before submitting a Pull Request.
+See [Contributing Guide](CONTRIBUTING.md).
 
 ## Acknowledgments
 
-- Built on [Code-OSS](https://github.com/microsoft/vscode), the open-source foundation of Visual Studio Code
-- Inspired by modern AI coding assistants
-- Powered by open AI research and models
+- Built on [Code-OSS](https://github.com/microsoft/vscode)
+- Validated on consumer GPUs (RTX 3060 12GB + llama.cpp) and cloud APIs
+- The agent loop is measured, not marketed — failure classes stay visible

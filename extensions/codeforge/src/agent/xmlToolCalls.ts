@@ -36,6 +36,28 @@ function toolCall(name: string, args: Record<string, unknown>, index: number): L
 	};
 }
 
+/**
+ * Parse `<parameter=name>…</parameter>` and Qwen leak closers `</name>`
+ * (e.g. `</old_string>` instead of `</parameter>`).
+ */
+function parseParameterArgs(inner: string): Record<string, unknown> {
+	const args: Record<string, unknown> = {};
+	// Prefer </parameter>; also accept any </ident> closer (Qwen often emits </old_string>
+	// even for a different parameter name — that still ends the current value).
+	const paramRe =
+		/<parameter\s*=\s*([A-Za-z0-9_]+)\s*>([\s\S]*?)(?:<\/parameter>|<\/[A-Za-z0-9_]+>|(?=<parameter\s*=)|$)/gi;
+	let pm: RegExpExecArray | null;
+	while ((pm = paramRe.exec(inner))) {
+		args[pm[1]] = coerceParamValue(pm[2] ?? '');
+	}
+	const namedRe =
+		/<parameter\s+name\s*=\s*["']([A-Za-z0-9_]+)["']\s*>([\s\S]*?)(?:<\/parameter>|<\/[A-Za-z0-9_]+>)/gi;
+	while ((pm = namedRe.exec(inner))) {
+		args[pm[1]] = coerceParamValue(pm[2] ?? '');
+	}
+	return args;
+}
+
 function parseFunctionBlocks(body: string, startIndex: number): LiftedToolCall[] {
 	const out: LiftedToolCall[] = [];
 	const fnRe =
@@ -45,20 +67,25 @@ function parseFunctionBlocks(body: string, startIndex: number): LiftedToolCall[]
 	while ((m = fnRe.exec(body))) {
 		const name = m[1];
 		const inner = m[2] ?? '';
-		const args: Record<string, unknown> = {};
-		const paramRe =
-			/<parameter\s*=\s*([A-Za-z0-9_]+)\s*>([\s\S]*?)(?:<\/parameter>|(?=<parameter\s*=)|$)/gi;
-		let pm: RegExpExecArray | null;
-		while ((pm = paramRe.exec(inner))) {
-			args[pm[1]] = coerceParamValue(pm[2] ?? '');
+		out.push(toolCall(name, parseParameterArgs(inner), i++));
+	}
+	return out;
+}
+
+/** Collapse runaway identical tool_calls (same name + arguments) to one. */
+export function dedupeIdenticalToolCalls(calls: LiftedToolCall[]): LiftedToolCall[] {
+	if (calls.length < 2) return calls;
+	const out: LiftedToolCall[] = [];
+	for (const c of calls) {
+		const prev = out[out.length - 1];
+		if (
+			prev &&
+			prev.function.name === c.function.name &&
+			prev.function.arguments === c.function.arguments
+		) {
+			continue;
 		}
-		// Alternate: <parameter name="x">...</parameter>
-		const namedRe =
-			/<parameter\s+name\s*=\s*["']([A-Za-z0-9_]+)["']\s*>([\s\S]*?)<\/parameter>/gi;
-		while ((pm = namedRe.exec(inner))) {
-			args[pm[1]] = coerceParamValue(pm[2] ?? '');
-		}
-		out.push(toolCall(name, args, i++));
+		out.push(c);
 	}
 	return out;
 }
@@ -136,5 +163,5 @@ export function parseXmlToolCalls(text: string): LiftedToolCall[] {
 		}
 		out.push(...parseFunctionBlocks(body, out.length));
 	}
-	return out.filter(c => !!c.function.name);
+	return dedupeIdenticalToolCalls(out.filter(c => !!c.function.name));
 }

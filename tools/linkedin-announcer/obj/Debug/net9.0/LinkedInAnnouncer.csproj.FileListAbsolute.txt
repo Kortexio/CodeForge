@@ -1,0 +1,15 @@
+C:\Users\vitor\source\repos\Kortexio\CodeForge\tools\linkedin-announcer\bin\Debug\net9.0\LinkedInAnnouncer.exe
+C:\Users\vitor\source\repos\Kortexio\CodeForge\tools\linkedin-announcer\bin\Debug\net9.0\LinkedInAnnouncer.deps.json
+C:\Users\vitor\source\repos\Kortexio\CodeForge\tools\linkedin-announcer\bin\Debug\net9.0\LinkedInAnnouncer.runtimeconfig.json
+C:\Users\vitor\source\repos\Kortexio\CodeForge\tools\linkedin-announcer\bin\Debug\net9.0\LinkedInAnnouncer.dll
+C:\Users\vitor\source\repos\Kortexio\CodeForge\tools\linkedin-announcer\bin\Debug\net9.0\LinkedInAnnouncer.pdb
+C:\Users\vitor\source\repos\Kortexio\CodeForge\tools\linkedin-announcer\obj\Debug\net9.0\LinkedInAnnouncer.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\vitor\source\repos\Kortexio\CodeForge\tools\linkedin-announcer\obj\Debug\net9.0\LinkedInAnnouncer.AssemblyInfoInputs.cache
+C:\Users\vitor\source\repos\Kortexio\CodeForge\tools\linkedin-announcer\obj\Debug\net9.0\LinkedInAnnouncer.AssemblyInfo.cs
+C:\Users\vitor\source\repos\Kortexio\CodeForge\tools\linkedin-announcer\obj\Debug\net9.0\LinkedInAnnouncer.csproj.CoreCompileInputs.cache
+C:\Users\vitor\source\repos\Kortexio\CodeForge\tools\linkedin-announcer\obj\Debug\net9.0\LinkedInAnnouncer.sourcelink.json
+C:\Users\vitor\source\repos\Kortexio\CodeForge\tools\linkedin-announcer\obj\Debug\net9.0\LinkedInAnnouncer.dll
+C:\Users\vitor\source\repos\Kortexio\CodeForge\tools\linkedin-announcer\obj\Debug\net9.0\refint\LinkedInAnnouncer.dll
+C:\Users\vitor\source\repos\Kortexio\CodeForge\tools\linkedin-announcer\obj\Debug\net9.0\LinkedInAnnouncer.pdb
+C:\Users\vitor\source\repos\Kortexio\CodeForge\tools\linkedin-announcer\obj\Debug\net9.0\LinkedInAnnouncer.genruntimeconfig.cache
+C:\Users\vitor\source\repos\Kortexio\CodeForge\tools\linkedin-announcer\obj\Debug\net9.0\ref\LinkedInAnnouncer.dll

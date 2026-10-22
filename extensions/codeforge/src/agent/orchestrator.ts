@@ -123,9 +123,14 @@ export function mentionsCards(task: string): boolean {
  * Multi-card work should run as isolated sub-runs (one card per agent loop).
  * Forced = slash `/cards` / `/plan-run`. Auto = task mentions cards and ≥2 cards exist.
  */
-export function shouldOrchestrateCards(task: string, cardCount: number, forced: boolean): boolean {
+export function shouldOrchestrateCards(
+	task: string,
+	cardCount: number,
+	forced: boolean,
+	autoMinCards = 2
+): boolean {
 	if (forced) return cardCount >= 1;
-	return cardCount >= 2 && mentionsCards(task);
+	return cardCount >= autoMinCards && mentionsCards(task);
 }
 
 export function wantsNewApp(task: string): boolean {

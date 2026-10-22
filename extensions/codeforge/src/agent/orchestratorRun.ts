@@ -25,9 +25,7 @@ import {
 	wantsNewApp,
 	type Plan,
 } from './orchestrator';
-
-const ITEM_MAX_STEPS = 25;
-const ITEM_HARD_CAP = 40;
+import { resolveProfileForRun } from './modelProfile';
 
 export interface OrchestrateOptions {
 	/** `/cards` or `/plan-run`: run even when the automatic trigger would not. */
@@ -76,13 +74,22 @@ export async function runOrchestrated(
 	const root = opts.workspaceRoot;
 	if (!root) return undefined;
 	const forced = o.forced === true;
+	const profile =
+		opts.modelProfile ??
+		resolveProfileForRun(opts.serverId || 'default', opts.model, opts.sampling);
+	opts.modelProfile = profile;
 	const cards = orderCards(selectCards(opts.task, findCards(root, nodeOracleFs)));
 	// Cards: auto when the task names them and ≥2 exist; slash forces even a single card.
 	// New-app multi-item planning still goes through buildPlan (forced or wantsNewApp).
-	const cardJob = shouldOrchestrateCards(opts.task, cards.length, forced);
+	const cardJob = shouldOrchestrateCards(
+		opts.task,
+		cards.length,
+		forced,
+		profile.orchestrator.autoMinCards
+	);
 	if (!cardJob && !forced && !wantsNewApp(opts.task)) return undefined;
 
-	const oracleCfg = detectOracle(root, nodeOracleFs);
+	let oracleCfg = detectOracle(root, nodeOracleFs);
 	const plan = await buildPlan(opts, root, forced || cardJob, !!oracleCfg);
 	if (!plan) return undefined;
 
@@ -121,6 +128,9 @@ export async function runOrchestrated(
 	});
 
 	const verify = async (): Promise<{ ok: boolean; text: string }> => {
+		if (!oracleCfg) {
+			oracleCfg = detectOracle(root, nodeOracleFs);
+		}
 		if (!oracleCfg) return { ok: true, text: '' };
 		const result = await runOracle(oracleCfg, async command => {
 			const r = await opts.bridge.execute({
@@ -138,6 +148,7 @@ export async function runOrchestrated(
 		cancelled: opts.cancelled,
 		save: p => savePlan(root, p),
 		onUpdate: publish,
+		maxAttempts: profile.orchestrator.maxItemAttempts,
 		runItem: async (item, p) => {
 			const idx = p.items.indexOf(item) + 1;
 			const card = item.source ? nodeOracleFs.readText(path.join(root, item.source)) : undefined;
@@ -159,8 +170,9 @@ export async function runOrchestrated(
 				history: [],
 				isolated: true,
 				basePhase: 'implement',
-				maxSteps: ITEM_MAX_STEPS,
-				hardCap: ITEM_HARD_CAP,
+				maxSteps: profile.orchestrator.itemMaxSteps,
+				hardCap: profile.orchestrator.itemHardCap,
+				modelProfile: profile,
 			});
 			const blocked = parseBlockedClaim(reply);
 			if (blocked) return { ok: false, reply, blocked };

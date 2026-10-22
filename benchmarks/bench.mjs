@@ -17,9 +17,11 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
+import { resolveBenchLayout } from './layout.mjs';
 
-const HERE = path.dirname(fileURLToPath(import.meta.url));
+const LAYOUT = resolveBenchLayout();
+const HERE = LAYOUT.here;
 const FIXTURES = {
 	shop: path.join(HERE, 'fixtures', 'shop'),
 	billing: path.join(HERE, 'fixtures', 'billing'),
@@ -28,7 +30,8 @@ const FIXTURES = {
 	'router-cards': path.join(HERE, 'fixtures', 'router-cards'),
 };
 const TASKS_DIR = path.join(HERE, 'tasks');
-const RESULTS_DIR = path.join(HERE, 'results');
+const RESULTS_DIR =
+	process.env.CODEFORGE_BENCH_RESULTS?.trim() || LAYOUT.resultsDir;
 let RUNS_ROOT = process.env.CODEFORGE_BENCH_DIR || path.join(os.homedir(), 'codeforge-bench');
 const CF_HOME = path.join(os.homedir(), '.CodeForge');
 const HIDDEN_DIR = '.bench-hidden';
@@ -511,15 +514,13 @@ function runVisibleAndHidden(dir, task) {
 			};
 			return { visible, hidden, runtime };
 		}
-		if (hasHidden) {
-			fs.rmSync(hiddenTarget, { recursive: true, force: true });
-			copyFixture(hiddenSrc, hiddenTarget);
-		}
 		const visible = runDotnetTests(dir, {
 			filter: hasHidden ? 'FullyQualifiedName!~BenchHidden' : undefined,
 		});
 		let hidden = { pass: 0, fail: 0, output: '(no hidden)', skipped: !hasHidden };
 		if (hasHidden) {
+			fs.rmSync(hiddenTarget, { recursive: true, force: true });
+			copyFixture(hiddenSrc, hiddenTarget);
 			hidden = runDotnetTests(dir, { filter: 'FullyQualifiedName~BenchHidden' });
 			fs.rmSync(hiddenTarget, { recursive: true, force: true });
 		} else if (task.category === 'scaffold') {
@@ -666,14 +667,16 @@ function cmdRun(taskKey, flags) {
 	const outJson = path.join(RESULTS_DIR, `${meta.name}.headless.json`);
 	fs.mkdirSync(RESULTS_DIR, { recursive: true });
 
-	const compile = spawnSync('npm', ['run', 'build:extensions'], {
-		cwd: path.join(HERE, '..'),
-		encoding: 'utf8',
-		shell: true,
-		timeout: 300_000,
-	});
-	if (compile.status !== 0) {
-		die(`build:extensions failed:\n${compile.stdout}\n${compile.stderr}`);
+	if (!flags.skipBuild && !LAYOUT.packaged) {
+		const compile = spawnSync('npm', ['run', 'build:extensions'], {
+			cwd: LAYOUT.repoRoot,
+			encoding: 'utf8',
+			shell: true,
+			timeout: 300_000,
+		});
+		if (compile.status !== 0) {
+			die(`build:extensions failed:\n${compile.stdout}\n${compile.stderr}`);
+		}
 	}
 
 	const args = [
@@ -694,22 +697,61 @@ function cmdRun(taskKey, flags) {
 	if (flags.maxSteps) args.push('--maxSteps', String(flags.maxSteps));
 	if (flags.hardCap) args.push('--hardCap', String(flags.hardCap));
 	if (flags.sampling) args.push('--sampling', String(flags.sampling));
+	args.push('--profileHome', path.join(os.homedir(), '.CodeForge'));
 
 	console.log(`Headless run ${meta.name}…`);
+	const agentEnv = {
+		...process.env,
+		CODEFORGE_EXT_OUT: LAYOUT.extOut,
+		NODE_PATH: [
+			path.join(LAYOUT.extRoot, 'node_modules'),
+			path.join(LAYOUT.repoRoot, 'node_modules'),
+			process.env.NODE_PATH || '',
+		]
+			.filter(Boolean)
+			.join(path.delimiter),
+	};
+	if (flags.disableHysteresis || flags.calibrate) {
+		agentEnv.CODEFORGE_DISABLE_HYSTERESIS = '1';
+	}
+	if (flags.harnessFile) {
+		agentEnv.CODEFORGE_HARNESS_FILE = path.resolve(String(flags.harnessFile));
+	}
 	const agent = spawnSync(process.execPath, args, {
-		cwd: path.join(HERE, '..'),
+		cwd: LAYOUT.repoRoot,
 		encoding: 'utf8',
 		timeout: 3_600_000,
+		env: agentEnv,
 	});
 	if (agent.status === 2) {
 		process.stdout.write(agent.stdout || '');
 		process.stderr.write(agent.stderr || '');
+		if (flags.softFail) {
+			return {
+				pass: false,
+				score: 0,
+				infrastructureError: true,
+				notRun: true,
+				loopExit: 'error',
+				task: taskKey,
+			};
+		}
 		process.exit(2);
 	}
 	if (agent.status !== 0) {
+		if (flags.softFail) {
+			return {
+				pass: false,
+				score: 0,
+				infrastructureError: true,
+				notRun: true,
+				loopExit: 'error',
+				task: taskKey,
+			};
+		}
 		console.error(agent.stdout);
 		console.error(agent.stderr);
-		die(`headless agent exited ${agent.status}`);
+		throw new Error(`headless agent exited ${agent.status}`);
 	}
 	process.stdout.write(agent.stdout || '');
 
@@ -727,6 +769,7 @@ function cmdRun(taskKey, flags) {
 		toolCallMode: headless.toolCallMode,
 		elapsedMs: headless.elapsedMs,
 		headlessReply: headless.replyPreview,
+		replyTail: headless.replyTail,
 	};
 	const resultPath = path.join(RESULTS_DIR, `${meta.name}.json`);
 	fs.writeFileSync(resultPath, JSON.stringify(merged, null, 2));
@@ -768,10 +811,39 @@ function cmdSelftest(filter) {
 	if (!ok) process.exit(1);
 }
 
+/**
+ * Classify a failed (or suspicious) run from structured fields — not reply text.
+ * A = harness (no writes / stuck / refusals), B = protocol (badArgs/normalize/truncated),
+ * C = semantic (wrote + oracle green but hidden red).
+ */
+function classifyFailure(r) {
+	if (r.pass && !r.falseDone) return null;
+	const writes = Number(r.session?.writes ?? r.changedFiles?.length ?? 0);
+	const exit = String(r.loopExit || '');
+	const refusals = r.refusals || {};
+	const refusalN = Object.values(refusals).reduce((a, b) => a + Number(b || 0), 0);
+	const proto = r.protocol || {};
+	const badArgs = Number(proto.badArgs || 0);
+	const normalizeErr = Number(proto.normalize_error || proto.normalizeError || 0);
+	const truncated = Number(proto.lengthExits || proto.truncated_tool_json || 0);
+	const classes = [];
+	if (writes === 0 || exit === 'stuck' || refusalN > 0) classes.push('A-harness');
+	if (badArgs > 0 || normalizeErr > 0 || truncated > 0 || exit === 'length') classes.push('B-protocol');
+	if (
+		writes > 0 &&
+		(r.falseDone || (Number(r.hidden?.fail || 0) > 0 && !r.falseDone))
+	) {
+		classes.push('C-semantic');
+	}
+	if (!classes.length) classes.push(r.pass ? 'ok' : 'unknown');
+	return classes.join('+');
+}
+
 function printResult(r) {
 	const s = r.session;
+	const failClass = classifyFailure(r);
 	console.log(
-		`${r.pass ? 'PASS' : 'FAIL'}  ${r.run}  score ${r.score}/100  (${r.model || 'no session found'}${r.runtime ? ` · ${r.runtime}` : ''})`
+		`${r.pass ? 'PASS' : 'FAIL'}  ${r.run}  score ${r.score}/100  (${r.model || 'no session found'}${r.runtime ? ` · ${r.runtime}` : ''}${failClass ? ` · ${failClass}` : ''})`
 	);
 	if (r.review) {
 		const v = r.review;
@@ -831,6 +903,8 @@ function cmdReport() {
 		model: (r.model || '-').slice(0, 18),
 		pass: r.pass ? 'PASS' : 'fail',
 		score: r.score,
+		class: classifyFailure(r) || (r.pass ? '' : '?'),
+		exit: r.loopExit || '',
 		hidden: r.review ? `F1 ${r.review.f1}` : `${r.hidden.pass}/${r.hidden.pass + r.hidden.fail}`,
 		cards: r.hidden.cards ? r.hidden.cards.filter(c => c.ratio === 1).length + `/${r.hidden.cards.length}` : '',
 		falseDone: r.falseDone ? 'YES' : '',
@@ -841,6 +915,487 @@ function cmdReport() {
 		min: Math.round(r.session.wallSeconds / 60),
 	}));
 	console.table(rows);
+	const tallies = { 'A-harness': 0, 'B-protocol': 0, 'C-semantic': 0 };
+	for (const r of results) {
+		const c = classifyFailure(r);
+		if (!c) continue;
+		if (c.includes('A-harness')) tallies['A-harness'] += 1;
+		if (c.includes('B-protocol')) tallies['B-protocol'] += 1;
+		if (c.includes('C-semantic')) tallies['C-semantic'] += 1;
+	}
+	console.log(
+		`Failure classes: A-harness=${tallies['A-harness']} B-protocol=${tallies['B-protocol']} C-semantic=${tallies['C-semantic']}`
+	);
+}
+
+function modelSafe(raw) {
+	return String(raw ?? '')
+		.trim()
+		.replace(/[^\w.-]+/g, '_')
+		.replace(/^_+|_+$/g, '')
+		.slice(0, 120) || 'unknown';
+}
+
+/**
+ * Calibrate one model (UI / --model) or A/B weak+strong (lab CLI).
+ * Classification is from protocol stats, not from the model name.
+ */
+function cmdCalibrate(flags) {
+	const settings = readJson(path.join(os.homedir(), '.CodeForge', 'ai', 'settings.json')) || {};
+	const serverId = String(flags.server || settings.activeServerId || 'default');
+	const singleModel = String(flags.model || '').trim();
+	const weakFlag = String(flags['weak-model'] || flags.weakModel || '').trim();
+	const strongFlag = String(flags['strong-model'] || flags.strongModel || '').trim();
+	const models = singleModel
+		? [singleModel]
+		: weakFlag && strongFlag
+			? [weakFlag, strongFlag]
+			: [
+					settings.activeModel || weakFlag || 'qwen3.6-35b',
+				].filter(Boolean);
+	if (!models.length) die('calibrate needs --model <id> (or --weak-model + --strong-model)');
+	const reps = Math.max(1, Number(flags.reps || 3) || 3);
+	const suite = ['T2', 'T4', 'CS2', 'CS3'];
+
+	if (!flags.skipBuild && !LAYOUT.packaged) {
+		const compile = spawnSync(
+			'npx',
+			['tsc', '-p', 'extensions/codeforge/tsconfig.json'],
+			{
+				cwd: LAYOUT.repoRoot,
+				encoding: 'utf8',
+				shell: true,
+				timeout: 300_000,
+			}
+		);
+		if (compile.status !== 0) {
+			die(`tsc failed:\n${compile.stdout}\n${compile.stderr}`);
+		}
+	}
+
+	const require = createRequire(import.meta.url);
+	const {
+		loadModelProfile,
+		saveModelProfile,
+		applyCalibrationFromStats,
+	} = require(path.join(LAYOUT.extOut, 'agent', 'modelProfile.js'));
+
+	const byModel = {};
+	for (const model of models) {
+		const results = [];
+		const labelBase = `calibrate-${modelSafe(model)}`;
+		for (let rep = 1; rep <= reps; rep++) {
+			for (const task of suite) {
+				console.log(`\n=== calibrate ${model} ${task} rep ${rep}/${reps} ===`);
+				try {
+					const r = cmdRun(task, {
+						...flags,
+						label: `${labelBase}-r${rep}`,
+						model,
+						server: serverId,
+						skipBuild: true,
+						disableHysteresis: true,
+						// Session weak harness on during calibrate so the suite matches product weak path;
+						// profile knobs after classify decide long-term cost.
+						weak: 'on',
+					});
+					results.push(r);
+				} catch (err) {
+					console.error(err);
+					results.push({ pass: false, score: 0, protocol: {}, task });
+				}
+			}
+		}
+		byModel[model] = results;
+	}
+
+	const date = new Date().toISOString().slice(0, 10);
+	const lines = [
+		`# Calibration — ${date}`,
+		'',
+		`Models: ${models.map(m => `\`${m}\``).join(', ')} · reps=${reps} · suite=${suite.join(',')}`,
+		'',
+		'| Model | Class | Pass | Mean score | badArgs/native | lengthExits | Knobs |',
+		'|---|---|---:|---:|---:|---:|---|',
+	];
+
+	for (const model of models) {
+		const results = byModel[model] || [];
+		const n = results.length || 1;
+		const passes = results.filter(r => r.pass).length;
+		const meanScore = results.reduce((s, r) => s + (Number(r.score) || 0), 0) / n;
+		let badArgs = 0;
+		let native = 0;
+		let lengthExits = 0;
+		for (const r of results) {
+			const p = r.protocol || {};
+			badArgs += Number(p.badArgs) || 0;
+			native += Number(p.nativeToolCalls) || 0;
+			lengthExits += Number(p.lengthExits) || 0;
+		}
+		const badArgsRate = badArgs / Math.max(1, native);
+		const passRate = passes / n;
+		let profile = loadModelProfile(serverId, model, { applyHysteresis: false });
+		profile.calibration = {
+			at: new Date().toISOString(),
+			suite: suite.join(','),
+			passRate,
+			meanScore,
+			protocolMeans: {
+				badArgs: badArgs / n,
+				nativeToolCalls: native / n,
+				lengthExits: lengthExits / n,
+			},
+		};
+		const { profile: next, classification } = applyCalibrationFromStats(profile, {
+			passRate,
+			badArgsRate,
+			lengthExits,
+			totalRuns: n,
+			nativeToolCalls: native,
+		});
+		profile = next;
+		profile.calibration.classification = classification;
+		// Prefer text transport when native parse leaks arguments (Qwen XML closers).
+		const refusals = results.reduce((s, r) => {
+			const ref = r.refusals || {};
+			return s + Object.values(ref).reduce((a, b) => a + Number(b || 0), 0);
+		}, 0);
+		if (badArgsRate >= 0.1 || (native > 0 && refusals / Math.max(1, native) >= 0.1)) {
+			profile.toolTransport = 'text';
+		} else if (classification === 'strong' && badArgsRate < 0.05) {
+			profile.toolTransport = 'native';
+		}
+		saveModelProfile(profile);
+		const knobs =
+			classification === 'strong'
+				? `strong: writeMax=${profile.mutations.writeMaxContentLines}, massRewrite=${profile.mutations.enforceMassRewriteGate}, weakSkill=${profile.prompt.forcedWeakSkill}, transport=${profile.toolTransport || 'native'}`
+				: `weak: defaults, transport=${profile.toolTransport || 'native'}`;
+		lines.push(
+			`| ${model} | ${classification} | ${passes}/${n} | ${meanScore.toFixed(1)} | ${badArgsRate.toFixed(3)} | ${lengthExits} | ${knobs.replace(/\|/g, '/')} |`
+		);
+	}
+
+	lines.push('');
+	lines.push(
+		'Class **strong** when `passRate ≥ 0.5`, `badArgs/native < 0.05`, `lengthExits === 0`, and native tool calls > 0; otherwise **weak**. High badArgs → `toolTransport=text`.'
+	);
+	lines.push('Profiles: `~/.CodeForge/ai/model-profiles/<serverId>/<model>/profile.json`.');
+	const outMd = path.join(RESULTS_DIR, `CALIBRATE-${date}.md`);
+	fs.mkdirSync(RESULTS_DIR, { recursive: true });
+	fs.writeFileSync(outMd, lines.join('\n') + '\n', 'utf8');
+	console.log(lines.join('\n'));
+	console.log(`\nWrote ${outMd}`);
+}
+
+function isInfrastructureError(r) {
+	return !!(r?.infrastructureError || r?.notRun || r?.loopExit === 'error');
+}
+
+function emptyPairedByTask(tasks) {
+	return Object.fromEntries(tasks.map(t => [t, { parent: [], candidate: [] }]));
+}
+
+async function probeReviseLlm(server, model) {
+	try {
+		const res = await fetch(`${String(server.baseUrl).replace(/\/$/, '')}/chat/completions`, {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+				...(server.apiKey ? { Authorization: `Bearer ${server.apiKey}` } : {}),
+			},
+			body: JSON.stringify({
+				model,
+				max_tokens: 1,
+				messages: [{ role: 'user', content: 'ping' }],
+			}),
+			signal: AbortSignal.timeout(15_000),
+		});
+		return res.ok;
+	} catch {
+		return false;
+	}
+}
+
+function writeReviseDeferredSnapshot(rev, serverId, model, reason) {
+	const dir = path.dirname(rev.harnessFilePath(serverId, model));
+	fs.mkdirSync(dir, { recursive: true });
+	const snap = {
+		at: new Date().toISOString(),
+		note: 'Harness revise deferred — local LLM was not reachable (same pattern as offline baselines).',
+		reason,
+	};
+	const fp = path.join(dir, 'revise-deferred.json');
+	fs.writeFileSync(fp, JSON.stringify(snap, null, 2), 'utf8');
+	console.log(`Deferred harness revision (no live LLM). Wrote ${fp}`);
+	return fp;
+}
+
+/**
+ * One test-time harness revision. The same model proposes; T2/T4 score the
+ * change (CS2/CS3 stay held out). harness.json updates only when a keep survives
+ * holdout checks.
+ */
+async function cmdRevise(flags) {
+	const settings = readJson(path.join(os.homedir(), '.CodeForge', 'ai', 'settings.json')) || {};
+	const serverId = String(flags.server || settings.activeServerId || 'default');
+	const model = String(
+		flags.model ||
+			(settings.activeServerId === serverId ? settings.activeModel : '') ||
+			''
+	).trim();
+	if (!model) die('revise needs --model <id> (or an active model in settings)');
+	const repsEach = Math.max(1, Number(flags.reps || 3) || 3);
+	const suite = String(flags.tasks || 'T2,T4')
+		.split(',')
+		.map(s => s.trim())
+		.filter(Boolean);
+	if (!suite.length) die('revise needs at least one task');
+
+	const server = (settings.servers || []).find(s => s.id === serverId && s.enabled !== false);
+	if (!server?.baseUrl?.trim()) die(`no usable server (id=${serverId})`);
+
+	const require = createRequire(import.meta.url);
+	// Probe LLM before compile / score-count gates so offline runs defer immediately.
+	const revEarly = (() => {
+		try {
+			return require(path.join(LAYOUT.extOut, 'agent', 'harnessRevision.js'));
+		} catch {
+			return null;
+		}
+	})();
+	const llmOkEarly = await probeReviseLlm(server, model);
+	if (!llmOkEarly) {
+		if (revEarly) {
+			writeReviseDeferredSnapshot(revEarly, serverId, model, 'LLM probe failed');
+			return;
+		}
+		die('LLM probe failed and harnessRevision.js is not built (run build:extensions)');
+	}
+
+	if (repsEach * suite.length < 3) {
+		die(
+			`revise needs at least 3 scores (tasks × reps). Got ${suite.length}×${repsEach}. One run is noise.`
+		);
+	}
+
+	if (!flags.skipBuild && !LAYOUT.packaged) {
+		const compile = spawnSync('npx', ['tsc', '-p', 'extensions/codeforge/tsconfig.json'], {
+			cwd: LAYOUT.repoRoot,
+			encoding: 'utf8',
+			shell: true,
+			timeout: 300_000,
+		});
+		if (compile.status !== 0) die(`tsc failed:\n${compile.stdout}\n${compile.stderr}`);
+	}
+
+	const rev = revEarly || require(path.join(LAYOUT.extOut, 'agent', 'harnessRevision.js'));
+	const telemetry = require(path.join(LAYOUT.extOut, 'agent', 'protocolTelemetry.js'));
+	const file = rev.harnessFilePath(serverId, model);
+	const parent = rev.loadHarnessArtifact(serverId, model, file);
+	const report = rev.formatExecutionReport(telemetry.loadModelRollup(serverId, model));
+	console.log(`Harness revision for ${model} on ${server.name || serverId}`);
+	console.log(`Selection suite: ${suite.join(', ')} × ${repsEach} (held out of this decision: tasks not listed).`);
+	console.log(report);
+
+	const parentOutcomes = [];
+	const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cf-revise-harness-'));
+	const taskKeys = suite.map(k => findTask(k).id.split('-')[0]);
+
+	const benchRun = (taskKey, labelSuffix, harnessFile) => {
+		const r = cmdRun(taskKey, {
+			...flags,
+			model,
+			server: serverId,
+			label: labelSuffix,
+			skipBuild: true,
+			disableHysteresis: true,
+			softFail: true,
+			harnessFile,
+		});
+		if (isInfrastructureError(r)) {
+			console.warn(`Skipping infrastructure error for ${taskKey} (${labelSuffix})`);
+			return undefined;
+		}
+		const score = Number(r?.score);
+		if (!Number.isFinite(score)) {
+			throw new Error(`no score for ${taskKey} (${labelSuffix})`);
+		}
+		return { score, r, taskKey };
+	};
+
+	const harnessFileFor = artifact => {
+		if (artifact.revision === parent.revision) return file;
+		const fp = path.join(tempDir, `harness-r${artifact.revision}.json`);
+		rev.saveHarnessArtifact(artifact, fp);
+		return fp;
+	};
+
+	const pushOutcome = (taskId, r, score) => {
+		parentOutcomes.push({
+			task: taskId,
+			score,
+			loopExit: r.loopExit || undefined,
+			steps: typeof r.steps === 'number' ? r.steps : undefined,
+			hiddenFailed: r.hidden?.failed ?? [],
+			checksFailed: (r.checks ?? [])
+				.filter(c => !c.ok)
+				.map(c => [c.why || c.type, c.detail].filter(Boolean).join(' ')),
+			replyTail:
+				typeof r.replyTail === 'string'
+					? r.replyTail
+					: typeof r.headlessReply === 'string'
+						? r.headlessReply.slice(-500)
+						: undefined,
+		});
+	};
+
+	const scorePhase = async input => {
+		const byTask = emptyPairedByTask(taskKeys);
+		if (input.phase === 'parent') {
+			for (const task of suite) {
+				const taskId = findTask(task).id;
+				const short = taskId.split('-')[0];
+				for (let rep = 1; rep <= repsEach; rep++) {
+					console.log(`\n=== revise parent ${short} rep ${rep}/${repsEach} ===`);
+					const run = benchRun(
+						task,
+						`revise-parent-${short}-rep${rep}`,
+						harnessFileFor(input.artifact)
+					);
+					if (!run) continue;
+					byTask[short].parent.push(run.score);
+					pushOutcome(taskId, run.r, run.score);
+				}
+			}
+			const text = rev.formatTaskOutcomes(parentOutcomes);
+			if (text) console.log(`\n${text}`);
+			return { byTask };
+		}
+
+		for (const task of suite) {
+			const taskId = findTask(task).id;
+			const short = taskId.split('-')[0];
+			for (let rep = 1; rep <= repsEach; rep++) {
+				console.log(`\n=== revise paired ${short} rep ${rep}/${repsEach} (parent) ===`);
+				const parentRun = benchRun(
+					task,
+					`revise-paired-parent-${short}-rep${rep}`,
+					harnessFileFor(input.parent)
+				);
+				if (!parentRun) continue;
+				byTask[short].parent.push(parentRun.score);
+
+				console.log(`\n=== revise paired ${short} rep ${rep}/${repsEach} (candidate r${input.candidate.revision}) ===`);
+				const candRun = benchRun(
+					task,
+					`revise-paired-cand-r${input.candidate.revision}-${short}-rep${rep}`,
+					harnessFileFor(input.candidate)
+				);
+				if (!candRun) continue;
+				byTask[short].candidate.push(candRun.score);
+			}
+		}
+		return { byTask };
+	};
+
+	const scoreHoldout = async (artifact, holdoutTasks, labelPrefix, side) => {
+		const byTask = emptyPairedByTask(holdoutTasks.map(t => findTask(t).id.split('-')[0]));
+		for (const task of holdoutTasks) {
+			const short = findTask(task).id.split('-')[0];
+			for (let rep = 1; rep <= repsEach; rep++) {
+				console.log(`\n=== ${labelPrefix} holdout ${short} rep ${rep}/${repsEach} ===`);
+				const run = benchRun(
+					task,
+					`${labelPrefix}-holdout-${short}-rep${rep}`,
+					harnessFileFor(artifact)
+				);
+				if (!run) continue;
+				byTask[short][side].push(run.score);
+			}
+		}
+		return byTask;
+	};
+
+	try {
+		let outcome = await rev.executeHarnessRevision({
+			artifact: parent,
+			report,
+			minRepsPerTask: 3,
+			parentOutcomes: () => parentOutcomes,
+			propose: async messages => {
+				const res = await fetch(`${String(server.baseUrl).replace(/\/$/, '')}/chat/completions`, {
+					method: 'POST',
+					headers: {
+						'Content-Type': 'application/json',
+						...(server.apiKey ? { Authorization: `Bearer ${server.apiKey}` } : {}),
+					},
+					body: JSON.stringify({
+						model,
+						temperature: 0.2,
+						max_tokens: 4096,
+						enable_thinking: false,
+						chat_template_kwargs: { enable_thinking: false },
+						messages,
+					}),
+				});
+				const body = await res.text();
+				if (!res.ok) throw new Error(`proposer HTTP ${res.status}: ${body.slice(0, 500)}`);
+				const data = JSON.parse(body);
+				const message = data?.choices?.[0]?.message ?? {};
+				const content = [message.content, message.reasoning_content, message.reasoning]
+					.filter(part => typeof part === 'string' && part.trim())
+					.join('\n');
+				if (!content.trim()) throw new Error('proposer returned an empty message');
+				console.log(`Proposer reply:\n${content.slice(0, 1500)}`);
+				return content;
+			},
+			score: scorePhase,
+		});
+
+		if (outcome.kept) {
+			const holdout = ['CS2', 'CS3'];
+			console.log(`\nHoldout validation: ${holdout.join(', ')} × ${repsEach}`);
+			const parentHold = await scoreHoldout(parent, holdout, 'parent', 'parent');
+			const candHold = await scoreHoldout(outcome.artifact, holdout, 'candidate', 'candidate');
+			const holdReason = rev.holdoutRegressed(parentHold, candHold);
+			if (holdReason) {
+				console.log(`Holdout failed: ${holdReason}`);
+				const entry = {
+					at: new Date().toISOString(),
+					decision: 'revert',
+					reason: `holdout: ${holdReason}`,
+					diagnosis: outcome.diagnosis,
+					parentMean: outcome.parentMean,
+					candidateMean: outcome.candidateMean,
+					parentReps: outcome.artifact.history.at(-1)?.parentReps ?? 0,
+					candidateReps: outcome.artifact.history.at(-1)?.candidateReps ?? 0,
+				};
+				outcome = {
+					...outcome,
+					kept: false,
+					reason: entry.reason,
+					artifact: {
+						...parent,
+						history: [...parent.history, entry].slice(-20),
+					},
+				};
+			}
+		}
+
+		if (outcome.kept) {
+			rev.saveHarnessArtifact(outcome.artifact, file);
+		} else if (outcome.scored || outcome.artifact.history.length > parent.history.length) {
+			rev.saveHarnessArtifact(outcome.artifact, file);
+		}
+		console.log(
+			`\n${outcome.kept ? 'KEPT' : 'REVERTED'} revision ${outcome.kept ? outcome.artifact.revision : parent.revision}: ${outcome.reason}`
+		);
+		if (outcome.diagnosis) console.log(`Diagnosis: ${outcome.diagnosis}`);
+		console.log(`Harness file: ${file}`);
+	} finally {
+		fs.rmSync(tempDir, { recursive: true, force: true });
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -870,8 +1425,17 @@ switch (pos[0]) {
 	case 'run':
 		cmdRun(pos[1], flags);
 		break;
+	case 'calibrate':
+		cmdCalibrate(flags);
+		break;
+	case 'revise':
+		cmdRevise(flags).catch(err => {
+			console.error(err instanceof Error ? err.message : err);
+			process.exit(1);
+		});
+		break;
 	default:
 		console.log(
-			'Usage: node benchmarks/bench.mjs <list | setup <task> --label <name> [--open] | check [run|latest] | report | selftest [CS] | run <task> --label <name>>'
+			'Usage: node benchmarks/bench.mjs <list | setup <task> --label <name> [--open] | check [run|latest] | report | selftest [CS] | run <task> --label <name> | calibrate [--model m | --weak-model m --strong-model m] [--reps n] | revise [--model m] [--reps n] [--tasks T2,T4]>'
 		);
 }

@@ -22,9 +22,17 @@ npm run bench -- selftest CS                       # validates fixtures + soluti
 npm run build:extensions
 node benchmarks/bench.mjs run T1 --label baseline-qwen35b
 # Optional: --server <id> --model <id> --weak off
+
+# Calibrate one model (harness classifies weak vs strong from protocol)
+node benchmarks/bench.mjs calibrate --model qwen3.6-35b --reps 3
+# Optional lab A/B:
+node benchmarks/bench.mjs calibrate --weak-model qwen3.6-35b --strong-model Qwen3-32B-exl3-4.0bpw --reps 3
 ```
 
-Headless results include `loopExit`, `steps`, `refusals`, `protocol` (parse/tool-name failures), and `toolCallMode` (`native` | `content` | `none`).
+In the app: **CodeForge Settings → Benchmark** (pick Model → Run). Suite packaged at `resources/calibrate-bench/` via `npm run sync:calibrate-bench`.
+
+
+Headless results include `loopExit`, `steps`, `refusals`, `protocol` (parse/tool-name failures), and `toolCallMode` (`native` | `content` | `none`). Protocol counters are also appended to `~/.CodeForge/ai/model-profiles/<server>/<model>/runs.jsonl` (rollup in `rollup.json`).
 
 Score (0–100): hidden 60 · visible 15 · protected untouched 10 · checks 10 · no junk files 5.
 

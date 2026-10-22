@@ -51,7 +51,9 @@ import { pathsNeedingReindex } from '../../extensions/codeforge/src/intelligence
 import {
 	formatReadLedger,
 	midCompactMessages,
+	toWireToolArguments,
 } from '../../extensions/codeforge/src/agent/toolHistory';
+import { parseToolArguments } from '../../extensions/codeforge/src/agent/agentLoop';
 import { EXPLORE_MODE } from '../../extensions/codeforge/src/agent/exploreMode';
 import { extractBuildErrorLines } from '../../extensions/codeforge/src/governance/guardrailEngine';
 import { buildPriorAgentTranscript } from '../../extensions/codeforge/src/agent/priorContext';
@@ -851,6 +853,39 @@ describe('FILES ALREADY READ ledger', () => {
 		const user = next.find(m => m.role === 'user');
 		expect(String(user?.content)).toContain('FILES ALREADY READ');
 		expect(String(user?.content)).toContain('src/a.ts: L1-120');
+	});
+});
+
+describe('wire-safe tool arguments', () => {
+	const isObjectJson = (s: string) => {
+		const v = JSON.parse(s) as unknown;
+		return !!v && typeof v === 'object' && !Array.isArray(v);
+	};
+
+	it('passes valid arguments through unchanged', () => {
+		const raw = '{"path":"a.ts","content":"x"}';
+		expect(toWireToolArguments(raw, parseToolArguments)).toBe(raw);
+	});
+
+	it('repairs a write cut off mid-string and clips the huge content', () => {
+		const body = '<!DOCTYPE html>\\n<html lang=\\"pt-BR\\">\\n' + 'x'.repeat(35000);
+		const raw = `{"path":"index.html","content":"${body}`;
+		expect(() => JSON.parse(raw)).toThrow();
+		const wire = toWireToolArguments(raw, parseToolArguments);
+		expect(isObjectJson(wire)).toBe(true);
+		const parsed = JSON.parse(wire) as { path: string; content: string };
+		expect(parsed.path).toBe('index.html');
+		expect(parsed.content.length).toBeLessThan(2500);
+		expect(parsed.content).toContain('…[clipped:');
+	});
+
+	it('replaces unrepairable arguments with a valid stand-in', () => {
+		const raw = '<parameter=path>a.ts</parameter> {{{"';
+		const wire = toWireToolArguments(raw, () => {
+			throw new Error('nope');
+		});
+		expect(isObjectJson(wire)).toBe(true);
+		expect(wire).toContain('not valid JSON');
 	});
 });
 

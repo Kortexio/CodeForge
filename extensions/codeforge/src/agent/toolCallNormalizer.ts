@@ -88,16 +88,24 @@ function compactSignature(schema: JsonSchemaLike | undefined): string {
 function applyArgAliases(
 	args: Record<string, unknown>,
 	toolName: string,
-	notes: string[]
+	notes: string[],
+	schema?: JsonSchemaLike
 ): Record<string, unknown> {
 	const out: Record<string, unknown> = { ...args };
+	const props = schema?.properties ?? undefined;
 
 	for (const [canonical, aliases] of Object.entries(ARG_ALIASES)) {
+		// Only remap when the tool schema has the canonical name and not the alias
+		// (avoids browser_type.text → content, references.line → startLine, etc.).
+		if (props) {
+			if (!(canonical in props)) continue;
+		}
 		if (out[canonical] !== undefined && out[canonical] !== null && out[canonical] !== '') {
 			continue;
 		}
 		for (const alias of aliases) {
 			if (out[alias] === undefined || out[alias] === null || out[alias] === '') continue;
+			if (props && alias in props) continue;
 			out[canonical] = out[alias];
 			delete out[alias];
 			notes.push(`(argument ${alias} read as ${canonical})`);
@@ -357,8 +365,8 @@ export function normalizeToolCall(input: NormalizeToolCallInput): NormalizeToolC
 		};
 	}
 
-	let args = applyArgAliases({ ...input.args }, resolved.name, notes);
 	const schema = input.toolSchemas?.[resolved.name];
+	let args = applyArgAliases({ ...input.args }, resolved.name, notes, schema);
 	const repaired = repairLeakedParams(args, schema, notes);
 	const leakedArgs = repaired.leaked.length ? repaired.leaked : undefined;
 	if (repaired.error) {

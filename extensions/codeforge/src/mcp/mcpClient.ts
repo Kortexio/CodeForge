@@ -11,6 +11,9 @@ import { spawn, execFileSync, ChildProcessWithoutNullStreams } from 'child_proce
 import { accessSync, constants } from 'fs';
 import { McpServerConfig } from '../settings/aiSettingsStore';
 import { parseEnvFile } from './mcpJsonFile';
+import { formatMcpResult } from './mcpResultFormat';
+
+const MCP_HTTP_TIMEOUT_MS = 12_000;
 
 export interface McpToolDef {
 	serverId: string;
@@ -36,7 +39,11 @@ export class McpClientManager {
 	private nextId = 1;
 	private pending = new Map<
 		number,
-		{ resolve: (v: unknown) => void; reject: (e: Error) => void }
+		{
+			serverId: string;
+			resolve: (v: unknown) => void;
+			reject: (e: Error) => void;
+		}
 	>();
 	private buffers = new Map<string, Buffer>();
 	private tools: McpToolDef[] = [];
@@ -288,11 +295,24 @@ export class McpClientManager {
 			method: 'tools/call',
 			params: { name, arguments: args },
 		};
-		const res = await fetch(url, {
-			method: 'POST',
-			headers: this.httpHeaders(server),
-			body: JSON.stringify(body),
-		});
+		const ctrl = new AbortController();
+		const timer = setTimeout(() => ctrl.abort(), MCP_HTTP_TIMEOUT_MS);
+		let res: Response;
+		try {
+			res = await fetch(url, {
+				method: 'POST',
+				headers: this.httpHeaders(server),
+				body: JSON.stringify(body),
+				signal: ctrl.signal,
+			});
+		} catch (err) {
+			if (ctrl.signal.aborted) {
+				throw new Error(`MCP HTTP timeout calling ${server.name}`);
+			}
+			throw err;
+		} finally {
+			clearTimeout(timer);
+		}
 		if (!res.ok) {
 			throw new Error(`MCP HTTP ${res.status}: ${await res.text()}`);
 		}
@@ -362,8 +382,13 @@ export class McpClientManager {
 		});
 		proc.on('exit', code => {
 			this.output.appendLine(`[mcp:${server.name}] exited ${code}`);
+			if (this.processes.get(server.id) !== proc) {
+				return;
+			}
 			this.processes.delete(server.id);
 			this.framing.delete(server.id);
+			this.buffers.delete(server.id);
+			this.rejectPendingForServer(server.id, `MCP server ${server.name} exited (${code ?? '?'})`);
 		});
 
 		if (readyPromise) {
@@ -413,7 +438,7 @@ export class McpClientManager {
 			params: {},
 		};
 		const ctrl = new AbortController();
-		const timer = setTimeout(() => ctrl.abort(), 12_000);
+		const timer = setTimeout(() => ctrl.abort(), MCP_HTTP_TIMEOUT_MS);
 		let res: Response;
 		try {
 			res = await fetch(url, {
@@ -519,6 +544,15 @@ export class McpClientManager {
 		}
 	}
 
+	private rejectPendingForServer(serverId: string, message: string): void {
+		const err = new Error(message);
+		for (const [id, p] of this.pending) {
+			if (p.serverId !== serverId) continue;
+			this.pending.delete(id);
+			p.reject(err);
+		}
+	}
+
 	private handleMessage(raw: string): void {
 		try {
 			const msg = JSON.parse(raw) as JsonRpcResponse;
@@ -560,10 +594,11 @@ export class McpClientManager {
 				resolve({});
 				return;
 			}
-			this.pending.set(id, { resolve, reject });
+			this.pending.set(id, { serverId, resolve, reject });
 			proc.stdin.write(frame);
 			setTimeout(() => {
-				if (this.pending.has(id)) {
+				const p = this.pending.get(id);
+				if (p) {
 					this.pending.delete(id);
 					reject(new Error(`MCP timeout: ${method}`));
 				}
@@ -673,16 +708,6 @@ function indexOfDoubleCrlf(buf: Buffer): number {
 
 function sanitizeName(name: string): string {
 	return name.replace(/[^a-zA-Z0-9_-]/g, '_');
-}
-
-function formatMcpResult(result: unknown): string {
-	if (result == null) return '(empty)';
-	if (typeof result === 'string') return result;
-	const r = result as { content?: Array<{ type?: string; text?: string }> };
-	if (Array.isArray(r.content)) {
-		return r.content.map(c => c.text ?? JSON.stringify(c)).join('\n');
-	}
-	return JSON.stringify(result, null, 2);
 }
 
 let sharedMcp: McpClientManager | undefined;

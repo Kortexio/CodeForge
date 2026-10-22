@@ -73,6 +73,32 @@ export function aiSettingsFile(): string {
 	return path.join(homeRoot(), 'ai', 'settings.json');
 }
 
+/**
+ * Root for per-model profiles and protocol rollups.
+ * Independent of CODEFORGE_HOME (bench uses a temp home). Override with
+ * CODEFORGE_MODEL_PROFILE_HOME for tests.
+ */
+export function modelProfileHome(): string {
+	return process.env.CODEFORGE_MODEL_PROFILE_HOME?.trim() || path.join(os.homedir(), '.CodeForge');
+}
+
+export function modelProfilesRoot(): string {
+	return path.join(modelProfileHome(), 'ai', 'model-profiles');
+}
+
+/** Safe directory segment for a model or server id. */
+export function modelSafeName(raw: string): string {
+	return String(raw ?? '')
+		.trim()
+		.replace(/[^\w.-]+/g, '_')
+		.replace(/^_+|_+$/g, '')
+		.slice(0, 120) || 'unknown';
+}
+
+export function modelProfileDir(serverId: string, model: string): string {
+	return path.join(modelProfilesRoot(), modelSafeName(serverId), modelSafeName(model));
+}
+
 export function codeIndexDir(workspaceFolder: string): string {
 	return path.join(homeRoot(), 'code-index', workspaceHash(workspaceFolder));
 }

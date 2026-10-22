@@ -14,7 +14,13 @@ export const HISTORY_MAX = 20;
 export const DIGEST_MAX = 2000;
 
 export type StatusSource = 'model' | 'harness';
-export type StatusOutcome = 'done' | 'blocked' | 'max-steps' | 'cancelled' | 'error';
+export type StatusOutcome =
+	| 'done'
+	| 'blocked'
+	| 'max-steps'
+	| 'cancelled'
+	| 'error'
+	| 'stuck';
 
 export interface StatusRepoSnapshot {
 	head: string;
@@ -94,7 +100,16 @@ export function normalizeEntry(input: Partial<StatusEntry> & { objective?: strin
 }
 
 function normalizeOutcome(o: unknown): StatusOutcome {
-	if (o === 'blocked' || o === 'max-steps' || o === 'cancelled' || o === 'error' || o === 'done') return o;
+	if (
+		o === 'blocked' ||
+		o === 'max-steps' ||
+		o === 'cancelled' ||
+		o === 'error' ||
+		o === 'done' ||
+		o === 'stuck'
+	) {
+		return o;
+	}
 	return 'done';
 }
 
