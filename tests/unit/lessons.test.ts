@@ -2,9 +2,14 @@ import * as fs from 'fs/promises';
 import * as os from 'os';
 import * as path from 'path';
 import {
+	getExtendedLessons,
 	learnFromShellFailure,
+	learnFromShellSuccess,
+	lessonDecayScore,
 	lessonFromFailure,
+	lessonsForCommand,
 	lessonsForText,
+	recordLesson,
 	resetLessonsCacheForTests,
 } from '../../extensions/codeforge/src/memory/extendedMemory';
 
@@ -66,13 +71,80 @@ describe('dynamic shell lessons', () => {
 
 	it('puts a learned lesson back when the text matches', async () => {
 		await learnFromShellFailure(dir, 'git log --format="%h %an"', ambiguousAn);
-		const { getExtendedLessons } = await import(
-			'../../extensions/codeforge/src/memory/extendedMemory'
-		);
 		const all = await getExtendedLessons(dir);
 		expect(lessonsForText(all, 'please list files')).toEqual([]);
 		expect(lessonsForText(all, ambiguousAd).map(l => l.id)).toEqual([
 			lessonFromFailure('git log --format="%h %an"', ambiguousAn).id,
 		]);
+	});
+
+	it('unlearns on success of the same command signature', async () => {
+		const learned = await learnFromShellFailure(
+			dir,
+			'az account show',
+			'error: subscription not found in tenant'
+		);
+		expect(learned).toBeTruthy();
+		const cleared = await learnFromShellSuccess(dir, 'az account show');
+		expect(cleared?.id).toBe(learned!.lesson.id);
+		const all = await getExtendedLessons(dir);
+		expect(all.find(l => l.id === learned!.lesson.id)).toBeUndefined();
+	});
+
+	it('keeps a new lesson when the store is already full', async () => {
+		for (let i = 0; i < 40; i++) {
+			await recordLesson(dir, {
+				id: `shell.fill-${i}`,
+				kind: 'shell',
+				title: `fill ${i}`,
+				pattern: `cmd ${i}`,
+				advice: 'x',
+				match: `alpha${i}[\\s\\S]{0,40}beta${i}`,
+			});
+		}
+		const fresh = await recordLesson(dir, {
+			id: 'shell.fresh',
+			kind: 'shell',
+			title: 'fresh',
+			pattern: 'new',
+			advice: 'y',
+			match: 'freshone[\\s\\S]{0,40}freshtwo',
+		});
+		const all = await getExtendedLessons(dir);
+		expect(all.length).toBeLessThanOrEqual(40);
+		expect(all.some(l => l.id === fresh.id)).toBe(true);
+	});
+
+	it('does not inject aged or one-word-match lessons', async () => {
+		const old = await recordLesson(dir, {
+			id: 'shell.old',
+			kind: 'shell',
+			title: 'old',
+			pattern: 'az login',
+			advice: 'retry',
+			match: 'azure[\\s\\S]{0,40}login',
+			hits: 2,
+		});
+		const file = path.join(dir, '.CodeForge', 'memory', 'lessons.json');
+		const raw = JSON.parse(await fs.readFile(file, 'utf8')) as {
+			lessons: Array<{ id: string; lastSeen: string; match?: string; hits: number }>;
+		};
+		for (const l of raw.lessons) {
+			if (l.id === old.id) {
+				l.lastSeen = new Date(Date.now() - 30 * 86_400_000).toISOString();
+			}
+		}
+		raw.lessons.push({
+			id: 'shell.flag',
+			lastSeen: new Date().toISOString(),
+			hits: 5,
+			match: 'flag',
+		});
+		await fs.writeFile(file, JSON.stringify(raw, null, 2), 'utf8');
+		resetLessonsCacheForTests();
+		const all = await getExtendedLessons(dir);
+		expect(lessonDecayScore(all.find(l => l.id === old.id)!)).toBeLessThan(0.5);
+		expect(lessonsForCommand(all, 'az login').map(l => l.id)).not.toContain(old.id);
+		expect(all.find(l => l.id === 'shell.flag')?.inactive).toBe(true);
 	});
 });

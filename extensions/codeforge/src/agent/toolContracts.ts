@@ -81,6 +81,9 @@ export function buildToolSystemContract(
 	if (has('read') || has('search')) {
 		lines.push('Issue independent read/search calls together when useful.');
 	}
+	if (has('think')) {
+		lines.push('Call `think` before a non-obvious next action; it has no side effects.');
+	}
 	if (has('update_status')) {
 		lines.push('Prefer update_status before a final wrap-up.');
 	}
@@ -188,6 +191,8 @@ export const TOOL_DESCRIPTIONS = {
 	wiki_facts: 'List current project facts. No arguments.',
 	update_status:
 		'Save a handoff checkpoint before wrapping up: objective, stoppedAt, next (required); optional blockers, files.',
+	think:
+		'Record a short reasoning step before a non-obvious next action. thought required. No side effects — does not read or change files.',
 	browser_navigate: [
 		'Open a URL in the embedded browser agent. url required.',
 		'Result includes After page state (URL/title/text) — that state is the source of truth.',

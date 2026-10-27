@@ -23,8 +23,11 @@ export {
 export {
 	getExtendedLessons,
 	learnFromShellFailure,
+	learnFromShellSuccess,
 	formatLessonsForPrompt,
 	isShellNoiseFailure,
+	lessonDecayScore,
+	lessonsForCommand,
 	recordLesson,
 	type MemoryLesson,
 } from './extendedMemory';

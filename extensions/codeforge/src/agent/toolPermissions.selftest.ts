@@ -112,8 +112,13 @@ const ask = filterToolsByProfile(ALL, 'ask');
 assert(ask.has('read') && ask.has('web_fetch'), 'ask keeps read/web');
 assert(!ask.has('write') && !ask.has('shell'), 'ask denies write/shell');
 
+// Coach is JSON-reply-only (habits.json + SKILL.md are written by the harness, not the coach).
 const coach = filterToolsByProfile(ALL, 'coach');
-assert(coach.has('read') && coach.has('skill') && coach.has('write'), 'coach keeps read/skill/write');
+assert(coach.has('update_status'), 'coach keeps update_status');
+assert(
+	!coach.has('read') && !coach.has('skill') && !coach.has('write'),
+	'coach denies read/skill/write — JSON reply only'
+);
 assert(!coach.has('shell') && !coach.has('delete'), 'coach denies shell/delete');
 
 const status = filterToolsByProfile(ALL, 'status');

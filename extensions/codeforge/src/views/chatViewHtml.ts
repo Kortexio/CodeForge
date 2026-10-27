@@ -1170,7 +1170,7 @@ export function getChatViewHtml(assets: ChatViewAssets): string {
   }
 
   function renderThinking(reasoning, isPending, liveStatus) {
-    // Cursor-style: muted one-liner only (e.g. "Planning next moves") — no spinner, no tool log.
+    // Pending: muted live line (tool verb or short model narration). Gone when the turn finishes.
     if (isPending) {
       var status = String(liveStatus || 'Planning next moves').trim() || 'Planning next moves';
       return '<div class="thinking-live" aria-live="polite">' + escapeHtml(status) + '</div>';
@@ -1195,7 +1195,7 @@ export function getChatViewHtml(assets: ChatViewAssets): string {
       html += '<b>Generation</b><ul>';
       if (timings.completionTokens) html += '<li>Tokens: ' + Math.round(timings.completionTokens) + '</li>';
       if (timings.durationMs) html += '<li>Time: ' + Math.round(timings.durationMs) + ' ms</li>';
-      if (timings.tokensPerSecond) html += '<li>Speed: ' + Number(timings.tokensPerSecond).toFixed(1) + ' t/s</li>';
+      if (timings.tokensPerSecond) html += '<li>Decode: ' + Number(timings.tokensPerSecond).toFixed(1) + ' t/s</li>';
       html += '</ul>';
     }
     html += '</div></button>';

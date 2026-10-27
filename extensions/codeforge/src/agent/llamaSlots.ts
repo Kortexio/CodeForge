@@ -81,6 +81,44 @@ export function parseModelStatusArgs(body: unknown, modelId: string): LlamaSlotC
 	return capsFromArgs(args);
 }
 
+/**
+ * Context window from an OpenAI-compat / llama.cpp `/models` (or `/v1/models`) body.
+ * Prefers meta.n_ctx (llama.cpp); also accepts common vLLM / gateway fields.
+ * Returns the largest reported window (≥ 2048), or undefined when absent.
+ */
+export function contextWindowFromModelsList(body: unknown): number | undefined {
+	if (!body || typeof body !== 'object') return undefined;
+	const root = body as { data?: unknown; models?: unknown };
+	const rows = Array.isArray(root.data)
+		? root.data
+		: Array.isArray(root.models)
+			? root.models
+			: [];
+	const values: number[] = [];
+	for (const row of rows) {
+		if (!row || typeof row !== 'object') continue;
+		const r = row as Record<string, unknown>;
+		const meta =
+			r.meta && typeof r.meta === 'object' ? (r.meta as Record<string, unknown>) : undefined;
+		const candidates = [
+			meta?.n_ctx,
+			meta?.context_length,
+			r.n_ctx,
+			r.context_length,
+			r.max_model_len,
+			r.max_context_length,
+		];
+		for (const c of candidates) {
+			const n = Number(c);
+			if (Number.isFinite(n) && n >= 2048) {
+				values.push(Math.floor(n));
+			}
+		}
+	}
+	if (!values.length) return undefined;
+	return Math.max(...values);
+}
+
 /** Client budget cannot exceed the live slot window. */
 export function effectiveContextBudget(
 	configured: number | undefined,

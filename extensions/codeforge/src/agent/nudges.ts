@@ -58,8 +58,26 @@ export const MAX_STEPS_PROMPT = [
 ].join('\n');
 
 /**
- * Tool loop stuck (identical call+result / explore streak / UI unchanged). Distinct from step budget.
+ * Restart after an identical-call streak. The turn keeps going; only that repeat loop ends.
+ * Further reads of other paths are still allowed — verification is not a mutation.
  */
+export const IDENTICAL_STALL_RECOVERY = [
+	'The repeated calls have stopped. Those results are already in this conversation.',
+	'Do not repeat those exact calls.',
+	'Keep verifying with a different file, search, or command if you still need to check something.',
+	'Edit only when that check shows a change to make.',
+].join('\n');
+
+/** Tool result when an explore call repeats. The previous body is not sent again. */
+export function repeatedExploreRefusal(note: string): string {
+	return [
+		note,
+		'This result is already in the conversation. It was not sent again.',
+		'Do not repeat this exact call.',
+		'You can still read or search a different path, or run a command, if you need to verify more.',
+	].join('\n');
+}
+
 export function stuckWrapPrompt(cause: string): string {
 	return [
 		'CRITICAL — TOOLS STUCK WITHOUT PROGRESS',

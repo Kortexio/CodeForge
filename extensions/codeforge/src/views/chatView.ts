@@ -1789,7 +1789,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		);
 	}
 
-	/** Cursor-style muted status line (e.g. "Planning next moves") — not a tool audit log. */
+	/**
+	 * Muted live line while the agent works. Tool verbs stay short labels;
+	 * streamed model prose becomes a brief narration (sense of motion on long turns).
+	 * Cleared when the pending bubble leaves `pending` (see updateLastMessage).
+	 */
 	private setPendingLiveStatus(text: string): void {
 		let cleaned = String(text || '')
 			.replace(/\s+/g, ' ')
@@ -1812,12 +1816,40 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		else if (/^Deleting\b|^Renaming\b|^Inspecting\b/i.test(cleaned)) cleaned = 'Updating files';
 		else if (/^Running\b/i.test(cleaned)) cleaned = 'Running command';
 		else if (/^Updating status/i.test(cleaned)) cleaned = 'Updating status';
-		else cleaned = 'Planning next moves';
+		else if (/^\[(subagent|coach)\]/i.test(cleaned)) {
+			cleaned = cleaned.replace(/^\[(subagent|coach)\]\s*/i, '').trim() || cleaned;
+			cleaned = ChatViewProvider.liveNarrationSnippet(cleaned);
+		} else {
+			// Streamed assistant prose (or unknown status) — show intent, not a dead "Planning…" stub.
+			cleaned = ChatViewProvider.liveNarrationSnippet(cleaned);
+		}
 		const last = this._messages[this._messages.length - 1];
 		if (!last || last.role !== 'assistant' || last.status !== 'pending') return;
 		if (last.liveStatus === cleaned) return;
-		last.liveStatus = cleaned.slice(0, 64);
+		last.liveStatus = cleaned.slice(0, 160);
 		this.updateView();
+	}
+
+	/** Last sentence / trailing clause of streamed model text for the live status line. */
+	private static liveNarrationSnippet(text: string): string {
+		let t = String(text || '')
+			.replace(/\s+/g, ' ')
+			.trim();
+		if (!t) return 'Planning next moves';
+		// Drop obvious tool-JSON / fence noise.
+		if (/^[{[]/.test(t) || /^```/.test(t) || /"tool_calls"\s*:/.test(t)) {
+			return 'Planning next moves';
+		}
+		const sentences = t.split(/(?<=[.!?…])\s+/).filter(Boolean);
+		let pick = sentences.length ? sentences[sentences.length - 1]! : t;
+		if (pick.length < 16 && sentences.length > 1) {
+			pick = sentences.slice(-2).join(' ');
+		}
+		// Prefer a trailing window when the model dumps a long paragraph without punctuation.
+		if (pick.length > 140) {
+			pick = '…' + pick.slice(-137).trimStart();
+		}
+		return pick || 'Planning next moves';
 	}
 
 	private applyTurnMetrics(metrics: {

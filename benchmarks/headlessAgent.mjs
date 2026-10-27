@@ -190,7 +190,16 @@ async function resolveNumCtx(llm) {
 		/* probe is best-effort */
 	}
 	const caps = cachedLlamaSlots(llm.serverId, llm.model);
-	return effectiveContextBudget(llm.numCtx, caps) ?? llm.numCtx;
+	const probed = effectiveContextBudget(llm.numCtx, caps) ?? llm.numCtx;
+	const hard = Number(process.env.CODEFORGE_BENCH_NUM_CTX);
+	const cap = Number.isFinite(hard) && hard >= 2048 ? Math.floor(hard) : 0;
+	const numCtx = cap > 0 ? Math.min(probed, cap) : probed;
+	if (numCtx < llm.numCtx) {
+		console.log(
+			`numCtx ${llm.numCtx} clamped to ${numCtx} (server slot / bench cap) so the request cannot grow the KV cache`
+		);
+	}
+	return numCtx;
 }
 
 async function main() {
@@ -271,6 +280,23 @@ async function main() {
 		process.env.CODEFORGE_MODEL_PROFILE_HOME = path.join(os.homedir(), '.CodeForge');
 	}
 
+	let modelProfile;
+	if (flags.profileOverride) {
+		let override;
+		try {
+			override = JSON.parse(String(flags.profileOverride));
+		} catch (err) {
+			die(`invalid --profileOverride JSON: ${err instanceof Error ? err.message : String(err)}`);
+		}
+		const { resolveProfileForRun, mergeModelProfile } = require(
+			path.join(EXT_OUT, 'agent', 'modelProfile.js')
+		);
+		modelProfile = mergeModelProfile(
+			resolveProfileForRun(llm.serverId || 'default', llm.model, sampling),
+			override
+		);
+	}
+
 	const started = Date.now();
 	let reply = '';
 	let loopExit = 'unknown';
@@ -278,6 +304,7 @@ async function main() {
 		const bridge = new VSCodeAIBridge(vscode.window.createOutputChannel());
 		bridge.setFallbackWorkspaceRoot(workspace);
 		const agentOpts = {
+			...(modelProfile ? { modelProfile } : {}),
 			bridge,
 			provider: llm.provider,
 			apiKey: llm.apiKey,
@@ -381,6 +408,7 @@ async function main() {
 		server: llm.serverName,
 		serverId: llm.serverId,
 		weakProfile: weak,
+		...(modelProfile ? { profileOverride: JSON.parse(String(flags.profileOverride)) } : {}),
 		numCtx,
 		toolCallMode: probe.toolCallMode,
 		toolCallModeDetail: probe.detail,

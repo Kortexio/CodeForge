@@ -28,6 +28,8 @@ import {
 import { buildToolSystemContract, toolDescription } from './toolContracts';
 import { resolveProfileForRun, type ModelProfile } from './modelProfile';
 import { applyHarnessKnobs, learnedHarnessBlock, loadHarnessArtifact } from './harnessRevision';
+import { stampForProfile } from './harnessFingerprint';
+import { createThinkingEscalation } from './thinkingEscalation';
 import { normalizeToolCall, type JsonSchemaLike } from './toolCallNormalizer';
 import { looksLikeXmlToolMarkup, parseXmlToolCalls } from './xmlToolCalls';
 import {
@@ -80,7 +82,11 @@ import {
 } from '../skills/skillCatalog';
 import { runAgentHooks } from '../hooks/hooksRunner';
 import { getSessionWikiStore } from '../memory/sessionWiki';
-import { learnFromShellFailure, isShellNoiseFailure } from '../memory/extendedMemory';
+import {
+	learnFromShellFailure,
+	learnFromShellSuccess,
+	isShellNoiseFailure,
+} from '../memory/extendedMemory';
 import { getProjectWikiStore } from '../memory/projectWiki';
 import {
 	discoverStatusRefs,
@@ -110,6 +116,8 @@ import {
 	specSelfCheckNote,
 	TRUNCATED_TOOL_JSON_FINAL_NOTE,
 	TRUNCATED_TOOL_JSON_NOTE,
+	IDENTICAL_STALL_RECOVERY,
+	repeatedExploreRefusal,
 	LENGTH_EXHAUSTED_PROMPT,
 	MAX_STEPS_PROMPT,
 	stuckWrapPrompt,
@@ -178,18 +186,26 @@ import {
 	isExploreToolName,
 } from './loopDetector';
 import {
+	applyCoachReply,
 	appendRoundResult,
 	coachTaskPrompt,
 	collectLockablePaths,
 	denyExperimentMutation,
 	experimentSystemHint,
+	featureKeyFromLock,
 	lockedScorePaths,
 	readChecksLock,
+	readHabitsFile,
 	readRoundResults,
 	shouldRunCoach,
 	writeChecksLock,
 	type ChecksLock,
 } from './experimentLoop';
+import {
+	formatLessonItem,
+	getExtendedLessons,
+	lessonsForCommand,
+} from '../memory/extendedMemory';
 import { getEditJournal } from './editJournal';
 import { webFetch, webSearch } from './webTools';
 import { formatTodos, writeTodos } from './todoStore';
@@ -1045,6 +1061,23 @@ export const AGENT_TOOLS = [
 	{
 		type: 'function' as const,
 		function: {
+			name: 'think',
+			description: toolDescription('think'),
+			parameters: {
+				type: 'object',
+				properties: {
+					thought: {
+						type: 'string',
+						description: 'Reasoning about the next action. No side effects.',
+					},
+				},
+				required: ['thought'],
+			},
+		},
+	},
+	{
+		type: 'function' as const,
+		function: {
 			name: 'browser_navigate',
 			description: toolDescription('browser_navigate'),
 			parameters: {
@@ -1243,6 +1276,8 @@ type ChatMessage = {
 	tool_call_id?: string;
 	name?: string;
 	tool_calls?: ToolCall[];
+	/** Kept only for the current turn when the profile thinks on tool rounds. */
+	reasoning_content?: string;
 };
 
 interface ToolCall {
@@ -1383,21 +1418,33 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 	const base = (opts.baseUrl || defaultBase(opts.provider)).replace(/\/$/, '');
 	let turnPromptTokens: number | undefined;
 	let turnCompletionTokens = 0;
-	let turnDurationMs = 0;
+	/** Wall-clock sum of LLM HTTP calls (includes prefill / queue). */
+	let turnWallMs = 0;
+	/** Decode-only sum (first token → end), when streaming measures it. */
+	let turnGenerationMs = 0;
+	/** Token-weighted sum of server-reported predicted_per_second (llama.cpp). */
+	let turnServerTpsNum = 0;
+	let turnServerTpsDen = 0;
 	const turnReasoningParts: string[] = [];
 	const emitTurnMetrics = () => {
 		const hasTokens =
-			turnPromptTokens !== undefined || turnCompletionTokens > 0 || turnDurationMs > 0;
+			turnPromptTokens !== undefined || turnCompletionTokens > 0 || turnWallMs > 0;
 		const reasoning = turnReasoningParts.join('\n\n').trim() || undefined;
 		if (!hasTokens && !reasoning) return;
-		const tokensPerSecond =
-			turnCompletionTokens > 0 && turnDurationMs > 0
-				? turnCompletionTokens / (turnDurationMs / 1000)
-				: undefined;
+		// Prefer server decode speed, then client first-token→end, never wall-clock÷tokens
+		// (wall includes prefill and under-reports tok/s for long prompts).
+		let tokensPerSecond: number | undefined;
+		if (turnServerTpsDen > 0) {
+			tokensPerSecond = turnServerTpsNum / turnServerTpsDen;
+		} else if (turnCompletionTokens > 0 && turnGenerationMs > 0) {
+			tokensPerSecond = turnCompletionTokens / (turnGenerationMs / 1000);
+		}
+		const durationMs =
+			turnGenerationMs > 0 ? turnGenerationMs : turnWallMs > 0 ? turnWallMs : undefined;
 		opts.onTurnMetrics?.({
 			promptTokens: turnPromptTokens,
 			completionTokens: turnCompletionTokens > 0 ? turnCompletionTokens : undefined,
-			durationMs: turnDurationMs > 0 ? turnDurationMs : undefined,
+			durationMs,
 			tokensPerSecond,
 			reasoning,
 		});
@@ -1417,6 +1464,21 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 		opts.model,
 		harnessOverride || undefined
 	);
+	const runStamp = stampForProfile(
+		loadedProfile,
+		learnedHarness.revision,
+		AGENT_TOOLS.map(t => ({
+			name: t.function.name,
+			parameters: t.function.parameters,
+		}))
+	);
+	if (
+		loadedProfile.calibration?.contract &&
+		loadedProfile.calibration.contract !== runStamp.contract &&
+		!loadedProfile.calibration.stale
+	) {
+		loadedProfile.calibration = { ...loadedProfile.calibration, stale: true };
+	}
 	const modelProfile = applyHarnessKnobs(loadedProfile, learnedHarness);
 	opts.modelProfile = modelProfile;
 	if (modelProfile.toolTransport === 'text' && opts.proseToolsOnly !== false) {
@@ -1499,8 +1561,8 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 	const planModeHint = opts.coachMode
 		? [
 				'### COACH MODE (active)',
-				'Update only .CodeForge/skills/how-to-work/SKILL.md from the experiment results.',
-				'Do not edit application code, tests, oracle.json, or checks.lock.',
+				'Reply with one JSON object only (rounds + habit or NO_ENTRY). No file edits.',
+				'The harness writes habits.json and regenerates how-to-work/SKILL.md.',
 			].join('\n')
 		: opts.askMode
 		? [
@@ -1548,7 +1610,11 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 		'The IDE runs build/test (oracle) after writes and when you finish; done when green. If blocked, reply `blocked: <reason>`.',
 		opts.planMode
 			? 'In plan mode you may reason carefully before exploring (/think).'
-			: 'On tool rounds call tools directly (/no_think).',
+			: modelProfile.thinking.toolRounds
+				? 'Thinking is on for tool rounds (/think).'
+				: modelProfile.thinking.escalate !== false
+					? 'On tool rounds call tools directly (/no_think). After a blocked tool, failed edit, or red build/test, the next round thinks once. Call `think` before a non-obvious next action; it has no side effects.'
+					: 'On tool rounds call tools directly (/no_think). Call `think` before a non-obvious next action; it has no side effects.',
 		opts.forceJson
 			? 'This server expects JSON responses. Prefer native tool_calls when available; otherwise reply with ONLY JSON like {"tool_calls":[{"id":"call_1","type":"function","function":{"name":"write","arguments":{"path":"...","content":"..."}}}]} — no markdown fences.'
 			: '',
@@ -1571,7 +1637,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 			: '',
 		agentsMdSection,
 		forcedSkillSection,
-		learnedHarnessBlock(learnedHarness),
+		learnedHarnessBlock(learnedHarness, runStamp.contract),
 		mcpHint,
 	]
 		.filter(Boolean)
@@ -1662,6 +1728,22 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 	const emitProtocol = (label: string, detail?: string) => {
 		opts.onActivity?.({ kind: 'protocol', label, detail });
 	};
+	emitProtocol(
+		'config',
+		JSON.stringify({
+			contract: runStamp.contract,
+			configHash: runStamp.configHash,
+			harnessRevision: runStamp.harnessRevision,
+		})
+	);
+	const thinkingEscalation = createThinkingEscalation({
+		enabled:
+			modelProfile.thinking.escalate !== false &&
+			modelProfile.thinking.supported !== false &&
+			!modelProfile.thinking.toolRounds,
+		maxPerTurn: modelProfile.thinking.maxEscalationsPerTurn ?? 6,
+	});
+	let keepReasoningThisTurn = modelProfile.thinking.toolRounds === true;
 	let protocolSizedOnce = false;
 	const touchedPaths = new Set<string>();
 	/** Paths successfully written/edited this turn — used for the project handoff. */
@@ -1691,7 +1773,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 	/** Caps step-=1 refunds so repair/overflow paths cannot spin forever. */
 	let refundedSteps = 0;
 	const MAX_REFUNDED_STEPS = 12;
-	const loopDetector = createLoopDetector();
+	const loopDetector = createLoopDetector({ stallThreshold: modelProfile.loop?.stallThreshold });
 	/** Retries when gateway rejects truncated tool-call JSON (common with large writes). */
 	let truncatedToolRetries = 0;
 	/** Retries when model dumps tool JSON in content but parse fails. */
@@ -2168,12 +2250,19 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 			const roundMaxTokens = preferShortCompletion
 				? Math.min(completionCap, SHORT_COMPLETION_TOKENS)
 				: completionCap;
+			const escalatedThisRound = thinkingEscalation.nextRoundThinks();
+			if (escalatedThisRound) {
+				keepReasoningThisTurn = true;
+				emitProtocol('escalatedRounds', '1');
+			}
 			const round = await postAgentRound(
 				opts,
 				url,
-				sanitizeMessages(messages),
+				sanitizeMessages(messages, keepReasoningThisTurn),
 				roundMaxTokens,
-				roundTools
+				roundTools,
+				'auto',
+				escalatedThisRound
 			);
 			if (!round.ok) {
 				const errText = round.errorText;
@@ -2388,12 +2477,29 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 			});
 
 			const callDuration = Date.now() - llmStart;
-			turnDurationMs += callDuration;
+			turnWallMs += callDuration;
 			const tokensInCall = Number(data.usage?.prompt_tokens ?? data.usage?.input_tokens ?? 0) || 0;
 			const tokensOutCall =
 				Number(data.usage?.completion_tokens ?? data.usage?.output_tokens ?? 0) || 0;
 			if (tokensInCall > 0) turnPromptTokens = tokensInCall;
 			if (tokensOutCall > 0) turnCompletionTokens += tokensOutCall;
+			const serverTps = Number(data.timings?.predicted_per_second);
+			if (Number.isFinite(serverTps) && serverTps > 0 && tokensOutCall > 0) {
+				turnServerTpsNum += serverTps * tokensOutCall;
+				turnServerTpsDen += tokensOutCall;
+			} else if (
+				typeof data.generationMs === 'number' &&
+				data.generationMs > 0 &&
+				tokensOutCall > 0
+			) {
+				turnGenerationMs += data.generationMs;
+			} else if (
+				typeof data.timings?.predicted_ms === 'number' &&
+				data.timings.predicted_ms > 0 &&
+				tokensOutCall > 0
+			) {
+				turnGenerationMs += data.timings.predicted_ms;
+			}
 
 			const msg = data.choices?.[0]?.message;
 			if (!msg) {
@@ -2420,6 +2526,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 			content = content.trim();
 
 			if (thoughtRaw && thoughtRaw !== content) {
+				emitProtocol('reasoningRounds', '1');
 				turnReasoningParts.push(String(thoughtRaw));
 				opts.onActivity?.({
 					kind: 'thought',
@@ -2662,6 +2769,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					};
 					if (!result.ok && oracleRejections < MAX_ORACLE_REJECTIONS && step + 1 < stepBudget) {
 						oracleRejections += 1;
+						thinkingEscalation.note('oracle_red');
 						if (experimentOn) {
 							const journal = getEditJournal();
 							const turn = journal.getTurn();
@@ -2894,12 +3002,22 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					depth === 0
 				) {
 					const rounds = await readRoundResults(opts.workspaceRoot);
-					if (shouldRunCoach(rounds)) {
-						opts.onStatus?.('Coach: updating how-to-work…');
+					const lockForCoach = await readChecksLock(opts.workspaceRoot);
+					const habitsFile = await readHabitsFile(opts.workspaceRoot);
+					const featureKey = lockForCoach
+						? featureKeyFromLock(lockForCoach)
+						: opts.task || '';
+					if (
+						shouldRunCoach(rounds, {
+							featureKey,
+							coachedFeatures: habitsFile.coachedFeatures,
+						})
+					) {
+						opts.onStatus?.('Coach: proposing habit…');
 						opts.onActivity?.({
 							kind: 'checkpoint',
 							label: 'Method coach',
-							detail: 'Updating how-to-work from experiment results',
+							detail: 'JSON habit from experiment results',
 						});
 						try {
 							const coachReply = await runAgentWithTools({
@@ -2909,13 +3027,19 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 								planMode: false,
 								isolated: true,
 								history: [],
-								maxSteps: 6,
+								maxSteps: 4,
 								depth: depth + 1,
 								onStatus: text => opts.onStatus?.(`[coach] ${text}`),
 								onActivity: ev =>
 									opts.onActivity?.({ ...ev, label: `[coach] ${ev.label}` }),
 							});
-							reply += `\n\n### Method coach\n${coachReply}`;
+							const applied = await applyCoachReply(
+								opts.workspaceRoot,
+								coachReply,
+								rounds,
+								lockForCoach
+							);
+							reply += `\n\n### Method coach\n${applied.summary}`;
 						} catch (err) {
 							const msg = err instanceof Error ? err.message : String(err);
 							reply += `\n\n### Method coach\n(failed: ${msg})`;
@@ -2930,6 +3054,9 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 				role: 'assistant',
 				content: assistantContent || '',
 				tool_calls: toolCalls,
+				...(keepReasoningThisTurn && thoughtRaw
+					? { reasoning_content: thoughtRaw }
+					: {}),
 			});
 			lengthTruncationNudges = 0;
 			preferShortCompletion = false;
@@ -2953,8 +3080,10 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 			}
 			const lane: ParallelIoJob[] = [];
 
-			const noteIdenticalCall = (fingerprint: string, content: string): string => {
+			const noteIdenticalCall = (fingerprint: string, content: string, toolName = ''): string => {
 				const { note } = loopDetector.recordCall(fingerprint, hashResult(content));
+				if (note) thinkingEscalation.note('loop_note');
+				if (note && isExploreToolName(toolName)) return repeatedExploreRefusal(note);
 				return note ? `${note}\n${content}` : content;
 			};
 
@@ -3064,6 +3193,12 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					failedFingerprints.set(fingerprint, priorFails + 1);
 					failedAtWriteCount.set(fingerprint, successfulWriteCount);
 					if (
+						(name === 'edit' || name === 'apply_patch') &&
+						/old_string was not found|hunk \d+:|apply_patch:/i.test(output)
+					) {
+						thinkingEscalation.note('edit_miss');
+					}
+					if (
 						name === 'browser_click' ||
 						name === 'browser_type' ||
 						name === 'browser_navigate'
@@ -3121,6 +3256,22 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 										kind: 'checkpoint',
 										label: 'Lesson learned',
 										detail: learned.lesson.id,
+									});
+								}
+							} catch {
+								/* best-effort */
+							}
+						} else {
+							try {
+								const cleared = await learnFromShellSuccess(
+									opts.workspaceRoot,
+									original
+								);
+								if (cleared) {
+									opts.onActivity?.({
+										kind: 'checkpoint',
+										label: 'Lesson cleared',
+										detail: cleared.id,
 									});
 								}
 							} catch {
@@ -3307,14 +3458,17 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 				}
 
 				if (name === 'read' && pathKey && success) {
-					const diskBody = (() => {
-						const m = /^\(unchanged since step \d+\)\n/.exec(output);
-						return m ? output.slice(m[0].length) : output;
-					})();
+					const unchangedMarker = /^\(unchanged since step \d+\)\n/.exec(output)?.[0];
+					const diskBody = unchangedMarker ? output.slice(unchangedMarker.length) : output;
 					const { note } = loopDetector.recordCall(fingerprint, hashResult(diskBody));
-					if (note) output = `${note}\n${output}`;
+					if (note) {
+						thinkingEscalation.note('loop_note');
+						output = isExploreToolName(name)
+							? `${unchangedMarker ?? ''}${repeatedExploreRefusal(note)}`
+							: `${note}\n${output}`;
+					}
 				} else {
-					output = noteIdenticalCall(fingerprint, output);
+					output = noteIdenticalCall(fingerprint, output, name);
 				}
 
 				messages.push({
@@ -3390,6 +3544,26 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					toolSchemas: agentToolSchemas,
 				});
 				if (normalized.notes.length) toolAdvice.push(...normalized.notes);
+				if (call.function.name === 'shell' || call.function.name === 'dotnet') {
+					try {
+						const cmdPreview =
+							call.function.name === 'dotnet'
+								? dotnetCommandLine(args)
+								: String(args.command ?? '');
+						const lessons = await getExtendedLessons(opts.workspaceRoot);
+						const matched = lessonsForCommand(lessons, cmdPreview, 3);
+						if (matched.length) {
+							toolAdvice.push(
+								[
+									'(lessons matching this command)',
+									...matched.map(formatLessonItem),
+								].join('\n')
+							);
+						}
+					} catch {
+						/* best-effort */
+					}
+				}
 				if (normalized.leakedArgs?.length) {
 					if (!normalized.error) emitProtocol('badArgs', '1');
 					emitProtocol(
@@ -3439,6 +3613,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					trace?.info('harness', String(content.length));
 					messages.push({ role: 'tool', tool_call_id: call.id, name, content });
 					actions.push(`${name} blocked (${label})`);
+					thinkingEscalation.note('guardrail_refusal');
 					opts.onActivity?.({
 						kind: 'tool',
 						label: `${name} blocked (${label})`,
@@ -3998,8 +4173,19 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 			loopDetector.endStep();
 			loopDetector.setUnchangedStreak(unchangedStreak);
 
-			// Hard stop when tools loop without progress — no coaching nudges.
+			// Identical re-reads end the repeat loop and the turn continues.
+			// A browser UI that stays unchanged still ends the turn.
 			if (loopDetector.shouldStop() && step >= 2) {
+				if (loopDetector.stallKind() === 'identical') {
+					loopDetector.resetIdenticalStreak();
+					messages.push({ role: 'user', content: IDENTICAL_STALL_RECOVERY });
+					opts.onActivity?.({
+						kind: 'checkpoint',
+						label: 'Repeated reads stopped',
+						detail: 'continue verifying without repeating those calls',
+					});
+					continue;
+				}
 				loopExit = 'stuck';
 				stuckCause = loopDetector.cause();
 				opts.onActivity?.({
@@ -4099,7 +4285,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 			const wrap = await postAgentRound(
 				opts,
 				url,
-				sanitizeMessages(messages),
+				sanitizeMessages(messages, keepReasoningThisTurn),
 				SHORT_COMPLETION_TOKENS,
 				toolsForRound(
 					activeToolNames,
@@ -4388,6 +4574,17 @@ async function executeTool(
 				return await webSearch(String(args.query ?? ''), Number(args.max_results ?? 8));
 			case 'web_fetch':
 				return await webFetch(String(args.url ?? ''), Number(args.max_chars ?? 40_000));
+			case 'think': {
+				const thought = String(args.thought ?? '').trim();
+				opts.onActivity?.({
+					kind: 'protocol',
+					label: 'thinkToolCalls',
+					detail: '1',
+				});
+				return thought
+					? `Thought recorded (${thought.length} chars). Continue with the next tool action.`
+					: 'Thought recorded. Continue with the next tool action.';
+			}
 			case 'todo_write': {
 				const list = Array.isArray(args.todos) ? args.todos : [];
 				const normalized = list.map((t: unknown) => {
@@ -4888,7 +5085,8 @@ async function postAgentRound(
 	maxTokens = 8192,
 	tools: typeof AGENT_TOOLS = AGENT_TOOLS,
 	/** Keep tool schemas but forbid calls (prefix-cache friendly wrap-up). */
-	toolChoice: 'auto' | 'none' = 'auto'
+	toolChoice: 'auto' | 'none' = 'auto',
+	escalatedThinking = false
 ): Promise<{
 	ok: boolean;
 	status: number;
@@ -4900,11 +5098,16 @@ async function postAgentRound(
 	}
 
 	const withTools = !opts.proseToolsOnly && tools.length > 0 && toolChoice !== 'none';
+	const toolRoundThinking = opts.modelProfile?.thinking?.toolRounds === true;
+	const thinkingSupported = opts.modelProfile?.thinking?.supported;
 	const thinkInput: ThinkingRoundInput & { tools?: typeof AGENT_TOOLS } = {
 		model: opts.model,
+		thinkingSupported,
 		planMode: !!opts.planMode,
 		withTools,
 		proseToolsOnly: !!opts.proseToolsOnly,
+		toolRoundThinking,
+		escalatedThinking,
 		tools,
 	};
 	const profileSamp = opts.modelProfile?.sampling;
@@ -4924,10 +5127,21 @@ async function postAgentRound(
 	if (typeof sampling.dry_multiplier === 'number') {
 		samplingExtras.dry_multiplier = sampling.dry_multiplier;
 	}
-	const cappedTokens = toolAwareMaxTokens(maxTokens, thinkInput, opts.modelProfile?.completion);
+	const cappedTokens = toolAwareMaxTokens(
+		maxTokens,
+		thinkInput,
+		opts.modelProfile
+			? {
+					...opts.modelProfile.completion,
+					thinkingMaxTokens: opts.modelProfile.thinking.maxTokens,
+				}
+			: undefined
+	);
 	const disableThink = shouldDisableThinking(thinkInput);
 	const enableThink = shouldEnableThinking(thinkInput);
-	let outbound = stripReasoningFromMessages(messages);
+	let outbound = stripReasoningFromMessages(messages, {
+		keepCurrentTurn: toolRoundThinking || escalatedThinking,
+	});
 	if (disableThink || enableThink) {
 		outbound = applySoftThinkSwitch(outbound, disableThink);
 	}
@@ -4985,6 +5199,7 @@ async function postAgentRound(
 					...llmJsonOptions(opts.forceJson),
 					...llmThinkingRequestFields({
 						model: opts.model,
+						thinkingSupported,
 						planMode: !!opts.planMode,
 						withTools: false,
 						proseToolsOnly: !!opts.proseToolsOnly,
@@ -5015,6 +5230,16 @@ async function postAgentRound(
 	}
 }
 
+/** llama.cpp / compatible server decode+prefill timings (OpenAI-compat extension). */
+type ServerLlmTimings = {
+	predicted_per_second?: number;
+	prompt_per_second?: number;
+	predicted_ms?: number;
+	prompt_ms?: number;
+	predicted_n?: number;
+	prompt_n?: number;
+};
+
 type ChatCompletionData = {
 	choices?: Array<{
 		message?: {
@@ -5033,7 +5258,28 @@ type ChatCompletionData = {
 		input_tokens?: number;
 		output_tokens?: number;
 	};
+	timings?: ServerLlmTimings;
+	/** Client-measured decode window (first streamed token → end), ms. */
+	generationMs?: number;
 };
+
+function pickServerTimings(raw: unknown): ServerLlmTimings | undefined {
+	if (!raw || typeof raw !== 'object') return undefined;
+	const t = raw as Record<string, unknown>;
+	const num = (k: string): number | undefined => {
+		const v = t[k];
+		return typeof v === 'number' && Number.isFinite(v) ? v : undefined;
+	};
+	const out: ServerLlmTimings = {
+		predicted_per_second: num('predicted_per_second'),
+		prompt_per_second: num('prompt_per_second'),
+		predicted_ms: num('predicted_ms'),
+		prompt_ms: num('prompt_ms'),
+		predicted_n: num('predicted_n'),
+		prompt_n: num('prompt_n'),
+	};
+	return Object.values(out).some(v => v !== undefined) ? out : undefined;
+}
 
 /**
  * Read a chat completion — prefers true SSE streaming with live deltas.
@@ -5053,12 +5299,9 @@ async function readChatCompletionResponse(
 			!ctype.includes('application/json'));
 
 	if (canStream && response.body) {
-		try {
-			return await streamSseChatCompletion(response.body, onDelta);
-		} catch (err) {
-			// Fall through to buffered read when streaming fails mid-flight.
-			if (err instanceof Error && /abort/i.test(err.message)) throw err;
-		}
+		// Do not fall through to response.text(): the stream reader already
+		// consumed the body, and a second read hides the real failure.
+		return await streamSseChatCompletion(response.body, onDelta);
 	}
 
 	const text = await response.text();
@@ -5070,7 +5313,10 @@ async function readChatCompletionResponse(
 		}
 		return data;
 	}
-	return liftProseToolsFromCompletion(JSON.parse(text) as ChatCompletionData);
+	const parsed = JSON.parse(text) as ChatCompletionData & { timings?: unknown };
+	const lifted = liftProseToolsFromCompletion(parsed);
+	const timings = pickServerTimings(parsed.timings) ?? lifted.timings;
+	return timings ? { ...lifted, timings } : lifted;
 }
 
 async function streamSseChatCompletion(
@@ -5087,18 +5333,28 @@ async function streamSseChatCompletion(
 		{ id: string; type: 'function'; function: { name: string; arguments: string } }
 	>();
 	let usage: ChatCompletionData['usage'];
+	let timings: ServerLlmTimings | undefined;
 	let finishReason: string | null | undefined;
 	let stopReason: string | null | undefined;
 	let sawToolDelta = false;
+	let firstTokenAt: number | undefined;
+
+	const markFirstToken = () => {
+		if (firstTokenAt === undefined) firstTokenAt = Date.now();
+	};
 
 	const appendReasoning = (raw: unknown) => {
-		if (typeof raw === 'string' && raw) reasoning += raw;
+		if (typeof raw === 'string' && raw) {
+			reasoning += raw;
+			markFirstToken();
+		}
 	};
 
 	const applyChunk = (payload: string) => {
 		if (!payload || payload === '[DONE]') return;
 		let chunk: {
 			usage?: ChatCompletionData['usage'];
+			timings?: unknown;
 			choices?: Array<{
 				finish_reason?: string | null;
 				stop_reason?: string | null;
@@ -5129,6 +5385,8 @@ async function streamSseChatCompletion(
 			return;
 		}
 		if (chunk.usage) usage = chunk.usage;
+		const fromChunk = pickServerTimings(chunk.timings);
+		if (fromChunk) timings = fromChunk;
 		const choice = chunk.choices?.[0];
 		if (!choice) return;
 		if (choice.finish_reason) finishReason = choice.finish_reason;
@@ -5136,6 +5394,7 @@ async function streamSseChatCompletion(
 		if (choice.message) {
 			if (choice.message.content) {
 				content += choice.message.content;
+				markFirstToken();
 				if (!sawToolDelta) onDelta?.(content);
 			}
 			appendReasoning(choice.message.reasoning_content);
@@ -5143,6 +5402,7 @@ async function streamSseChatCompletion(
 			appendReasoning(choice.message.thinking);
 			if (choice.message.tool_calls?.length) {
 				sawToolDelta = true;
+				markFirstToken();
 				for (let i = 0; i < choice.message.tool_calls.length; i++) {
 					const tc = choice.message.tool_calls[i];
 					toolMap.set(i, {
@@ -5161,6 +5421,7 @@ async function streamSseChatCompletion(
 		if (!delta) return;
 		if (typeof delta.content === 'string' && delta.content) {
 			content += delta.content;
+			markFirstToken();
 			if (!sawToolDelta) onDelta?.(content);
 		}
 		appendReasoning(delta.reasoning_content);
@@ -5168,6 +5429,7 @@ async function streamSseChatCompletion(
 		appendReasoning(delta.thinking);
 		for (const tc of delta.tool_calls ?? []) {
 			sawToolDelta = true;
+			markFirstToken();
 			const idx = tc.index ?? 0;
 			const prev = toolMap.get(idx) ?? {
 				id: tc.id || `call_${idx}`,
@@ -5198,6 +5460,9 @@ async function streamSseChatCompletion(
 		if (trimmed.startsWith('data:')) applyChunk(trimmed.slice(5).trim());
 	}
 
+	const generationMs =
+		firstTokenAt !== undefined ? Math.max(1, Date.now() - firstTokenAt) : undefined;
+
 	const tool_calls = [...toolMap.entries()]
 		.sort((a, b) => a[0] - b[0])
 		.map(([, v]) => v)
@@ -5215,6 +5480,8 @@ async function streamSseChatCompletion(
 					},
 				],
 				usage,
+				timings,
+				generationMs,
 			};
 		}
 	}
@@ -5232,6 +5499,8 @@ async function streamSseChatCompletion(
 			},
 		],
 		usage,
+		timings,
+		generationMs,
 	});
 }
 
@@ -5301,6 +5570,7 @@ function aggregateSseChatCompletion(raw: string): ChatCompletionData {
 		{ id: string; type: 'function'; function: { name: string; arguments: string } }
 	>();
 	let usage: ChatCompletionData['usage'];
+	let timings: ServerLlmTimings | undefined;
 	let finishReason: string | null | undefined;
 	let stopReason: string | null | undefined;
 
@@ -5315,6 +5585,7 @@ function aggregateSseChatCompletion(raw: string): ChatCompletionData {
 		if (!payload || payload === '[DONE]') continue;
 		let chunk: {
 			usage?: ChatCompletionData['usage'];
+			timings?: unknown;
 			choices?: Array<{
 				finish_reason?: string | null;
 				stop_reason?: string | null;
@@ -5347,6 +5618,8 @@ function aggregateSseChatCompletion(raw: string): ChatCompletionData {
 		if (chunk.usage) {
 			usage = chunk.usage;
 		}
+		const fromChunk = pickServerTimings(chunk.timings);
+		if (fromChunk) timings = fromChunk;
 		const choice = chunk.choices?.[0];
 		if (!choice) continue;
 		if (choice.finish_reason) finishReason = choice.finish_reason;
@@ -5412,6 +5685,7 @@ function aggregateSseChatCompletion(raw: string): ChatCompletionData {
 					},
 				],
 				usage,
+				timings,
 			};
 		}
 	}
@@ -5429,6 +5703,7 @@ function aggregateSseChatCompletion(raw: string): ChatCompletionData {
 			},
 		],
 		usage,
+		timings,
 	};
 }
 
@@ -5659,7 +5934,7 @@ export function parseToolArguments(raw: string): Record<string, unknown> {
 	}
 }
 
-function sanitizeMessages(messages: ChatMessage[]): ChatMessage[] {
+function sanitizeMessages(messages: ChatMessage[], keepCurrentTurnReasoning = false): ChatMessage[] {
 	return stripReasoningFromMessages(
 		messages.map(m => {
 			const content =
@@ -5667,6 +5942,7 @@ function sanitizeMessages(messages: ChatMessage[]): ChatMessage[] {
 			const next: ChatMessage = { role: m.role, content };
 			if (m.tool_call_id) next.tool_call_id = m.tool_call_id;
 			if (m.name) next.name = m.name;
+			if (m.reasoning_content) next.reasoning_content = m.reasoning_content;
 			if (m.tool_calls?.length) {
 				next.tool_calls = m.tool_calls.map(tc => {
 					const args = toWireToolArguments(tc.function.arguments ?? '', parseToolArguments);
@@ -5676,7 +5952,8 @@ function sanitizeMessages(messages: ChatMessage[]): ChatMessage[] {
 				});
 			}
 			return next;
-		})
+		}),
+		{ keepCurrentTurn: keepCurrentTurnReasoning }
 	);
 }
 

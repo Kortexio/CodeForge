@@ -119,19 +119,8 @@ export const PLAN_ALLOWED_TOOLS = [
 	'apply_patch',
 ] as const;
 
-/** Method coach: read + skill + write/edit gated to how-to-work only. */
-export const COACH_ALLOWED_TOOLS = [
-	'list',
-	'read',
-	'search',
-	'retrieve',
-	'skill',
-	'write',
-	'edit',
-	'apply_patch',
-	'update_status',
-	'todo_write',
-] as const;
+/** Method coach: JSON reply only; harness writes habits.json + SKILL.md. */
+export const COACH_ALLOWED_TOOLS = ['think', 'update_status'] as const;
 
 const EXPLORE_ALLOWED = [
 	'read',
@@ -170,6 +159,7 @@ export const CORE = [
 	'diagnostics',
 	'todo_write',
 	'delegate_task',
+	'think',
 	'update_status',
 	'skill',
 ] as const;

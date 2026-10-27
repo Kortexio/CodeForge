@@ -26,7 +26,6 @@ import {
 import { getContextProviderRegistry } from '../context/providers';
 import { getSessionWikiStore } from '../memory/sessionWiki';
 import { getProjectWikiStore } from '../memory/projectWiki';
-import { getExtendedLessons, lessonsForText, formatLessonItem } from '../memory/extendedMemory';
 import { emptyStatusPrompt, formatStatusForPrompt, loadProjectStatus, parseRepoSnapshot } from './projectStatus';
 import { clipData } from './clip';
 import { execFile } from 'child_process';
@@ -153,28 +152,6 @@ export async function buildContextPacket(opts: {
 		/* ignore */
 	}
 
-	try {
-		const lessons = await getExtendedLessons(opts.workspaceRoot);
-		const relevant = lessonsForText(lessons, opts.task, 4);
-		const items = relevant.map((l, i) => ({
-			text: formatLessonItem(l),
-			priority: 100 - i,
-		}));
-		if (items.length) {
-			sources.push({
-				kind: 'lessons',
-				priority: 88,
-				content: '### Known issues from earlier errors',
-				items: [
-					{ text: '### Known issues from earlier errors', priority: 200 },
-					...items,
-				],
-			});
-		}
-	} catch {
-		/* ignore */
-	}
-
 	if (retrieved.length || retrieveNote) {
 		const boosted = retrieved.filter(r =>
 			boost.has(r.path.replace(/\\/g, '/').toLowerCase())
@@ -269,14 +246,16 @@ async function gatherIdeState(): Promise<{
 		lines.push('- Open: (none)');
 	}
 
-	const tabs = vscode.window.tabGroups.all
-		.flatMap((g: vscode.TabGroup) => g.tabs)
+	// Headless bench mocks a window without the editor tab API. Missing groups must
+	// not abort compaction (that surfaced as loopExit error and discarded the score).
+	const tabs = (vscode.window.tabGroups?.all ?? [])
+		.flatMap((g: vscode.TabGroup) => g.tabs ?? [])
 		.map((t: vscode.Tab) => {
 			const input = t.input as { uri?: vscode.Uri } | undefined;
 			return input?.uri ? vscode.workspace.asRelativePath(input.uri) : undefined;
 		})
 		.filter((p): p is string => !!p);
-	const dirty = vscode.workspace.textDocuments
+	const dirty = (vscode.workspace.textDocuments ?? [])
 		.filter((d: vscode.TextDocument) => d.isDirty && !d.isUntitled)
 		.map((d: vscode.TextDocument) => vscode.workspace.asRelativePath(d.uri));
 	for (const p of [...dirty, ...tabs]) {

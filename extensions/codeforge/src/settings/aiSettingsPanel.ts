@@ -36,6 +36,12 @@ import {
 	runHarnessRevision,
 	runModelProfileCalibration,
 } from './modelProfileCalibrate';
+import {
+	contextWindowFromModelsList,
+	parseLlamaSlots,
+	serverRoot,
+	shouldProbeLlamaSlots,
+} from '../agent/llamaSlots';
 
 export type AiSettingsTab = 'models' | 'mcp' | 'guardrails' | 'agent' | 'benchmark' | 'plugins';
 
@@ -352,11 +358,18 @@ export class AiSettingsPanel {
 				const server = state.servers.find(s => s.id === serverId);
 				if (!server) return;
 				try {
-					const models = await fetchRemoteModels(server);
+					const { models, contextWindow } = await fetchRemoteModels(server);
 					if (models.length) {
 						server.models = Array.from(new Set([...models, ...server.models]));
+						let ctxNote = '';
+						if (contextWindow && contextWindow >= 2048) {
+							server.numCtx = contextWindow;
+							ctxNote = ` Context window set to ${contextWindow.toLocaleString('en-US')}.`;
+						}
 						await this.store.save(state);
-						void vscode.window.showInformationMessage(`Loaded ${models.length} models from ${server.name}`);
+						void vscode.window.showInformationMessage(
+							`Loaded ${models.length} models from ${server.name}.${ctxNote}`
+						);
 					} else {
 						void vscode.window.showWarningMessage('No models returned. Check base URL / API key.');
 					}
@@ -1819,10 +1832,10 @@ export class AiSettingsPanel {
           <div class="row"><label>Provider</label><select data-f="kind">${kinds}</select></div>
           <div class="row"><label>Base URL</label><input data-f="baseUrl" placeholder="https://api… or http://localhost:11434/v1" /></div>
           <div class="row"><label>API key</label><input data-f="apiKey" type="password" placeholder="Optional for local servers" /></div>
-          <div class="row"><label>num_ctx</label>
+          <div class="row"><label>Context window</label>
             <div>
               <input data-f="numCtx" type="number" min="2048" step="1024" placeholder="32768" />
-              <div class="hint">Context window (tokens). Align with Ollama/server num_ctx. Drives compact/caps; sent as options.num_ctx when supported.</div>
+              <div class="hint">Tokens per request. Filled automatically by Refresh from API when the server reports it (e.g. llama.cpp). Also drives compact/caps.</div>
             </div>
           </div>
           <div class="row"><label>Force JSON</label>
@@ -2057,14 +2070,16 @@ function sanitizeForWebview(state: AiSettingsState): AiSettingsState {
 	};
 }
 
-async function fetchRemoteModels(server: AiServer): Promise<string[]> {
+async function fetchRemoteModels(
+	server: AiServer
+): Promise<{ models: string[]; contextWindow?: number }> {
 	const rawBase = (server.baseUrl || defaultBaseUrlFor(server.kind)).replace(/\/$/, '');
 	if (!rawBase) {
 		throw new Error('Base URL is empty');
 	}
 
 	if (server.kind === 'anthropic') {
-		return defaultModelsFor('anthropic');
+		return { models: defaultModelsFor('anthropic') };
 	}
 
 	const headers: Record<string, string> = {
@@ -2091,17 +2106,26 @@ async function fetchRemoteModels(server: AiServer): Promise<string[]> {
 				data?: Array<{ id?: string }>;
 				models?: Array<{ name?: string; model?: string }>;
 			};
+			let ids: string[] = [];
 			if (Array.isArray(data.data)) {
-				const ids = data.data.map(m => m.id).filter((x): x is string => Boolean(x));
-				if (ids.length) return ids;
+				ids = data.data.map(m => m.id).filter((x): x is string => Boolean(x));
 			}
-			if (Array.isArray(data.models)) {
-				const ids = data.models
+			if (!ids.length && Array.isArray(data.models)) {
+				ids = data.models
 					.map(m => m.name || m.model)
 					.filter((x): x is string => Boolean(x));
-				if (ids.length) return ids;
 			}
-			errors.push(`${url} → empty list`);
+			if (!ids.length) {
+				errors.push(`${url} → empty list`);
+				continue;
+			}
+			const fromList = contextWindowFromModelsList(data);
+			const fromSlots =
+				fromList === undefined
+					? await fetchSlotsContextWindow(rawBase, server.apiKey, ids[0])
+					: undefined;
+			const contextWindow = fromList ?? fromSlots;
+			return { models: ids, contextWindow };
 		} catch (err) {
 			errors.push(`${url} → ${err instanceof Error ? err.message : String(err)}`);
 		}
@@ -2110,4 +2134,31 @@ async function fetchRemoteModels(server: AiServer): Promise<string[]> {
 	throw new Error(
 		`No models endpoint found. Tried:\n${errors.join('\n')}\n\nTip: use a base URL like https://host/v1 (OpenAI-compatible) or http://localhost:11434 for Ollama.`
 	);
+}
+
+/** Fallback when /models has ids but no n_ctx — llama.cpp GET /slots. */
+async function fetchSlotsContextWindow(
+	baseUrl: string,
+	apiKey: string | undefined,
+	modelId: string
+): Promise<number | undefined> {
+	if (!shouldProbeLlamaSlots(baseUrl)) return undefined;
+	const root = serverRoot(baseUrl);
+	const urls = [
+		`${root}/slots?model=${encodeURIComponent(modelId)}`,
+		`${root}/slots`,
+	];
+	for (const url of urls) {
+		try {
+			const res = await fetch(url, {
+				headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
+			});
+			if (!res.ok) continue;
+			const caps = parseLlamaSlots(await res.json());
+			if (caps && caps.slotContext >= 2048) return caps.slotContext;
+		} catch {
+			/* try next */
+		}
+	}
+	return undefined;
 }

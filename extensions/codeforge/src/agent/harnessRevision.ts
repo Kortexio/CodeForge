@@ -8,6 +8,15 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { modelProfileDir } from '../storage/paths';
+import {
+	DEFAULT_BOOTSTRAP_SAMPLES,
+	DEFAULT_MIN_REPS,
+	DEFAULT_TASK_REGRESSION,
+	decideCandidate,
+	meanScore,
+	bootstrapMeanLowerBound,
+} from './candidateGate';
+import { firstMatchingToken } from './fixtureIdentifiers';
 import { mergeModelProfile, type ModelProfile } from './modelProfile';
 import {
 	emptyProtocolCounters,
@@ -15,14 +24,13 @@ import {
 	type ProtocolRollup,
 } from './protocolTelemetry';
 
+export { DEFAULT_MIN_REPS, DEFAULT_TASK_REGRESSION, DEFAULT_BOOTSTRAP_SAMPLES, meanScore, bootstrapMeanLowerBound };
+
 export const HARNESS_SECTIONS = ['workflow', 'writePolicy', 'toolContract'] as const;
 export type HarnessSection = (typeof HARNESS_SECTIONS)[number];
 
 export const SECTION_MAX_CHARS = 1200;
-export const DEFAULT_MIN_REPS = 3;
 export const DEFAULT_MIN_DELTA = 2;
-export const DEFAULT_TASK_REGRESSION = 2;
-export const DEFAULT_BOOTSTRAP_SAMPLES = 2000;
 
 const KNOB_LIMITS = {
 	writeMaxContentLines: { min: 40, max: 400 },
@@ -30,7 +38,7 @@ const KNOB_LIMITS = {
 } as const;
 
 /** Artifact text must not smuggle phrase matchers or a license to skip checks. */
-const FORBIDDEN_SNIPPETS = [
+export const FORBIDDEN_SNIPPETS = [
 	'harness note',
 	'if the user says',
 	'if the user asks',
@@ -61,18 +69,42 @@ export type HarnessHistoryEntry = {
 	candidateReps: number;
 };
 
+export type HarnessScreen = {
+	tokenCount: number;
+	at: string;
+};
+
 export type HarnessArtifact = {
 	version: 1;
 	revision: number;
 	sections: Record<HarnessSection, string>;
 	knobs: HarnessKnobs;
 	history: HarnessHistoryEntry[];
+	/**
+	 * Set when a revision was kept after fixture-token screening.
+	 * Absent on legacy artifacts → treated as empty at load (quarantine).
+	 */
+	screen?: HarnessScreen;
+	/** Contract fingerprint the revision was measured against (F2). */
+	contract?: string;
 };
+
+export type SectionEvidence = { run: string; step: number };
 
 export type HarnessEdit = {
 	diagnosis: string;
 	sections: Partial<Record<HarnessSection, string>>;
 	knobs: HarnessKnobs;
+	/** Per non-empty section: trajectory moments that justify the text. */
+	evidence?: Partial<Record<HarnessSection, SectionEvidence[]>>;
+};
+
+export type ParseProposerOpts = {
+	forbiddenTokens?: string[];
+	/** Known run labels → max tool step index (1-based) in that run's log. */
+	knownRuns?: Record<string, number>;
+	/** Require evidence citations for non-empty sections (default true when knownRuns set). */
+	requireEvidence?: boolean;
 };
 
 export function emptyHarnessArtifact(): HarnessArtifact {
@@ -118,13 +150,64 @@ function normalizeArtifact(raw: Partial<HarnessArtifact>): HarnessArtifact {
 		if (body && forbiddenSnippet(body)) body = '';
 		sections[key] = body;
 	}
+	const screen = parseScreen(raw.screen);
+	const hasBody =
+		HARNESS_SECTIONS.some(k => sections[k].trim().length > 0) ||
+		Object.keys(sanitizeKnobs(raw.knobs ?? {})).length > 0;
+	// Legacy artifacts without a screen stamp are quarantined: not injected.
+	if (hasBody && !screen) {
+		return {
+			...base,
+			revision: Number(raw.revision) || 0,
+			history: Array.isArray(raw.history) ? raw.history.slice(-20) : [],
+			...(typeof raw.contract === 'string' && raw.contract ? { contract: raw.contract } : {}),
+		};
+	}
 	return {
 		version: 1,
 		revision: Number(raw.revision) || 0,
 		sections,
 		knobs: sanitizeKnobs(raw.knobs ?? {}),
 		history: Array.isArray(raw.history) ? raw.history.slice(-20) : [],
+		...(screen ? { screen } : {}),
+		...(typeof raw.contract === 'string' && raw.contract ? { contract: raw.contract } : {}),
 	};
+}
+
+function parseScreen(raw: unknown): HarnessScreen | undefined {
+	if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+	const o = raw as Record<string, unknown>;
+	const tokenCount = Number(o.tokenCount);
+	const at = typeof o.at === 'string' ? o.at : '';
+	if (!Number.isFinite(tokenCount) || tokenCount < 0 || !at) return undefined;
+	return { tokenCount: Math.round(tokenCount), at };
+}
+
+/** Stamp a kept artifact after fixture-token screening. */
+export function stampScreen(
+	artifact: HarnessArtifact,
+	tokenCount: number,
+	at?: string
+): HarnessArtifact {
+	return {
+		...artifact,
+		screen: {
+			tokenCount: Math.max(0, Math.round(tokenCount)),
+			at: at ?? new Date().toISOString(),
+		},
+	};
+}
+
+/** First fixture token found in any section body, if any. */
+export function artifactFixtureHit(
+	artifact: HarnessArtifact,
+	tokens: string[]
+): string | undefined {
+	for (const key of HARNESS_SECTIONS) {
+		const hit = firstMatchingToken(artifact.sections[key], tokens);
+		if (hit) return hit;
+	}
+	return undefined;
 }
 
 function sanitizeKnobs(raw: HarnessKnobs): HarnessKnobs {
@@ -152,8 +235,22 @@ export function artifactHasContent(artifact: HarnessArtifact): boolean {
 	);
 }
 
-/** System block injected for this model. Empty when nothing has been kept. */
-export function learnedHarnessBlock(artifact: HarnessArtifact): string {
+/**
+ * System block injected for this model. Empty when nothing has been kept or screened,
+ * or when the artifact's contract no longer matches the live harness contract.
+ */
+export function learnedHarnessBlock(
+	artifact: HarnessArtifact,
+	liveContract?: string
+): string {
+	if (!artifact.screen) return '';
+	if (
+		liveContract &&
+		artifact.contract &&
+		artifact.contract !== liveContract
+	) {
+		return '';
+	}
 	const parts: string[] = [];
 	if (artifact.sections.workflow.trim()) {
 		parts.push(`#### Workflow\n${artifact.sections.workflow.trim()}`);
@@ -233,44 +330,97 @@ export function formatExecutionReport(rollup: ProtocolRollup | undefined): strin
 
 export type TaskOutcome = {
 	task: string;
+	/** Kept for the decision gate only — never shown to the proposer. */
 	score: number;
 	loopExit?: string;
 	steps?: number;
+	/** Kept for the decision gate only — never shown to the proposer. */
 	hiddenFailed: string[];
 	checksFailed: string[];
 	replyTail?: string;
+	/** Full tool trajectory for this run (proposer evidence). */
+	toolLog?: string;
+	/** Visible (non-hidden) test output only. */
+	visibleOutput?: string;
+	/** Stable run label for evidence citations, e.g. T2-r1. */
+	runId?: string;
 };
 
-/** Per-run results of the current harness on the selection tasks. */
+/**
+ * Proposer-facing report: trajectories, visible output, loop exits.
+ * Scores and hidden-test names stay out (Harness² answer-free boundary).
+ */
 export function formatTaskOutcomes(outcomes: TaskOutcome[]): string {
 	if (!outcomes.length) return '';
-	const latestByTask = new Map<string, TaskOutcome>();
-	for (const o of outcomes) latestByTask.set(o.task, o);
-	const lines = [...latestByTask.values()].map(o => {
-		const parts = [`- ${o.task}: score ${o.score}/100`];
+	const lines: string[] = ['Current harness on the selection tasks (no scores; judge from trajectories):'];
+	for (const o of outcomes) {
+		const run = o.runId || o.task;
+		const parts = [`### Run ${run}`];
 		if (o.loopExit) parts.push(`loop exit ${o.loopExit}`);
 		if (typeof o.steps === 'number' && o.loopExit !== 'budget') {
 			parts.push(`${o.steps} tool steps`);
 		}
-		let line = parts.join(', ');
-		if (o.hiddenFailed.length) line += `\n  hidden tests failed: ${o.hiddenFailed.slice(0, 6).join('; ')}`;
-		if (o.checksFailed.length) line += `\n  checks failed: ${o.checksFailed.slice(0, 4).join('; ')}`;
-		if (o.replyTail?.trim()) {
-			line += `\n  final reply (clipped): ${o.replyTail.trim().replace(/\s+/g, ' ').slice(0, 280)}`;
+		lines.push(parts.join(', '));
+		if (o.toolLog?.trim()) {
+			lines.push('Trajectory:');
+			lines.push(o.toolLog.trim().slice(0, 12000));
 		}
-		return line;
-	});
-	return ['Current harness on the selection tasks:', ...lines].join('\n');
+		if (o.visibleOutput?.trim()) {
+			lines.push('Visible test output:');
+			lines.push(o.visibleOutput.trim().slice(0, 4000));
+		}
+		if (o.replyTail?.trim()) {
+			lines.push(`Final reply (clipped): ${o.replyTail.trim().replace(/\s+/g, ' ').slice(0, 280)}`);
+		}
+		lines.push('');
+	}
+	return lines.join('\n');
 }
+
+/**
+ * Refuse a proposer report that still contains grader verdicts (hidden names or scores).
+ * Tripwire on the boundary — primary defence is formatTaskOutcomes.
+ */
+export function assertNoGraderVerdicts(
+	report: string,
+	hiddenNames: string[]
+): string | undefined {
+	const text = String(report ?? '');
+	if (/\bscore\s+\d+\/100\b/i.test(text) || /\bhidden tests failed\b/i.test(text)) {
+		return 'report contains grader verdict fields';
+	}
+	for (const name of hiddenNames) {
+		const n = String(name ?? '').trim();
+		if (n.length < 3) continue;
+		if (text.includes(n)) return `report contains hidden test name ${n}`;
+	}
+	return undefined;
+}
+
+export type ProposeDimension = 'all' | 'INV' | 'DOM';
+
+const DIMENSION_SECTIONS: Record<ProposeDimension, HarnessSection[] | null> = {
+	all: null,
+	INV: ['workflow', 'toolContract'],
+	DOM: ['writePolicy'],
+};
 
 export function proposerMessages(
 	artifact: HarnessArtifact,
-	report: string
+	report: string,
+	dimension: ProposeDimension = 'all'
 ): Array<{ role: 'system' | 'user'; content: string }> {
 	const prior = artifact.history
 		.slice(-5)
 		.map(h => `- ${h.decision}: ${h.diagnosis} (${h.reason})`)
 		.join('\n');
+	const allowed = DIMENSION_SECTIONS[dimension];
+	const sectionHint =
+		dimension === 'INV'
+			? 'Edit only workflow and toolContract (procedure and tool use). Leave writePolicy empty or unchanged.'
+			: dimension === 'DOM'
+				? 'Edit only writePolicy (project knowledge / how to write). Leave workflow and toolContract empty or unchanged.'
+				: 'You may edit any section.';
 	return [
 		{
 			role: 'system',
@@ -278,11 +428,14 @@ export function proposerMessages(
 				'You are the harness proposer for CodeForge. You do not solve the user task.',
 				'You revise the executable notes and a few knobs that wrap a frozen solver.',
 				'Reply with one JSON object and nothing else. No markdown fences, no tool calls.',
-				'Schema: {"diagnosis":"...","sections":{"workflow":"","writePolicy":"","toolContract":""},"knobs":{"writeMaxContentLines":180,"mutatingMaxTokens":6144,"enforceMassRewriteGate":true}}',
-				'Diagnose from the per-task results first (hidden test failures, loop exits, final replies). Protocol counters are secondary.',
+				'Schema: {"diagnosis":"...","sections":{"workflow":"","writePolicy":"","toolContract":""},"evidence":{"workflow":[{"run":"T2-r1","step":3}],"writePolicy":[{"run":"T2-r1","step":5}]},"knobs":{"writeMaxContentLines":180,"mutatingMaxTokens":6144,"enforceMassRewriteGate":true}}',
+				sectionHint,
+				'Diagnose from trajectories, loop exits, visible test output, and final replies. You do not receive scores or hidden-test names.',
+				'Prioritize where replicates DIVERGED (same task, different actions) and failures that repeated across every replicate. A failure in 1 of 3 replicates is noise.',
+				'Every non-empty section must cite evidence: [{run, step}] pointing at a trajectory moment. An edit without a named moment is speculation.',
 				'Change only the sections or knobs that the execution report supports. Omit unchanged knobs.',
 				`Each section is at most ${SECTION_MAX_CHARS} characters and states a structural rule (what to read, what a step must return, how to split a large write).`,
-				'Do not add phrase matchers, "if the user says", or instructions to ignore the oracle or skip tests.',
+				'Do not add phrase matchers, "if the user says", task-specific function or path names from the fixture, or instructions to ignore the oracle or skip tests.',
 				'If the report has no repeated failure, return {"diagnosis":"no evidence","sections":{},"knobs":{}}.',
 			].join('\n'),
 		},
@@ -292,11 +445,97 @@ export function proposerMessages(
 				'Current harness artifact:',
 				JSON.stringify({ revision: artifact.revision, sections: artifact.sections, knobs: artifact.knobs }),
 				prior ? `Earlier revision outcomes:\n${prior}` : 'No earlier revision outcomes.',
+				allowed
+					? `Allowed sections this call: ${allowed.join(', ')}.`
+					: 'All sections allowed.',
 				'Execution report:',
 				report,
 			].join('\n\n'),
 		},
 	];
+}
+
+export function composeMessages(input: {
+	parent: HarnessArtifact;
+	inv: HarnessArtifact;
+	dom: HarnessArtifact;
+	parentReport: string;
+	invProbe: string;
+	domProbe: string;
+}): Array<{ role: 'system' | 'user'; content: string }> {
+	return [
+		{
+			role: 'system',
+			content: [
+				'You compose harness candidates. Reply with one JSON object only.',
+				'Schema: {"choice":"merge"|"inv"|"dom"|"KEEP_BASE","diagnosis":"...","sections":{"workflow":"","writePolicy":"","toolContract":""},"knobs":{}}',
+				'merge: combine the best of INV (workflow/toolContract) and DOM (writePolicy).',
+				'inv or dom: keep that candidate wholesale.',
+				'KEEP_BASE: keep the parent unchanged (sections may be empty).',
+				'Do not invent fixture-specific names or phrase matchers.',
+			].join('\n'),
+		},
+		{
+			role: 'user',
+			content: [
+				'Parent:',
+				JSON.stringify({ sections: input.parent.sections, knobs: input.parent.knobs }),
+				'INV candidate (procedure/tools):',
+				JSON.stringify({ sections: input.inv.sections, knobs: input.inv.knobs }),
+				'DOM candidate (write policy):',
+				JSON.stringify({ sections: input.dom.sections, knobs: input.dom.knobs }),
+				'Parent trajectories:',
+				input.parentReport,
+				'INV probe trajectory:',
+				input.invProbe,
+				'DOM probe trajectory:',
+				input.domProbe,
+			].join('\n\n'),
+		},
+	];
+}
+
+export function parseComposeChoice(
+	raw: string
+):
+	| { ok: true; choice: 'merge' | 'inv' | 'dom' | 'KEEP_BASE'; edit: HarnessEdit }
+	| { ok: false; error: string } {
+	const parsed = extractProposerJson(raw);
+	if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+		return { ok: false, error: 'no compose JSON' };
+	}
+	const obj = parsed as Record<string, unknown>;
+	const choiceRaw = String(obj.choice || '').trim();
+	const choice =
+		choiceRaw === 'merge' || choiceRaw === 'inv' || choiceRaw === 'dom' || choiceRaw === 'KEEP_BASE'
+			? choiceRaw
+			: undefined;
+	if (!choice) return { ok: false, error: 'choice must be merge|inv|dom|KEEP_BASE' };
+	if (choice === 'KEEP_BASE') {
+		return {
+			ok: true,
+			choice,
+			edit: {
+				diagnosis: String(obj.diagnosis || 'KEEP_BASE'),
+				sections: {},
+				knobs: {},
+			},
+		};
+	}
+	const editParsed = parseProposerEdit(raw, {});
+	if (!editParsed.ok) return { ok: false, error: editParsed.error };
+	return { ok: true, choice, edit: editParsed.edit };
+}
+
+/** Restrict an edit to the sections allowed for a propose dimension. */
+export function filterEditToDimension(edit: HarnessEdit, dimension: ProposeDimension): HarnessEdit {
+	const allowed = DIMENSION_SECTIONS[dimension];
+	if (!allowed) return edit;
+	const sections: Partial<Record<HarnessSection, string>> = {};
+	for (const key of allowed) {
+		if (edit.sections[key] !== undefined) sections[key] = edit.sections[key];
+	}
+	return { ...edit, sections };
 }
 
 /** Pull the proposer object out of prose, fences, or a leading think block. */
@@ -352,13 +591,13 @@ export function extractProposerJson(raw: string): unknown | undefined {
 	return undefined;
 }
 
-export function parseProposerEdit(raw: string): { ok: true; edit: HarnessEdit } | { ok: false; error: string } {
+export function parseProposerEdit(
+	raw: string,
+	opts: ParseProposerOpts = {}
+): { ok: true; edit: HarnessEdit } | { ok: false; error: string } {
 	const parsed = extractProposerJson(raw);
 	if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
 		return { ok: false, error: 'proposer did not return a JSON object' };
-	}
-	if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-		return { ok: false, error: 'proposer JSON must be an object' };
 	}
 	const obj = parsed as Record<string, unknown>;
 	const diagnosis = String(obj.diagnosis ?? '').trim();
@@ -366,6 +605,7 @@ export function parseProposerEdit(raw: string): { ok: true; edit: HarnessEdit } 
 	if (diagnosis.toLowerCase() === 'no evidence') {
 		return { ok: false, error: 'no evidence' };
 	}
+	const forbidden = opts.forbiddenTokens ?? [];
 	const sections: Partial<Record<HarnessSection, string>> = {};
 	const rawSections = obj.sections;
 	if (rawSections && typeof rawSections === 'object' && !Array.isArray(rawSections)) {
@@ -396,6 +636,13 @@ export function parseProposerEdit(raw: string): { ok: true; edit: HarnessEdit } 
 			}
 			const banned = forbiddenSnippet(body);
 			if (banned) return { ok: false, error: `section ${key} contains forbidden text (${banned})` };
+			const fixtureHit = firstMatchingToken(body, forbidden);
+			if (fixtureHit) {
+				return {
+					ok: false,
+					error: `section ${key} contains fixture identifier (${fixtureHit})`,
+				};
+			}
 			sections[key as HarnessSection] = body;
 		}
 	}
@@ -418,7 +665,58 @@ export function parseProposerEdit(raw: string): { ok: true; edit: HarnessEdit } 
 	if (!Object.keys(sections).length && !Object.keys(knobs).length) {
 		return { ok: false, error: 'no change' };
 	}
-	return { ok: true, edit: { diagnosis, sections, knobs } };
+
+	const requireEvidence =
+		opts.requireEvidence === true ||
+		(opts.requireEvidence !== false && !!opts.knownRuns && Object.keys(opts.knownRuns).length > 0);
+	const evidence: Partial<Record<HarnessSection, SectionEvidence[]>> = {};
+	const rawEvidence = obj.evidence;
+	if (requireEvidence && Object.keys(sections).length) {
+		if (!rawEvidence || typeof rawEvidence !== 'object' || Array.isArray(rawEvidence)) {
+			return { ok: false, error: 'evidence is required for non-empty sections' };
+		}
+		for (const key of Object.keys(sections) as HarnessSection[]) {
+			const rows = (rawEvidence as Record<string, unknown>)[key];
+			if (!Array.isArray(rows) || !rows.length) {
+				return { ok: false, error: `section ${key} needs evidence citations` };
+			}
+			const parsedRows: SectionEvidence[] = [];
+			for (const row of rows) {
+				if (!row || typeof row !== 'object' || Array.isArray(row)) {
+					return { ok: false, error: `section ${key} evidence entry must be an object` };
+				}
+				const run = String((row as Record<string, unknown>).run ?? '').trim();
+				const step = Number((row as Record<string, unknown>).step);
+				if (!run || !Number.isFinite(step) || step < 1) {
+					return { ok: false, error: `section ${key} evidence needs run and step >= 1` };
+				}
+				if (opts.knownRuns) {
+					const max = opts.knownRuns[run];
+					if (max === undefined) {
+						return { ok: false, error: `section ${key} cites unknown run ${run}` };
+					}
+					if (step > max) {
+						return {
+							ok: false,
+							error: `section ${key} cites step ${step} outside run ${run} (max ${max})`,
+						};
+					}
+				}
+				parsedRows.push({ run, step: Math.round(step) });
+			}
+			evidence[key] = parsedRows;
+		}
+	}
+
+	return {
+		ok: true,
+		edit: {
+			diagnosis,
+			sections,
+			knobs,
+			...(Object.keys(evidence).length ? { evidence } : {}),
+		},
+	};
 }
 
 function normalizeForbiddenText(text: string): string {
@@ -441,50 +739,17 @@ export function applyHarnessEdit(parent: HarnessArtifact, edit: HarnessEdit): Ha
 		sections,
 		knobs: { ...parent.knobs, ...edit.knobs },
 		history: parent.history.slice(),
+		...(parent.screen ? { screen: parent.screen } : {}),
+		...(parent.contract ? { contract: parent.contract } : {}),
 	};
-}
-
-export function meanScore(scores: number[]): number {
-	if (!scores.length) return Number.NaN;
-	return scores.reduce((a, b) => a + b, 0) / scores.length;
 }
 
 export type TaskPairedScores = Record<string, { parent: number[]; candidate: number[] }>;
 
-/** 90% one-sided lower bound on the mean paired gain (10th percentile of bootstrap means). */
-export function bootstrapMeanLowerBound(
-	deltas: number[],
-	samples = DEFAULT_BOOTSTRAP_SAMPLES,
-	quantile = 0.1,
-	seed = 0xcf052026
-): number {
-	if (!deltas.length) return Number.NaN;
-	const n = deltas.length;
-	const means: number[] = [];
-	let state = seed >>> 0;
-	const rand = () => {
-		state = (Math.imul(1664525, state) + 1013904223) >>> 0;
-		return state / 0x1_0000_0000;
-	};
-	for (let b = 0; b < samples; b += 1) {
-		let sum = 0;
-		for (let i = 0; i < n; i += 1) {
-			sum += deltas[Math.floor(rand() * n)]!;
-		}
-		means.push(sum / n);
-	}
-	means.sort((a, b) => a - b);
-	const idx = Math.min(means.length - 1, Math.max(0, Math.floor(quantile * means.length)));
-	return means[idx]!;
-}
-
-function flattenPaired(byTask: TaskPairedScores, side: 'parent' | 'candidate'): number[] {
-	return Object.values(byTask).flatMap(p => p[side].filter(n => Number.isFinite(n)));
-}
-
 /**
- * Keep a revision only when every task has enough paired reps, no task regresses
- * beyond the margin, and each task's paired bootstrap 90% lower bound is > 0.
+ * Keep a revision only when the shared candidate gate clears: enough reps,
+ * no task regression beyond the margin, and stratified bootstrap lower bound > 0.
+ * Ceiling tasks (both sides at 100) never block.
  */
 export function decideRevision(input: {
 	byTask: TaskPairedScores;
@@ -492,66 +757,21 @@ export function decideRevision(input: {
 	taskRegressionMargin?: number;
 	bootstrapSamples?: number;
 }): { decision: 'keep' | 'revert'; reason: string; parentMean: number; candidateMean: number } {
-	const minReps = input.minRepsPerTask ?? DEFAULT_MIN_REPS;
-	const margin = input.taskRegressionMargin ?? DEFAULT_TASK_REGRESSION;
-	const samples = input.bootstrapSamples ?? DEFAULT_BOOTSTRAP_SAMPLES;
-	const tasks = Object.keys(input.byTask);
-	if (!tasks.length) {
-		return {
-			decision: 'revert',
-			reason: 'no paired task scores',
-			parentMean: Number.NaN,
-			candidateMean: Number.NaN,
-		};
+	const byTask: Record<string, { baseline: number[]; candidate: number[] }> = {};
+	for (const [task, pair] of Object.entries(input.byTask)) {
+		byTask[task] = { baseline: pair.parent, candidate: pair.candidate };
 	}
-	for (const task of tasks) {
-		const pair = input.byTask[task]!;
-		const parent = pair.parent.filter(n => Number.isFinite(n));
-		const candidate = pair.candidate.filter(n => Number.isFinite(n));
-		if (parent.length < minReps || candidate.length < minReps) {
-			return {
-				decision: 'revert',
-				reason: `${task}: need ${minReps} paired scores (parent ${parent.length}, candidate ${candidate.length})`,
-				parentMean: meanScore(flattenPaired(input.byTask, 'parent')),
-				candidateMean: meanScore(flattenPaired(input.byTask, 'candidate')),
-			};
-		}
-		if (parent.length !== candidate.length) {
-			return {
-				decision: 'revert',
-				reason: `${task}: paired score count mismatch (${parent.length} vs ${candidate.length})`,
-				parentMean: meanScore(flattenPaired(input.byTask, 'parent')),
-				candidateMean: meanScore(flattenPaired(input.byTask, 'candidate')),
-			};
-		}
-		const parentMean = meanScore(parent);
-		const candidateMean = meanScore(candidate);
-		if (candidateMean < parentMean - margin) {
-			return {
-				decision: 'revert',
-				reason: `${task}: candidate mean ${candidateMean.toFixed(1)} is more than ${margin} below parent ${parentMean.toFixed(1)}`,
-				parentMean: meanScore(flattenPaired(input.byTask, 'parent')),
-				candidateMean: meanScore(flattenPaired(input.byTask, 'candidate')),
-			};
-		}
-		const deltas = candidate.map((c, i) => c - parent[i]!);
-		const lower = bootstrapMeanLowerBound(deltas, samples);
-		if (!(lower > 0)) {
-			return {
-				decision: 'revert',
-				reason: `${task}: paired bootstrap 90% lower bound ${lower.toFixed(2)} is not > 0`,
-				parentMean: meanScore(flattenPaired(input.byTask, 'parent')),
-				candidateMean: meanScore(flattenPaired(input.byTask, 'candidate')),
-			};
-		}
-	}
-	const parentMean = meanScore(flattenPaired(input.byTask, 'parent'));
-	const candidateMean = meanScore(flattenPaired(input.byTask, 'candidate'));
+	const d = decideCandidate({
+		byTask,
+		minRepsPerTask: input.minRepsPerTask,
+		taskRegressionMargin: input.taskRegressionMargin,
+		bootstrapSamples: input.bootstrapSamples,
+	});
 	return {
-		decision: 'keep',
-		reason: `all ${tasks.length} task(s) cleared paired bootstrap with no regression beyond ${margin}`,
-		parentMean,
-		candidateMean,
+		decision: d.decision,
+		reason: d.reason,
+		parentMean: d.baselineMean,
+		candidateMean: d.candidateMean,
 	};
 }
 
@@ -582,6 +802,8 @@ export type HarnessRevisionOutcome = {
 	parentMean?: number;
 	candidateMean?: number;
 	scored: boolean;
+	/** Proposer report still carried grader verdicts; nothing was proposed. */
+	leak?: boolean;
 };
 
 /**
@@ -603,25 +825,188 @@ export async function executeHarnessRevision(opts: {
 	score: (input: HarnessScorePhase) => Promise<HarnessScoreResult>;
 	/** Per-task results gathered while scoring the parent. */
 	parentOutcomes?: () => TaskOutcome[];
+	/** Fixture identifiers that must not appear in section text. */
+	forbiddenTokens?: string[];
+	/** Hidden-test names that must not appear in the proposer report. */
+	hiddenNames?: string[];
 	minRepsPerTask?: number;
 	taskRegressionMargin?: number;
 	now?: string;
+	/** Optional contract fingerprint stamped on a kept revision (F2). */
+	contract?: string;
+	/**
+	 * Propose–Probe–Compose: propose INV + DOM, one probe each, compose, then gate.
+	 * When set, `scoreProbe` must return a short trajectory summary for the composer.
+	 */
+	ppc?: boolean;
+	scoreProbe?: (input: {
+		label: 'inv' | 'dom';
+		artifact: HarnessArtifact;
+	}) => Promise<{ summary: string }>;
 }): Promise<HarnessRevisionOutcome> {
 	await opts.score({ phase: 'parent', artifact: opts.artifact });
-	const taskReport = formatTaskOutcomes(opts.parentOutcomes?.() ?? []);
+	const outcomes = opts.parentOutcomes?.() ?? [];
+	const taskReport = formatTaskOutcomes(outcomes);
 	const report = [taskReport, opts.report].filter(Boolean).join('\n\n');
-	const raw = await opts.propose(proposerMessages(opts.artifact, report));
-	const parsed = parseProposerEdit(raw);
-	if (!parsed.ok) {
+	const leak = assertNoGraderVerdicts(report, opts.hiddenNames ?? []);
+	if (leak) {
 		return {
 			kept: false,
-			reason: parsed.error,
+			reason: leak,
 			diagnosis: '',
 			artifact: opts.artifact,
 			scored: false,
+			leak: true,
 		};
 	}
-	const candidate = applyHarnessEdit(opts.artifact, parsed.edit);
+
+	const knownRuns: Record<string, number> = {};
+	for (const o of outcomes) {
+		const id = o.runId || o.task;
+		const steps =
+			typeof o.steps === 'number' && o.steps > 0
+				? o.steps
+				: Math.max(1, (o.toolLog || '').split(/\n/).filter(Boolean).length || 1);
+		knownRuns[id] = Math.max(knownRuns[id] ?? 0, steps);
+	}
+	const parseOpts: ParseProposerOpts = {
+		forbiddenTokens: opts.forbiddenTokens,
+		knownRuns: Object.keys(knownRuns).length ? knownRuns : undefined,
+	};
+
+	const proposeOnce = async (dimension: ProposeDimension): Promise<
+		{ ok: true; edit: HarnessEdit } | { ok: false; error: string }
+	> => {
+		let messages = proposerMessages(opts.artifact, report, dimension);
+		let raw = await opts.propose(messages);
+		let parsed = parseProposerEdit(raw, parseOpts);
+		if (!parsed.ok && parsed.error !== 'no evidence') {
+			messages = [
+				...proposerMessages(opts.artifact, report, dimension),
+				{
+					role: 'user',
+					content: `Your previous attempt was rejected: ${parsed.error}. Fix it and reply with one JSON object again.`,
+				},
+			];
+			raw = await opts.propose(messages);
+			parsed = parseProposerEdit(raw, parseOpts);
+		}
+		if (!parsed.ok) return parsed;
+		return {
+			ok: true,
+			edit: filterEditToDimension(parsed.edit, dimension),
+		};
+	};
+
+	let candidate: HarnessArtifact;
+	let diagnosis: string;
+
+	if (opts.ppc) {
+		const invParsed = await proposeOnce('INV');
+		const domParsed = await proposeOnce('DOM');
+		if (!invParsed.ok && !domParsed.ok) {
+			return {
+				kept: false,
+				reason: `INV: ${invParsed.error}; DOM: ${domParsed.error}`,
+				diagnosis: '',
+				artifact: opts.artifact,
+				scored: false,
+			};
+		}
+		const invArt = invParsed.ok
+			? applyHarnessEdit(opts.artifact, invParsed.edit)
+			: opts.artifact;
+		const domArt = domParsed.ok
+			? applyHarnessEdit(opts.artifact, domParsed.edit)
+			: opts.artifact;
+		const invProbe = opts.scoreProbe
+			? await opts.scoreProbe({ label: 'inv', artifact: invArt })
+			: { summary: '(no probe)' };
+		const domProbe = opts.scoreProbe
+			? await opts.scoreProbe({ label: 'dom', artifact: domArt })
+			: { summary: '(no probe)' };
+		const composeRaw = await opts.propose(
+			composeMessages({
+				parent: opts.artifact,
+				inv: invArt,
+				dom: domArt,
+				parentReport: taskReport || report,
+				invProbe: invProbe.summary,
+				domProbe: domProbe.summary,
+			})
+		);
+		const composed = parseComposeChoice(composeRaw);
+		if (!composed.ok) {
+			return {
+				kept: false,
+				reason: composed.error,
+				diagnosis: '',
+				artifact: opts.artifact,
+				scored: false,
+			};
+		}
+		if (composed.choice === 'KEEP_BASE') {
+			const entry: HarnessHistoryEntry = {
+				at: opts.now ?? new Date().toISOString(),
+				decision: 'revert',
+				reason: 'composer chose KEEP_BASE',
+				diagnosis: composed.edit.diagnosis,
+				parentReps: 0,
+				candidateReps: 0,
+			};
+			return {
+				kept: false,
+				reason: entry.reason,
+				diagnosis: composed.edit.diagnosis,
+				artifact: {
+					...opts.artifact,
+					history: [...opts.artifact.history, entry].slice(-20),
+				},
+				scored: false,
+			};
+		}
+		if (composed.choice === 'inv') {
+			candidate = invArt;
+			diagnosis = invParsed.ok ? invParsed.edit.diagnosis : composed.edit.diagnosis;
+		} else if (composed.choice === 'dom') {
+			candidate = domArt;
+			diagnosis = domParsed.ok ? domParsed.edit.diagnosis : composed.edit.diagnosis;
+		} else {
+			const mergeEdit = filterEditToDimension(
+				{
+					...composed.edit,
+					sections: {
+						workflow:
+							composed.edit.sections.workflow ??
+							invArt.sections.workflow,
+						toolContract:
+							composed.edit.sections.toolContract ??
+							invArt.sections.toolContract,
+						writePolicy:
+							composed.edit.sections.writePolicy ??
+							domArt.sections.writePolicy,
+					},
+				},
+				'all'
+			);
+			candidate = applyHarnessEdit(opts.artifact, mergeEdit);
+			diagnosis = composed.edit.diagnosis;
+		}
+	} else {
+		const parsed = await proposeOnce('all');
+		if (!parsed.ok) {
+			return {
+				kept: false,
+				reason: parsed.error,
+				diagnosis: '',
+				artifact: opts.artifact,
+				scored: false,
+			};
+		}
+		candidate = applyHarnessEdit(opts.artifact, parsed.edit);
+		diagnosis = parsed.edit.diagnosis;
+	}
+
 	const paired = await opts.score({ phase: 'paired', parent: opts.artifact, candidate });
 	const decision = decideRevision({
 		byTask: paired.byTask,
@@ -634,13 +1019,17 @@ export async function executeHarnessRevision(opts: {
 		at: opts.now ?? new Date().toISOString(),
 		decision: decision.decision,
 		reason: decision.reason,
-		diagnosis: parsed.edit.diagnosis,
+		diagnosis,
 		parentMean: decision.parentMean,
 		candidateMean: decision.candidateMean,
 		parentReps,
 		candidateReps,
 	};
-	const base = decision.decision === 'keep' ? candidate : opts.artifact;
+	let base = decision.decision === 'keep' ? candidate : opts.artifact;
+	if (decision.decision === 'keep') {
+		base = stampScreen(base, opts.forbiddenTokens?.length ?? 0, entry.at);
+		if (opts.contract) base = { ...base, contract: opts.contract };
+	}
 	const artifact: HarnessArtifact = {
 		...base,
 		history: [...base.history, entry].slice(-20),
@@ -648,10 +1037,108 @@ export async function executeHarnessRevision(opts: {
 	return {
 		kept: decision.decision === 'keep',
 		reason: decision.reason,
-		diagnosis: parsed.edit.diagnosis,
+		diagnosis,
 		artifact,
 		parentMean: decision.parentMean,
 		candidateMean: decision.candidateMean,
 		scored: true,
+	};
+}
+
+/**
+ * Artifact as written for a scored run. The agent quarantines unscreened artifacts
+ * that have content, so an unstamped candidate would be scored as the empty harness.
+ * Content with a fixture token is refused instead of stamped.
+ */
+export function screenForScoring(
+	artifact: HarnessArtifact,
+	forbiddenTokens: string[]
+): { ok: true; artifact: HarnessArtifact } | { ok: false; reason: string } {
+	if (!artifactHasContent(artifact) || artifact.screen) return { ok: true, artifact };
+	const hit = artifactFixtureHit(artifact, forbiddenTokens);
+	if (hit) return { ok: false, reason: `candidate contains fixture identifier ${hit}` };
+	return { ok: true, artifact: stampScreen(artifact, forbiddenTokens.length) };
+}
+
+export type HarnessRevisionOpts = Parameters<typeof executeHarnessRevision>[0];
+
+export type SequentialStepRecord = HarnessRevisionOutcome & {
+	step: number;
+	parentRevision: number;
+};
+
+/**
+ * Sequential recursion: run `steps` revisions, each starting from the artifact the
+ * previous step returned (the kept candidate, or the same parent with the revert in
+ * its history so the next proposer sees why). A grader-verdict leak ends the loop.
+ * `afterStep` may veto a keep (holdout) and must return the outcome to carry forward.
+ */
+export async function executeSequentialRevision(
+	opts: Omit<HarnessRevisionOpts, 'artifact'> & {
+		artifact: HarnessArtifact;
+		steps: number;
+		beforeStep?: (step: number, parent: HarnessArtifact) => void | Promise<void>;
+		afterStep?: (
+			step: number,
+			outcome: HarnessRevisionOutcome,
+			parent: HarnessArtifact
+		) => HarnessRevisionOutcome | Promise<HarnessRevisionOutcome>;
+	}
+): Promise<{ final: HarnessArtifact; steps: SequentialStepRecord[] }> {
+	const total = Math.max(1, Math.floor(opts.steps));
+	const { steps: _steps, beforeStep, afterStep, ...base } = opts;
+	let parent = opts.artifact;
+	const records: SequentialStepRecord[] = [];
+	for (let step = 1; step <= total; step++) {
+		await beforeStep?.(step, parent);
+		let outcome = await executeHarnessRevision({ ...base, artifact: parent });
+		if (afterStep) outcome = await afterStep(step, outcome, parent);
+		records.push({ ...outcome, step, parentRevision: parent.revision });
+		if (outcome.leak) break;
+		parent = outcome.artifact;
+	}
+	return { final: parent, steps: records };
+}
+
+export type TransferPrecheck =
+	| { ok: true }
+	| { ok: false; status: 'NotRun'; reason: string };
+
+/** A learned artifact may be scored on another task set only if it has content and no target fixture tokens. */
+export function transferPrecheck(
+	artifact: HarnessArtifact,
+	targetTokens: string[]
+): TransferPrecheck {
+	if (!artifactHasContent(artifact)) {
+		return { ok: false, status: 'NotRun', reason: 'nothing to transfer: artifact has no kept sections or knobs' };
+	}
+	const hit = artifactFixtureHit(artifact, targetTokens);
+	if (hit) {
+		return {
+			ok: false,
+			status: 'NotRun',
+			reason: `artifact contains target fixture identifier ${hit}`,
+		};
+	}
+	return { ok: true };
+}
+
+/** Paired empty-vs-learned scores on the target set, decided by the same candidate gate. */
+export function decideTransfer(byTask: Record<string, { empty: number[]; learned: number[] }>): {
+	decision: 'keep' | 'revert';
+	reason: string;
+	emptyMean: number;
+	learnedMean: number;
+} {
+	const paired: TaskPairedScores = {};
+	for (const [task, s] of Object.entries(byTask)) {
+		paired[task] = { parent: s.empty, candidate: s.learned };
+	}
+	const d = decideRevision({ byTask: paired, minRepsPerTask: 3 });
+	return {
+		decision: d.decision,
+		reason: d.reason,
+		emptyMean: d.parentMean,
+		learnedMean: d.candidateMean,
 	};
 }

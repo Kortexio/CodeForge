@@ -2,15 +2,19 @@
  * Thinking / chain-of-thought controls for OpenAI-compatible agent rounds.
  *
  * Pattern (Qwen docs, Ollama tools-default-off, OpenCode plan/build):
- * - Agent tool rounds → thinking OFF (faster, tool tokens emit correctly)
+ * - Agent tool rounds → thinking OFF by default (faster, tool tokens emit correctly)
+ * - Agent tool rounds with profile `thinking.toolRounds` → thinking ON (interleaved:
+ *   reasoning of the current turn stays in history so each step builds on the last)
  * - Plan mode → thinking ON (deeper exploration)
- * - Only send enable_thinking* when the model likely supports it
+ * - Only send enable_thinking* when the model supports it: measured by calibrate
+ *   (`thinking.supported`), name heuristic only for models not calibrated yet
  */
 
 /** Model ids that commonly default thinking ON or honor enable_thinking. */
 const THINKING_MODEL_RE =
 	/\b(qwen3|qwq|deepseek-?r1|r1-|bonsai|gemma-?4|gpt-?oss|hydra|ornith|thinking|reasoner)\b/i;
 
+/** Name heuristic — fallback for models with no measured `thinking.supported`. */
 export function modelLikelySupportsThinking(model: string | undefined): boolean {
 	const id = String(model ?? '').trim();
 	if (!id) return false;
@@ -19,12 +23,27 @@ export function modelLikelySupportsThinking(model: string | undefined): boolean 
 
 export interface ThinkingRoundInput {
 	model: string;
+	/** ModelProfile `thinking.supported` (calibrate probe). Wins over the name heuristic. */
+	thinkingSupported?: boolean;
 	/** Plan mode keeps thinking ON (OpenCode-style). */
 	planMode?: boolean;
 	/** Native tools present on this request. */
 	withTools?: boolean;
 	/** Prose JSON tool protocol (still a tool-action turn). */
 	proseToolsOnly?: boolean;
+	/** ModelProfile `thinking.toolRounds`: reason before choosing each tool call. */
+	toolRoundThinking?: boolean;
+	/** One-shot escalation after a structural stumble (hybrid thinking). */
+	escalatedThinking?: boolean;
+}
+
+function isToolRound(input: ThinkingRoundInput): boolean {
+	return !!(input.withTools || input.proseToolsOnly);
+}
+
+export function supportsThinking(input: Pick<ThinkingRoundInput, 'model' | 'thinkingSupported'>): boolean {
+	if (typeof input.thinkingSupported === 'boolean') return input.thinkingSupported;
+	return modelLikelySupportsThinking(input.model);
 }
 
 /**
@@ -32,15 +51,17 @@ export interface ThinkingRoundInput {
  * Returns false when the model has no thinking support (do not send flags).
  */
 export function shouldDisableThinking(input: ThinkingRoundInput): boolean {
-	if (!modelLikelySupportsThinking(input.model)) return false;
-	if (input.planMode) return false;
-	return !!(input.withTools || input.proseToolsOnly);
+	if (!supportsThinking(input)) return false;
+	if (input.planMode || input.toolRoundThinking || input.escalatedThinking) return false;
+	return isToolRound(input);
 }
 
-/** Whether we should hard-enable thinking (Plan on reasoning models). */
+/** Whether we should hard-enable thinking (Plan, always-on tool rounds, or escalated). */
 export function shouldEnableThinking(input: ThinkingRoundInput): boolean {
-	if (!modelLikelySupportsThinking(input.model)) return false;
-	return !!input.planMode;
+	if (!supportsThinking(input)) return false;
+	if (input.planMode) return true;
+	if (input.escalatedThinking && isToolRound(input)) return true;
+	return !!input.toolRoundThinking && isToolRound(input);
 }
 
 /**
@@ -66,6 +87,7 @@ export function llmThinkingRequestFields(input: ThinkingRoundInput): Record<stri
 export type SamplingProfileSlice = {
 	plan: { temperature: number; top_p: number };
 	toolThinking: { temperature: number; top_p: number; presence_penalty: number };
+	toolReasoning?: { temperature: number; top_p: number; presence_penalty: number };
 	plain: { temperature: number; top_p: number };
 };
 
@@ -83,10 +105,15 @@ export function llmSamplingOptions(
 		toolThinking: { temperature: 0.7, top_p: 0.8, presence_penalty: 0 },
 		plain: { temperature: 0.2, top_p: 1 },
 	};
-	if (shouldEnableThinking(input)) {
+	if (input.planMode && shouldEnableThinking(input)) {
 		return { temperature: samp.plan.temperature, top_p: samp.plan.top_p };
 	}
-	if (shouldDisableThinking(input) || modelLikelySupportsThinking(input.model)) {
+	if (shouldEnableThinking(input)) {
+		// Tool rounds with thinking: own slice, so enabling thinking does not also widen sampling.
+		const s = samp.toolReasoning ?? samp.toolThinking;
+		return { temperature: s.temperature, top_p: s.top_p, presence_penalty: s.presence_penalty };
+	}
+	if (shouldDisableThinking(input) || supportsThinking(input)) {
 		// Non-thinking / tool rounds. presence_penalty stays 0 by default: tool calls must
 		// repeat tokens (</parameter>, old_string copied into new_string).
 		return {
@@ -105,12 +132,16 @@ export function llmSamplingOptions(
 export function toolAwareMaxTokens(
 	completionCap: number,
 	input: ThinkingRoundInput & { tools?: Array<{ function?: { name?: string } }> },
-	limits?: { mutatingMaxTokens: number; readOnlyMaxTokens: number }
+	limits?: { mutatingMaxTokens: number; readOnlyMaxTokens: number; thinkingMaxTokens?: number }
 ): number {
-	if (!input.withTools && !input.proseToolsOnly) return completionCap;
-	// Plan keeps thinking ON — do not starve the completion budget.
+	if (!isToolRound(input)) return completionCap;
 	if (input.planMode) return completionCap;
-	if (!shouldDisableThinking(input) && !modelLikelySupportsThinking(input.model)) {
+	// Reasoning comes before the call, so the read/write caps would starve it.
+	if (shouldEnableThinking(input)) {
+		const cap = limits?.thinkingMaxTokens;
+		return typeof cap === 'number' && cap > 0 ? Math.min(completionCap, cap) : completionCap;
+	}
+	if (!shouldDisableThinking(input) && !supportsThinking(input)) {
 		return completionCap;
 	}
 	const mutating = limits?.mutatingMaxTokens ?? 6144;
@@ -169,16 +200,42 @@ type MsgLike = {
 	thinking?: unknown;
 };
 
-/** Drop CoT fields and `<think>` blocks so later rounds stay lean. */
-export function stripReasoningFromMessages<T extends MsgLike>(messages: T[]): T[] {
-	return messages.map(m => {
+function reasoningText(m: MsgLike): string {
+	for (const v of [m.reasoning_content, m.reasoning, m.thinking]) {
+		if (typeof v === 'string' && v.trim()) return v.trim();
+	}
+	return '';
+}
+
+/**
+ * Drop CoT fields and `<think>` blocks so later rounds stay lean.
+ * `keepCurrentTurn`: assistant messages after the last user message keep their reasoning as
+ * `reasoning_content` (interleaved thinking across the tool steps of one turn). Older turns are
+ * always stripped, which matches what Qwen3-style chat templates render.
+ */
+export function stripReasoningFromMessages<T extends MsgLike>(
+	messages: T[],
+	opts: { keepCurrentTurn?: boolean } = {}
+): T[] {
+	let lastUser = -1;
+	if (opts.keepCurrentTurn) {
+		for (let i = messages.length - 1; i >= 0; i--) {
+			if (messages[i].role === 'user') {
+				lastUser = i;
+				break;
+			}
+		}
+	}
+	return messages.map((m, i) => {
 		const next: MsgLike = { ...m };
+		const kept = opts.keepCurrentTurn && i > lastUser && m.role === 'assistant' ? reasoningText(m) : '';
 		delete next.reasoning;
 		delete next.reasoning_content;
 		delete next.thinking;
 		if (typeof next.content === 'string') {
 			next.content = stripThinkBlocks(next.content);
 		}
+		if (kept) next.reasoning_content = kept;
 		return next as T;
 	});
 }
@@ -211,4 +268,56 @@ export function applySoftThinkSwitch<T extends MsgLike>(
 	const cleaned = body.replace(new RegExp(`(?:\\s|\\n)*${opposite}\\s*$`), '').trimEnd();
 	out[idx] = { ...out[idx], content: `${cleaned}\n${tag}` } as T;
 	return out;
+}
+
+/** Chat-completions body that asks for thinking on a tool round (calibrate support probe). */
+export function thinkingProbeRequest(model: string): Record<string, unknown> {
+	return {
+		model,
+		temperature: 0.6,
+		top_p: 0.95,
+		max_tokens: 1024,
+		stream: false,
+		tools: [
+			{
+				type: 'function',
+				function: {
+					name: 'read',
+					description: 'Read a file',
+					parameters: {
+						type: 'object',
+						properties: { path: { type: 'string' } },
+						required: ['path'],
+					},
+				},
+			},
+		],
+		tool_choice: 'auto',
+		messages: applySoftThinkSwitch(
+			[
+				{ role: 'system', content: 'You are a coding agent. Use the read tool to inspect files.' },
+				{
+					role: 'user',
+					content: 'Coupons expire one day early. The logic is in src/pricing/coupons.js. Find the cause.',
+				},
+			],
+			false
+		),
+		enable_thinking: true,
+		chat_template_kwargs: { enable_thinking: true },
+	};
+}
+
+/**
+ * Whether a probe response shows separate reasoning together with a usable answer.
+ * Reasoning alone (no tool call, no content) does not count: the round would be wasted.
+ */
+export function thinkingProbeObserved(message: unknown): boolean {
+	if (!message || typeof message !== 'object') return false;
+	const m = message as MsgLike;
+	const raw = typeof m.content === 'string' ? m.content : '';
+	const split = splitThinkContent(raw);
+	const reasoning = reasoningText(m) || split.reasoning;
+	const answered = (Array.isArray(m.tool_calls) && m.tool_calls.length > 0) || !!split.content;
+	return !!reasoning && answered;
 }

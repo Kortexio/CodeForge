@@ -52,6 +52,10 @@ export interface LoopDetector {
 	getUnchangedStreak(): number;
 	/** Consecutive steps where every call repeated a prior fingerprint+result. */
 	getConsecutiveIdenticalSteps(): number;
+	/** Which stall is active, if shouldStop() is true. */
+	stallKind(): 'identical' | 'unchanged' | null;
+	/** Clear the identical-call streak so one recovery round can run. */
+	resetIdenticalStreak(): void;
 }
 
 /** Simple stable hash of tool result text (for identity, not security). */
@@ -65,7 +69,8 @@ export function hashResult(text: string): string {
 	return (h >>> 0).toString(16).padStart(8, '0');
 }
 
-export function createLoopDetector(): LoopDetector {
+export function createLoopDetector(opts?: { stallThreshold?: number }): LoopDetector {
+	const stallThreshold = Math.max(2, Math.floor(opts?.stallThreshold ?? 3));
 	let currentStep = 1;
 	let consecutiveIdenticalSteps = 0;
 	let unchangedStreak = 0;
@@ -97,12 +102,12 @@ export function createLoopDetector(): LoopDetector {
 		},
 
 		shouldStop(): boolean {
-			return consecutiveIdenticalSteps >= 3 || unchangedStreak >= 3;
+			return consecutiveIdenticalSteps >= stallThreshold || unchangedStreak >= 3;
 		},
 
 		cause(): string {
-			if (consecutiveIdenticalSteps >= 3) {
-				return 'identical tool calls and results for 3 consecutive steps';
+			if (consecutiveIdenticalSteps >= stallThreshold) {
+				return `identical tool calls and results for ${stallThreshold} consecutive steps`;
 			}
 			if (unchangedStreak >= 3) {
 				return 'browser UI UNCHANGED for 3 consecutive actions';
@@ -120,6 +125,17 @@ export function createLoopDetector(): LoopDetector {
 
 		getConsecutiveIdenticalSteps(): number {
 			return consecutiveIdenticalSteps;
+		},
+
+		stallKind(): 'identical' | 'unchanged' | null {
+			if (consecutiveIdenticalSteps >= stallThreshold) return 'identical';
+			if (unchangedStreak >= 3) return 'unchanged';
+			return null;
+		},
+
+		resetIdenticalStreak(): void {
+			consecutiveIdenticalSteps = 0;
+			stepCalls = [];
 		},
 	};
 }

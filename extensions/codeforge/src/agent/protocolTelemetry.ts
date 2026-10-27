@@ -14,6 +14,12 @@ export const PROTOCOL_COUNTER_KEYS = [
 	'unknownTools',
 	'lengthExits',
 	'emptyReplies',
+	/** Rounds whose response carried separate reasoning (`reasoning_content` / `<think>`). */
+	'reasoningRounds',
+	/** Rounds where thinking was escalated after a structural stumble. */
+	'escalatedRounds',
+	/** Calls to the no-side-effect `think` tool. */
+	'thinkToolCalls',
 	'systemChars',
 	'toolsChars',
 ] as const;
@@ -46,6 +52,9 @@ export function emptyProtocolCounters(): ProtocolCounters {
 		unknownTools: 0,
 		lengthExits: 0,
 		emptyReplies: 0,
+		reasoningRounds: 0,
+		escalatedRounds: 0,
+		thinkToolCalls: 0,
 		systemChars: 0,
 		toolsChars: 0,
 	};
@@ -53,13 +62,23 @@ export function emptyProtocolCounters(): ProtocolCounters {
 
 export type ProtocolAggregator = {
 	observe(ev: ProtocolActivity): void;
-	snapshot(): { protocol: ProtocolCounters; samples: ProtocolSample[]; sampleCount: number };
+	snapshot(): {
+		protocol: ProtocolCounters;
+		samples: ProtocolSample[];
+		sampleCount: number;
+		contract?: string;
+		configHash?: string;
+		harnessRevision?: number;
+	};
 };
 
 export function createProtocolAggregator(opts?: { sampleCap?: number }): ProtocolAggregator {
 	const protocol = emptyProtocolCounters();
 	const samples: ProtocolSample[] = [];
 	const sampleCap = opts?.sampleCap ?? SAMPLE_CAP;
+	let contract: string | undefined;
+	let configHash: string | undefined;
+	let harnessRevision: number | undefined;
 
 	return {
 		observe(ev: ProtocolActivity): void {
@@ -77,6 +96,19 @@ export function createProtocolAggregator(opts?: { sampleCap?: number }): Protoco
 				}
 				return;
 			}
+			if (label === 'config') {
+				try {
+					const parsed = JSON.parse(String(ev.detail || '{}')) as Record<string, unknown>;
+					if (typeof parsed.contract === 'string') contract = parsed.contract;
+					if (typeof parsed.configHash === 'string') configHash = parsed.configHash;
+					if (typeof parsed.harnessRevision === 'number') {
+						harnessRevision = parsed.harnessRevision;
+					}
+				} catch {
+					/* ignore */
+				}
+				return;
+			}
 			if (label === 'systemChars' || label === 'toolsChars') {
 				protocol[label] = Number(ev.detail || 0) || 0;
 				return;
@@ -91,6 +123,9 @@ export function createProtocolAggregator(opts?: { sampleCap?: number }): Protoco
 				protocol: { ...protocol },
 				samples: samples.slice(),
 				sampleCount: samples.length,
+				...(contract ? { contract } : {}),
+				...(configHash ? { configHash } : {}),
+				...(typeof harnessRevision === 'number' ? { harnessRevision } : {}),
 			};
 		},
 	};
@@ -106,6 +141,9 @@ export type FlushRunTelemetryInput = {
 	aggregator: ProtocolAggregator;
 	/** Override profile root (tests). */
 	profileDir?: string;
+	contract?: string;
+	configHash?: string;
+	harnessRevision?: number;
 };
 
 export type RunTelemetryRecord = {
@@ -119,6 +157,9 @@ export type RunTelemetryRecord = {
 	protocol: ProtocolCounters;
 	sampleCount: number;
 	sampleReasons: string[];
+	contract?: string;
+	configHash?: string;
+	harnessRevision?: number;
 };
 
 export type ProtocolRollup = {
@@ -137,6 +178,10 @@ function ensureDirSync(dir: string): void {
 
 export function flushRunTelemetry(input: FlushRunTelemetryInput): RunTelemetryRecord {
 	const snap = input.aggregator.snapshot();
+	const contract = input.contract ?? snap.contract;
+	const configHash = input.configHash ?? snap.configHash;
+	const harnessRevision =
+		input.harnessRevision ?? snap.harnessRevision;
 	const record: RunTelemetryRecord = {
 		at: new Date().toISOString(),
 		serverId: input.serverId,
@@ -151,6 +196,9 @@ export function flushRunTelemetry(input: FlushRunTelemetryInput): RunTelemetryRe
 			.map(s => String(s.reason || ''))
 			.filter(Boolean)
 			.slice(0, SAMPLE_CAP),
+		...(contract ? { contract } : {}),
+		...(configHash ? { configHash } : {}),
+		...(typeof harnessRevision === 'number' ? { harnessRevision } : {}),
 	};
 
 	const dir = input.profileDir ?? modelProfileDir(input.serverId, input.model);
@@ -170,7 +218,7 @@ export function flushRunTelemetry(input: FlushRunTelemetryInput): RunTelemetryRe
 	rollup.runCount += 1;
 	rollup.updatedAt = record.at;
 	for (const key of PROTOCOL_COUNTER_KEYS) {
-		rollup.sums[key] += record.protocol[key];
+		rollup.sums[key] = (rollup.sums[key] ?? 0) + record.protocol[key];
 	}
 	rollup.recent.push(record);
 	if (rollup.recent.length > ROLLUP_WINDOW) {
@@ -220,6 +268,32 @@ export function lengthExitRate(rollup: ProtocolRollup): number {
 	let hits = 0;
 	for (const r of runs) {
 		if ((r.protocol.lengthExits ?? 0) > 0 || r.loopExit === 'length') hits += 1;
+	}
+	return hits / runs.length;
+}
+
+/** Runs that match a config hash (missing hash never matches a concrete hash). */
+export function runsForConfig(
+	rollup: ProtocolRollup,
+	configHash: string
+): RunTelemetryRecord[] {
+	if (!configHash) return [];
+	return rollup.recent.filter(r => r.configHash === configHash);
+}
+
+export function runsForSource(
+	rollup: ProtocolRollup,
+	source: 'chat' | 'bench'
+): RunTelemetryRecord[] {
+	return rollup.recent.filter(r => r.source === source);
+}
+
+/** Unrepaired XML/arg leaks only (repaired leaks do not drive hysteresis). */
+export function unrepairedLeakRate(runs: RunTelemetryRecord[]): number {
+	if (!runs.length) return 0;
+	let hits = 0;
+	for (const r of runs) {
+		if (r.sampleReasons.some(x => x === 'leaked_param_conflict')) hits += 1;
 	}
 	return hits / runs.length;
 }

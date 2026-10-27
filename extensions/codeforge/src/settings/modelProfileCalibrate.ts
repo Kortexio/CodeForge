@@ -270,8 +270,11 @@ export async function promptAndRunCalibration(
 
 	const repsPick = await vscode.window.showQuickPick(
 		[
-			{ label: '1', description: 'Faster smoke (4 tasks)' },
-			{ label: '3', description: 'Full calibrate (12 runs)' },
+			{ label: '1', description: 'Faster smoke (4 tasks; ×2 when the server supports thinking)' },
+			{
+				label: '3',
+				description: 'Full calibrate (12 runs; ×2 when the server supports thinking)',
+			},
 		],
 		{ title: 'Repetitions per task' }
 	);

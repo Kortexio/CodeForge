@@ -50,7 +50,8 @@ export interface AiServer {
 	/** Models available on this server (user-managed list). */
 	models: string[];
 	/**
-	 * Context window for this server/model (tokens).
+	 * Context window for this server (tokens). UI label: "Context window".
+	 * Filled by Refresh from API when the server reports n_ctx / max_model_len.
 	 * Sent as options.num_ctx when supported; also drives client compact/caps.
 	 */
 	numCtx?: number;

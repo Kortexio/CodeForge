@@ -80,6 +80,7 @@ const vscode = {
 		parse: s => makeUri(String(s).replace(/^file:\/\//, '')),
 	},
 	workspace: {
+		textDocuments: [],
 		get workspaceFolders() {
 			return [
 				{
@@ -181,6 +182,7 @@ const vscode = {
 	window: {
 		activeTextEditor: undefined,
 		visibleTextEditors: [],
+		tabGroups: { all: [] },
 		createOutputChannel: () => ({
 			appendLine: () => {},
 			append: () => {},

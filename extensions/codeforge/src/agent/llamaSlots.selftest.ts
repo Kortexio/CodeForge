@@ -3,6 +3,7 @@
  */
 import {
 	capsFromArgs,
+	contextWindowFromModelsList,
 	effectiveContextBudget,
 	parseLlamaSlots,
 	parseModelStatusArgs,
@@ -61,5 +62,23 @@ assert(fromModels?.parallel === 2 && fromModels.slotContext === 65536, 'model st
 assert(effectiveContextBudget(65536, { parallel: 2, slotContext: 32768, kvUnified: false }) === 32768, 'clamp');
 assert(effectiveContextBudget(8192, { parallel: 2, slotContext: 32768, kvUnified: false }) === 8192, 'keep smaller config');
 assert(effectiveContextBudget(65536, undefined) === 65536, 'no caps');
+
+assert(
+	contextWindowFromModelsList({
+		data: [{ id: 'qwen', meta: { n_ctx: 92160 } }],
+	}) === 92160,
+	'llama.cpp meta.n_ctx'
+);
+assert(
+	contextWindowFromModelsList({
+		data: [
+			{ id: 'a', meta: { n_ctx: 32768 } },
+			{ id: 'b', max_model_len: 65536 },
+		],
+	}) === 65536,
+	'max across models'
+);
+assert(contextWindowFromModelsList({ data: [{ id: 'gpt' }] }) === undefined, 'no ctx fields');
+assert(contextWindowFromModelsList({ data: [{ id: 'tiny', meta: { n_ctx: 512 } }] }) === undefined, 'below floor');
 
 console.log('llamaSlots.selftest ok');

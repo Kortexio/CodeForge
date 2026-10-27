@@ -248,7 +248,7 @@ describe('harness contradictions', () => {
 		expect(userMsgs).toMatch(/MAXIMUM STEPS|maximum steps/i);
 	}, 90_000);
 
-	it('Loop: identical call+result three times stops with that cause', async () => {
+	it('Loop: identical call+result streak restarts the loop instead of ending the turn', async () => {
 		const result = await runLoop({
 			files: { 'a.ts': 'const x = 1;\n' },
 			task: 'Read a.ts.',
@@ -259,6 +259,15 @@ describe('harness contradictions', () => {
 			],
 			maxSteps: 30,
 		});
-		expect(result.reply).toMatch(/identical|repeat|same (call|result)|stuck|without new progress/i);
+		const blob = JSON.stringify(result.requests);
+		expect(blob).toContain('The repeated calls have stopped.');
+		expect(blob).toContain('It was not sent again.');
+		const lastMsgs = (result.requests.at(-1)?.body.messages ?? []) as Array<{ role?: string; content?: string }>;
+		const bodies = lastMsgs.filter(m => m.role === 'tool' && /lines 1-2\/2/.test(m.content ?? ''));
+		expect(bodies.length).toBe(1);
+		const labels = result.activities.map(a => a.label ?? '');
+		expect(labels).toContain('Repeated reads stopped');
+		expect(labels).not.toContain('Stopped tool loop');
+		expect(result.reply).not.toMatch(/tools were repeating without new progress/i);
 	}, 90_000);
 });

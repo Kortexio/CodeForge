@@ -61,5 +61,23 @@ flushRunTelemetry({
 const rollup2 = loadModelRollup('srv', 'model', profileDir)!;
 assert(rollup2.runCount === 2 && rollup2.recent.length === 2, 'second flush');
 
+const legacyDir = path.join(tmp, 'srv', 'legacy');
+fs.mkdirSync(legacyDir, { recursive: true });
+const legacySums = { ...rollup2.sums } as Partial<typeof rollup2.sums>;
+delete legacySums.reasoningRounds;
+fs.writeFileSync(
+	path.join(legacyDir, 'rollup.json'),
+	JSON.stringify({ ...rollup2, sums: legacySums }),
+	'utf8'
+);
+const thinkAgg = createProtocolAggregator();
+thinkAgg.observe({ kind: 'protocol', label: 'reasoningRounds', detail: '1' });
+thinkAgg.observe({ kind: 'protocol', label: 'reasoningRounds', detail: '1' });
+assert(thinkAgg.snapshot().protocol.reasoningRounds === 2, 'reasoningRounds counts each round');
+assert(createProtocolAggregator().snapshot().protocol.reasoningRounds === 0, 'reasoningRounds starts at 0');
+flushRunTelemetry({ serverId: 'srv', model: 'legacy', source: 'bench', aggregator: thinkAgg, profileDir: legacyDir });
+const legacyRollup = loadModelRollup('srv', 'legacy', legacyDir)!;
+assert(legacyRollup.sums.reasoningRounds === 2, 'rollup written before the key sums from 0, not NaN');
+
 fs.rmSync(tmp, { recursive: true, force: true });
 console.log('protocolTelemetry.selftest: ok');

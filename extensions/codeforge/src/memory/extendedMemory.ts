@@ -23,6 +23,14 @@ export interface MemoryLesson {
 	lastSeen: string;
 	/** Optional regex source for matching future commands (string form) */
 	match?: string;
+	/** Situation shape for transfer (normalized command/error, no case facts). */
+	cue?: string;
+	/** Commands that produced this lesson. */
+	evidence?: string[];
+	/** Normalized command signature for success-unlearn. */
+	commandSignature?: string;
+	/** Inactive when match quality is too weak (kept on disk). */
+	inactive?: boolean;
 }
 
 interface LessonsFile {
@@ -95,9 +103,24 @@ async function save(workspaceFolder: string | undefined, data: LessonsFile): Pro
 	cacheKey = workspaceFolder ? workspaceHash(workspaceFolder) : 'default';
 }
 
+const DECAY_HALF_LIFE_DAYS = 14;
+const MIN_INJECT_SCORE = 0.5;
+
+export function lessonDecayScore(lesson: MemoryLesson, now = Date.now()): number {
+	if (lesson.inactive || lesson.hits <= 0) return 0;
+	const last = Date.parse(lesson.lastSeen || '');
+	const ageDays = Number.isFinite(last) ? Math.max(0, (now - last) / 86_400_000) : 365;
+	return lesson.hits * Math.pow(0.5, ageDays / DECAY_HALF_LIFE_DAYS);
+}
+
 export async function getExtendedLessons(workspaceFolder?: string): Promise<MemoryLesson[]> {
 	const data = await load(workspaceFolder);
-	return [...data.lessons].sort((a, b) => b.hits - a.hits || b.lastSeen.localeCompare(a.lastSeen));
+	return [...data.lessons]
+		.map(normalizeLessonQuality)
+		.sort(
+			(a, b) =>
+				lessonDecayScore(b) - lessonDecayScore(a) || b.lastSeen.localeCompare(a.lastSeen)
+		);
 }
 
 export async function recordLesson(
@@ -110,28 +133,58 @@ export async function recordLesson(
 	let next: MemoryLesson;
 	if (idx >= 0) {
 		const prev = data.lessons[idx];
-		next = {
+		next = normalizeLessonQuality({
 			...prev,
 			...lesson,
 			hits: prev.hits + 1,
 			lastSeen: now,
 			advice: lesson.advice || prev.advice,
 			pattern: lesson.pattern || prev.pattern,
-		};
+			evidence: [
+				...(prev.evidence ?? []),
+				...(lesson.evidence ?? []),
+			].slice(-8),
+		});
 		data.lessons[idx] = next;
 	} else {
-		next = {
+		next = normalizeLessonQuality({
 			...lesson,
 			hits: lesson.hits ?? 1,
 			lastSeen: now,
-		};
+		});
 		data.lessons.push(next);
 	}
+	// Evict by decay score; the just-written lesson is protected for this save.
+	const protectedId = next.id;
 	data.lessons = data.lessons
-		.sort((a, b) => b.hits - a.hits)
+		.map(normalizeLessonQuality)
+		.sort((a, b) => {
+			if (a.id === protectedId) return -1;
+			if (b.id === protectedId) return 1;
+			return lessonDecayScore(b) - lessonDecayScore(a);
+		})
 		.slice(0, MAX_LESSONS);
 	await save(workspaceFolder, data);
 	return next;
+}
+
+function normalizeLessonQuality(lesson: MemoryLesson): MemoryLesson {
+	const match = lesson.match?.trim() ?? '';
+	const words = matchWords(match);
+	const inactive = words.length > 0 && words.length < 2 ? true : lesson.inactive === true;
+	return {
+		...lesson,
+		inactive,
+		cue: lesson.cue || lesson.pattern,
+	};
+}
+
+function matchWords(match: string): string[] {
+	return match
+		.toLowerCase()
+		.replace(/\\[sSdDwW]|\{[^}]*\}|\[[^\]]*\]|[|().*+?^$]/g, ' ')
+		.split(/\s+/)
+		.filter(w => w.length > 2);
 }
 
 export interface ShellLessonResult {
@@ -188,13 +241,50 @@ export async function learnFromShellFailure(
 			}
 		: derived;
 
-	const lesson = await recordLesson(workspaceFolder, classified);
+	const lesson = await recordLesson(workspaceFolder, {
+		...classified,
+		commandSignature: normalizeCommandSignature(cmd),
+		evidence: [clipText(cmd, 160)],
+		cue: classified.pattern,
+	});
 	const seen = lesson.hits > 1 ? ` Seen ${lesson.hits} times.` : '';
 	return {
 		lesson,
 		isCmdNoise: isShellNoiseFailure(cmd, out),
 		adviceBlock: `(lesson — ${lesson.title}: ${lesson.advice}${seen})`,
 	};
+}
+
+/** Success of the same command signature removes the matching lesson. */
+export async function learnFromShellSuccess(
+	workspaceFolder: string | undefined,
+	command: string
+): Promise<MemoryLesson | null> {
+	const sig = normalizeCommandSignature(command);
+	if (!sig) return null;
+	const data = await load(workspaceFolder);
+	const idx = data.lessons.findIndex(
+		l => l.commandSignature === sig || normalizeCommandSignature(l.pattern) === sig
+	);
+	if (idx < 0) return null;
+	const [removed] = data.lessons.splice(idx, 1);
+	await save(workspaceFolder, data);
+	return removed ?? null;
+}
+
+export function normalizeCommandSignature(command: string): string {
+	return String(command ?? '')
+		.replace(/%[A-Za-z_][A-Za-z0-9_]*/g, '%VAR')
+		.replace(/'[^']*'/g, "'…'")
+		.replace(/"[^"]*"/g, '"…"')
+		.replace(/[A-Za-z]:\\[^\s]+/g, 'PATH')
+		.replace(/\b[0-9a-f]{8}-[0-9a-f-]{27,}\b/gi, 'GUID')
+		.replace(/\b[0-9a-f]{7,}\b/gi, 'SHA')
+		.replace(/\d+/g, 'N')
+		.replace(/\s+/g, ' ')
+		.trim()
+		.toLowerCase()
+		.slice(0, 160);
 }
 
 /** Build a lesson from the failure text. Same error signature → same id. */
@@ -241,7 +331,24 @@ export function formatLessonItem(lesson: MemoryLesson): string {
 
 /** Lessons already learned whose stored pattern appears in this text. */
 export function lessonsForText(lessons: MemoryLesson[], text: string, max = 4): MemoryLesson[] {
-	return lessons.filter(l => l.hits > 0 && lessonHitsText(l, text)).slice(0, max);
+	return lessons
+		.filter(
+			l =>
+				!l.inactive &&
+				l.hits > 0 &&
+				lessonDecayScore(l) >= MIN_INJECT_SCORE &&
+				lessonHitsText(l, text)
+		)
+		.slice(0, max);
+}
+
+/** Match lessons against a command about to run (preferred over task text). */
+export function lessonsForCommand(
+	lessons: MemoryLesson[],
+	command: string,
+	max = 4
+): MemoryLesson[] {
+	return lessonsForText(lessons, command, max);
 }
 
 /** Shell rejected the invocation itself (missing program, Unix pipe). Real program failures stay visible. */
@@ -313,7 +420,8 @@ function matchFromError(errorLine: string): string {
 		.split(/\s+/)
 		.filter(w => w.length > 3 && !SIGNATURE_STOP.has(w))
 		.slice(0, 4);
-	if (!words.length) return '';
+	// Require at least two distinctive words so one-word matches like "flag" stay inactive.
+	if (words.length < 2) return words[0] ? words[0].replace(/[.*+?^${}()|[\]\\]/g, '\\$&') : '';
 	return words
 		.slice(0, 3)
 		.map(w => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))

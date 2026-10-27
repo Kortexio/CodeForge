@@ -6,6 +6,7 @@
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { ensureDir } from '../storage/paths';
+import { FORBIDDEN_SNIPPETS } from './harnessRevision';
 
 /** Pure copy of guardrailEngine.isTestFilePath — keeps this module free of vscode. */
 function isTestFilePath(pathArg: unknown): boolean {
@@ -22,6 +23,10 @@ export const CHECKS_LOCK_REL = '.CodeForge/loop/checks.lock';
 export const ORACLE_JSON_REL = '.CodeForge/oracle.json';
 export const RESULTS_JSONL_REL = '.CodeForge/loop/results.jsonl';
 export const HOW_TO_WORK_REL = '.CodeForge/skills/how-to-work/SKILL.md';
+export const HABITS_REL = '.CodeForge/loop/habits.json';
+export const MAX_ACTIVE_HABITS = 5;
+export const HABIT_MAX_CHARS = 300;
+export const HABIT_PROBATION_FEATURES = 3;
 
 export interface ChecksLock {
 	paths: string[];
@@ -251,14 +256,16 @@ export function denyExperimentMutation(
 	}
 ): string | null {
 	if (opts.coachMode) {
-		if (tool === 'shell' || tool === 'dotnet' || tool === 'delete' || tool === 'rename') {
-			return `Not run: "${tool}" is not available in coach mode (only edit ${HOW_TO_WORK_REL}).`;
-		}
-		if (tool === 'write' || tool === 'edit' || tool === 'apply_patch') {
-			const paths = pathsTouchedByTool(tool, args);
-			if (!paths.length || paths.some(p => !isHowToWorkPath(p))) {
-				return `Not run: coach mode may only write ${HOW_TO_WORK_REL}.`;
-			}
+		if (
+			tool === 'shell' ||
+			tool === 'dotnet' ||
+			tool === 'delete' ||
+			tool === 'rename' ||
+			tool === 'write' ||
+			tool === 'edit' ||
+			tool === 'apply_patch'
+		) {
+			return `Not run: coach mode is JSON-only (habits are written by the harness).`;
 		}
 		return null;
 	}
@@ -321,11 +328,65 @@ export function parseRoundResults(text: string): RoundResult[] {
 	return out;
 }
 
-/** Coach runs when the latest feature had at least one undone round. */
-export function shouldRunCoach(rounds: RoundResult[]): boolean {
+export type HabitStatus = 'probation' | 'kept' | 'removed';
+
+export type Habit = {
+	id: string;
+	cue: string;
+	habit: string;
+	evidence: string[];
+	confidence: string;
+	status: HabitStatus;
+	featureKey: string;
+	baselineUndoRate: number;
+	featuresSeen: number;
+	at: string;
+};
+
+export type HabitsFile = { version: 1; habits: Habit[]; coachedFeatures: string[] };
+
+export function emptyHabitsFile(): HabitsFile {
+	return { version: 1, habits: [], coachedFeatures: [] };
+}
+
+export function parseHabitsFile(text: string): HabitsFile {
+	try {
+		const raw = JSON.parse(text) as Partial<HabitsFile>;
+		return {
+			version: 1,
+			habits: Array.isArray(raw.habits) ? (raw.habits as Habit[]) : [],
+			coachedFeatures: Array.isArray(raw.coachedFeatures)
+				? raw.coachedFeatures.map(String)
+				: [],
+		};
+	} catch {
+		return emptyHabitsFile();
+	}
+}
+
+export function featureKeyFromLock(lock: ChecksLock): string {
+	return `${lock.feature || 'feature'}@${lock.lockedAt || 'unknown'}`;
+}
+
+export function undoRate(rounds: RoundResult[], feature?: string): number {
+	const rows = feature
+		? rounds.filter(r => !feature || r.feature === feature)
+		: rounds;
+	if (!rows.length) return 0;
+	const undone = rows.filter(r => r.kept === false).length;
+	return undone / rows.length;
+}
+
+/** Coach runs at most once per feature key, and only when that feature had an undone round. */
+export function shouldRunCoach(
+	rounds: RoundResult[],
+	opts?: { featureKey?: string; coachedFeatures?: string[] }
+): boolean {
 	if (!rounds.length) return false;
 	const latest = rounds[rounds.length - 1];
 	const feature = latest.feature;
+	const key = opts?.featureKey || feature || '';
+	if (key && opts?.coachedFeatures?.includes(key)) return false;
 	const forFeature: RoundResult[] = [];
 	for (let i = rounds.length - 1; i >= 0; i--) {
 		const row = rounds[i];
@@ -341,15 +402,246 @@ export function coachTaskPrompt(rounds: RoundResult[], feature: string): string 
 	return [
 		'You are the experiment-loop method coach.',
 		`Feature just finished: ${feature}`,
-		`Read ${RESULTS_JSONL_REL} (summary below) and update only ${HOW_TO_WORK_REL}.`,
-		'Add at most one short habit that prevents a repeating mistake (undone rounds or green checks with missing wiring).',
+		'Reply with one JSON object only. No tools, no markdown fences.',
+		'Schema: {"rounds":[{"id":"r1","change":"...","observed":"...","verdict":"helped|hurt|no observed effect|confounded"}],"habit":{"cue":"...","habit":"...","evidence":["r1"],"confidence":"medium"} }',
+		'Or {"rounds":[...],"habit":"NO_ENTRY"} when nothing transfers.',
+		'A habit resting only on confounded rounds is invalid — use NO_ENTRY.',
+		`Habit text is at most ${HABIT_MAX_CHARS} characters. Cue is the situation shape, not this feature's facts.`,
 		'Do not edit code, tests, oracle.json, or checks.lock.',
-		'If the skill file is missing, create it with YAML frontmatter name/description and a "## How to work" section.',
-		'When done, reply with the habit you added (or say none).',
 		'',
 		'### Recent rounds',
 		body || '(empty)',
 	].join('\n');
+}
+
+export function parseCoachHabit(
+	raw: string
+):
+	| { ok: true; habit: Omit<Habit, 'id' | 'status' | 'featureKey' | 'baselineUndoRate' | 'featuresSeen' | 'at'> | null }
+	| { ok: false; error: string } {
+	const text = String(raw ?? '')
+		.replace(/<think\b[^>]*>[\s\S]*?<\/think>/gi, '')
+		.replace(/```(?:json)?/gi, '');
+	let obj: Record<string, unknown> | undefined;
+	for (let i = 0; i < text.length; i++) {
+		if (text[i] !== '{') continue;
+		let depth = 0;
+		let inStr = false;
+		let esc = false;
+		for (let j = i; j < text.length; j++) {
+			const c = text[j];
+			if (inStr) {
+				if (esc) {
+					esc = false;
+					continue;
+				}
+				if (c === '\\') {
+					esc = true;
+					continue;
+				}
+				if (c === '"') inStr = false;
+				continue;
+			}
+			if (c === '"') {
+				inStr = true;
+				continue;
+			}
+			if (c === '{') depth += 1;
+			else if (c === '}') {
+				depth -= 1;
+				if (depth === 0) {
+					try {
+						obj = JSON.parse(text.slice(i, j + 1)) as Record<string, unknown>;
+					} catch {
+						obj = undefined;
+					}
+					break;
+				}
+			}
+		}
+		if (obj) break;
+	}
+	if (!obj) return { ok: false, error: 'no JSON object' };
+	const rounds = Array.isArray(obj.rounds) ? obj.rounds : [];
+	const confoundedOnly =
+		rounds.length > 0 &&
+		rounds.every(
+			r =>
+				r &&
+				typeof r === 'object' &&
+				String((r as Record<string, unknown>).verdict || '').toLowerCase() === 'confounded'
+		);
+	if (obj.habit === 'NO_ENTRY' || obj.habit === null) {
+		return { ok: true, habit: null };
+	}
+	if (confoundedOnly) return { ok: false, error: 'habit rests only on confounded rounds' };
+	const h = obj.habit;
+	if (!h || typeof h !== 'object' || Array.isArray(h)) {
+		return { ok: false, error: 'habit missing' };
+	}
+	const habit = String((h as Record<string, unknown>).habit ?? '').trim();
+	const cue = String((h as Record<string, unknown>).cue ?? '').trim();
+	const confidence = String((h as Record<string, unknown>).confidence ?? 'medium').trim();
+	const evidence = Array.isArray((h as Record<string, unknown>).evidence)
+		? ((h as Record<string, unknown>).evidence as unknown[]).map(String)
+		: [];
+	if (!habit || !cue) return { ok: false, error: 'cue and habit required' };
+	if (habit.length > HABIT_MAX_CHARS) return { ok: false, error: 'habit too long' };
+	const lower = `${cue} ${habit}`.toLowerCase();
+	const banned = FORBIDDEN_SNIPPETS.find(s => lower.includes(s));
+	if (banned) return { ok: false, error: `forbidden text (${banned})` };
+	return {
+		ok: true,
+		habit: { cue, habit, evidence, confidence },
+	};
+}
+
+export function habitIsDuplicate(file: HabitsFile, cue: string, habit: string): boolean {
+	const cueKey = cue.trim().toLowerCase();
+	const habitKey = habit.trim().toLowerCase();
+	return file.habits.some(
+		h =>
+			(h.status === 'probation' || h.status === 'kept') &&
+			h.cue.trim().toLowerCase() === cueKey &&
+			h.habit.trim().toLowerCase() === habitKey
+	);
+}
+
+export function addHabitOnProbation(
+	file: HabitsFile,
+	draft: Omit<Habit, 'id' | 'status' | 'featureKey' | 'baselineUndoRate' | 'featuresSeen' | 'at'>,
+	opts: { featureKey: string; baselineUndoRate: number; at?: string }
+): HabitsFile | { error: string } {
+	if (habitIsDuplicate(file, draft.cue, draft.habit)) {
+		return { error: 'duplicate habit' };
+	}
+	const id = `h${file.habits.length + 1}-${Date.now().toString(36)}`;
+	const next: Habit = {
+		...draft,
+		id,
+		status: 'probation',
+		featureKey: opts.featureKey,
+		baselineUndoRate: opts.baselineUndoRate,
+		featuresSeen: 0,
+		at: opts.at || new Date().toISOString(),
+	};
+	const habits = [...file.habits, next];
+	const active = habits.filter(h => h.status === 'probation' || h.status === 'kept');
+	if (active.length > MAX_ACTIVE_HABITS) {
+		const drop = active.find(h => h.status === 'probation' && h.id !== next.id) || active[0];
+		return {
+			...file,
+			habits: habits.map(h =>
+				h.id === drop.id ? { ...h, status: 'removed' as const } : h
+			),
+		};
+	}
+	return { ...file, habits };
+}
+
+export async function readHabitsFile(workspaceRoot: string | undefined): Promise<HabitsFile> {
+	if (!workspaceRoot) return emptyHabitsFile();
+	try {
+		const text = await fs.readFile(path.join(workspaceRoot, HABITS_REL), 'utf8');
+		return parseHabitsFile(text);
+	} catch {
+		return emptyHabitsFile();
+	}
+}
+
+export async function writeHabitsAndSkill(
+	workspaceRoot: string | undefined,
+	file: HabitsFile
+): Promise<void> {
+	if (!workspaceRoot) return;
+	const habitsPath = path.join(workspaceRoot, HABITS_REL);
+	const skillPath = path.join(workspaceRoot, HOW_TO_WORK_REL);
+	await ensureDir(path.dirname(habitsPath));
+	await ensureDir(path.dirname(skillPath));
+	await fs.writeFile(habitsPath, JSON.stringify(file, null, 2), 'utf8');
+	await fs.writeFile(skillPath, renderHowToWork(file.habits), 'utf8');
+}
+
+/** Apply coach JSON: validate habit, advance probation, persist habits + SKILL.md. */
+export async function applyCoachReply(
+	workspaceRoot: string | undefined,
+	raw: string,
+	rounds: RoundResult[],
+	lock: ChecksLock | undefined
+): Promise<{ summary: string; file: HabitsFile }> {
+	const featureKey = lock ? featureKeyFromLock(lock) : `feature@${Date.now()}`;
+	let file = await readHabitsFile(workspaceRoot);
+	// Advance existing probation habits for this feature before adding a new one.
+	file = advanceHabitProbation(file, rounds, featureKey);
+	const parsed = parseCoachHabit(raw);
+	const baseline = undoRate(rounds);
+	if (!parsed.ok) {
+		await writeHabitsAndSkill(workspaceRoot, file);
+		return { summary: `Coach JSON invalid: ${parsed.error}`, file };
+	}
+	if (parsed.habit) {
+		const added = addHabitOnProbation(file, parsed.habit, {
+			featureKey,
+			baselineUndoRate: baseline,
+		});
+		if ('error' in added) {
+			await writeHabitsAndSkill(workspaceRoot, file);
+			return { summary: `Habit rejected: ${added.error}`, file };
+		}
+		file = added;
+	}
+	await writeHabitsAndSkill(workspaceRoot, file);
+	const active = file.habits.filter(h => h.status === 'probation' || h.status === 'kept');
+	const summary = parsed.habit
+		? `Added habit on probation (${active.length} active).`
+		: `No habit entry (${active.length} active).`;
+	return { summary, file };
+}
+
+export function renderHowToWork(habits: Habit[]): string {
+	const active = habits
+		.filter(h => h.status === 'probation' || h.status === 'kept')
+		.slice(0, MAX_ACTIVE_HABITS);
+	const lines = [
+		'---',
+		'name: how-to-work',
+		'description: Habits kept from the experiment loop.',
+		'---',
+		'',
+		'## How to work',
+		'',
+	];
+	if (!active.length) {
+		lines.push('_No habits kept yet._', '');
+	} else {
+		for (const h of active) {
+			lines.push(`- (${h.status}) When ${h.cue}: ${h.habit}`);
+		}
+		lines.push('');
+	}
+	return lines.join('\n');
+}
+
+export function advanceHabitProbation(
+	file: HabitsFile,
+	rounds: RoundResult[],
+	featureKey: string
+): HabitsFile {
+	const rate = undoRate(rounds);
+	const habits = file.habits.map(h => {
+		if (h.status !== 'probation') return h;
+		const next = { ...h, featuresSeen: h.featuresSeen + 1 };
+		if (next.featuresSeen < HABIT_PROBATION_FEATURES) return next;
+		if (rate < h.baselineUndoRate) {
+			return { ...next, status: 'kept' as const };
+		}
+		return { ...next, status: 'removed' as const };
+	});
+	return {
+		...file,
+		habits,
+		coachedFeatures: [...new Set([...file.coachedFeatures, featureKey])].slice(-40),
+	};
 }
 
 export function experimentSystemHint(): string {

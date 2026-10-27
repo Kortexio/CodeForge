@@ -98,6 +98,7 @@ const expected = [
 	'wiki_fact',
 	'wiki_facts',
 	'update_status',
+	'think',
 	'browser_navigate',
 	'browser_snapshot',
 	'browser_click',
