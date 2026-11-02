@@ -4998,7 +4998,10 @@ async function tryStructuredMidCompact(
 				role: 'system',
 				content: typeof system.content === 'string' ? system.content : systemContent,
 			},
-			{ role: 'user', content: formatCheckpointUserMessage(summary, readLedger) },
+			{
+				role: 'user',
+				content: buildUserContent(formatCheckpointUserMessage(summary, readLedger), opts.images),
+			},
 			...tail.filter(m => m.role !== 'system'),
 		];
 		normalizeToolProtocolHistory(next as Parameters<typeof normalizeToolProtocolHistory>[0]);
@@ -5113,27 +5116,27 @@ async function compactWithLlm(
 			: '';
 
 	// Keep the exact same system string (stable prefix); packet goes in the summary user message.
+	// The current turn's images must survive the rebuild: the summary is text, but the
+	// model still has to see what the user attached.
+	const summaryText = [
+		prior,
+		`Current task:\n${opts.task}`,
+		'',
+		'### Context packet (compact)',
+		packet.markdown,
+		'',
+		'### Rolling summary + facts',
+		'The conversation was compacted. STABLE FACTS (system message) hold the canonical paths and open errors.',
+		rolling,
+		readLedger ? `### FILES ALREADY READ\n${readLedger}` : '',
+		recentTools ? `\nRecent tool results:\n${recentTools}` : '',
+		stickyExtra,
+	]
+		.filter(Boolean)
+		.join('\n');
 	return [
 		{ role: 'system', content: system },
-		{
-			role: 'user',
-			content: [
-				prior,
-				`Current task:\n${opts.task}`,
-				'',
-				'### Context packet (compact)',
-				packet.markdown,
-				'',
-				'### Rolling summary + facts',
-				'The conversation was compacted. STABLE FACTS (system message) hold the canonical paths and open errors.',
-				rolling,
-				readLedger ? `### FILES ALREADY READ\n${readLedger}` : '',
-				recentTools ? `\nRecent tool results:\n${recentTools}` : '',
-				stickyExtra,
-			]
-				.filter(Boolean)
-				.join('\n'),
-		},
+		{ role: 'user', content: buildUserContent(summaryText, opts.images) },
 	];
 }
 
@@ -6138,8 +6141,34 @@ function toAnthropicContent(content: string | ContentPart[]): string | Array<Rec
 	});
 }
 
-function estimateTokens(messages: ChatMessage[]): number {
-	return Math.ceil(JSON.stringify(messages).length / 4);
+/**
+ * Vision tokens charged per attached image in the prompt estimate. The real count
+ * depends on the model's image resolution; this is a fixed planning value, and the
+ * server's reported prompt tokens take over (see lastRealPromptTokens) once known.
+ */
+const IMAGE_TOKEN_ESTIMATE = 1024;
+
+/**
+ * Prompt-size estimate for compaction decisions. An image's data URL is megabytes
+ * of base64: counting its characters as text made one attachment look like a
+ * 200k-token prompt, which forced a hard compaction before the first request and
+ * dropped the image. Images are counted as a fixed token cost instead.
+ */
+export function estimateTokens(messages: ChatMessage[]): number {
+	let chars = 0;
+	let images = 0;
+	for (const m of messages) {
+		if (Array.isArray(m.content)) {
+			for (const part of m.content) {
+				if (part.type === 'image_url') images++;
+				else chars += part.text.length;
+			}
+			chars += JSON.stringify({ ...m, content: undefined }).length;
+		} else {
+			chars += JSON.stringify(m).length;
+		}
+	}
+	return Math.ceil(chars / 4) + images * IMAGE_TOKEN_ESTIMATE;
 }
 
 function truncateHistory(text: string, max: number): string {

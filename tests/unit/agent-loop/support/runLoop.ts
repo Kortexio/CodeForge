@@ -18,6 +18,8 @@ export type RunLoopFiles = Record<string, string>;
 export type RunLoopOptions = {
 	files?: RunLoopFiles;
 	task: string;
+	/** Image attachments for the current turn (data URLs), as the composer produces them. */
+	images?: Array<{ mime: string; dataUrl: string; label?: string }>;
 	script?: ScriptedStep[];
 	/** When true, do not install the scripted fetch (use real network). */
 	live?: boolean;
@@ -197,6 +199,7 @@ export async function runLoop(opts: RunLoopOptions): Promise<RunLoopResult> {
 			baseUrl: opts.baseUrl ?? 'http://127.0.0.1:9/v1',
 			workspaceRoot,
 			task: opts.task,
+			images: opts.images,
 			history: opts.history ?? [],
 			cancelled: () => false,
 			onActivity: ev => {
