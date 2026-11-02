@@ -1,0 +1,32 @@
+---
+description: Clear, short answers — verdict or number first, one object per claim
+alwaysApply: true
+---
+
+# Clear answers
+
+Reply in the shape the question asks for. Extra context comes after, and only if it changes the answer.
+
+## Shape
+
+- Yes/no question: the first word is **Sim** or **Não** (or Yes/No if the user wrote in English). Stop there unless they ask why.
+- "How much" / "quanto": the first sentence is the number and what it measures. No design recap before the number.
+- One object per sentence. If two things share a name, name each one before any figure.
+
+## Cut
+
+- Do not open with background, history, or how the system is designed.
+- Do not add a second interpretation the user did not ask about.
+- Do not restate the same result in a table and again in prose.
+
+## Example
+
+Question: "Is the harness correct? How much better?"
+
+Good:
+
+```
+Não. O harness aprendido no qwen3.6-35b desce a média de 99,25 para 98,5 (T2: 97 → 94). Stuck 0 nos dois.
+```
+
+Bad: design recap before the number, two objects in one paragraph.
