@@ -2703,7 +2703,15 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 			}
 
 			if (!toolCalls.length) {
-				const trivial = isTrivialAssistantContent(content);
+				const lastHarnessNote = messages[messages.length - 1];
+				// A reply that only repeats the harness note just sent carries no answer.
+				const echoesHarnessNote =
+					lastHarnessNote?.role === 'user' &&
+					messages.length > 2 &&
+					typeof lastHarnessNote.content === 'string' &&
+					content.trim() !== '' &&
+					content.trim() === lastHarnessNote.content.trim();
+				const trivial = isTrivialAssistantContent(content) || echoesHarnessNote;
 				const hitLengthCap =
 					finishReason === 'length' ||
 					tokensOut >= 7500 ||
@@ -4317,7 +4325,9 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 			await flushLane();
 
 			const batchActions = actions.slice(actionsAtBatchStart);
+			// Only a status question ends on update_status; work turns still go through the finish gates.
 			if (
+				statusQuestion &&
 				batchTerminates(toolCalls.map(c => String(c.function?.name ?? ''))) &&
 				batchActions.length === toolCalls.length &&
 				batchActions.every(

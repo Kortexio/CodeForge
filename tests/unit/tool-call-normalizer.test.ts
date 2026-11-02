@@ -378,6 +378,26 @@ describe('toolCallNormalizer', () => {
 			expect(r.leakedArgs).toEqual(['old_string']);
 		});
 
+		it('cuts values that run past </function> into the next tool calls (T3 live run)', () => {
+			const tail =
+				'\n</new_string>\n</function>\n</tool_call>\n<tool_call>\n<function=search>\n<parameter=pattern>\nVIP.*10%';
+			const r = normalizeToolCall({
+				name: 'edit',
+				args: {
+					path: 'src/pricing/rules.js',
+					old_string: `const VIP_RATE = 0.1;\n</old_string>\n<parameter=new_string>\nconst VIP_RATE = 0.15;${tail}`,
+					new_string: `const VIP_RATE = 0.15;\n</new_string>\n</function>\n</tool_call>\n<tool_call>\n<function=edit>\n<parameter=path>\nsrc/pricing/rules.js`,
+					replace_all: false,
+				},
+				activeToolNames: CORE,
+				toolSchemas: SCHEMAS,
+			});
+			expect(r.error).toBeUndefined();
+			expect(r.args.old_string).toBe('const VIP_RATE = 0.1;');
+			expect(r.args.new_string).toBe('const VIP_RATE = 0.15;');
+			expect(r.notes.join(' ')).toMatch(/ran past <\/function>/);
+		});
+
 		it('accepts the unquoted <arg_key=new_string> form', () => {
 			const r = normalizeToolCall({
 				name: 'edit',

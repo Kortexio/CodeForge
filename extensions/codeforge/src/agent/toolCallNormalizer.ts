@@ -233,6 +233,18 @@ function splitLeakedParams(value: string, known: Set<string>): LeakSplit | undef
 	return { head, recovered };
 }
 
+/**
+ * A value that runs past its own close (`</new_string>\n</function>\n</tool_call>\n<tool_call>…`)
+ * carries the rest of this call and the next calls; the value ends at that close.
+ */
+function cutAtFunctionClose(value: string, known: Set<string>): string | undefined {
+	const re = /\r?\n?<\/([A-Za-z_][\w-]*)>[ \t]*\r?\n[ \t]*<\/function>/g;
+	for (const m of value.matchAll(re)) {
+		if (GRAMMAR_CLOSE_TAGS.has(m[1]) || known.has(m[1])) return value.slice(0, m.index);
+	}
+	return undefined;
+}
+
 function repairLeakedParams(
 	args: Record<string, unknown>,
 	schema: JsonSchemaLike | undefined,
@@ -240,13 +252,29 @@ function repairLeakedParams(
 ): { args: Record<string, unknown>; leaked: string[]; error?: string } {
 	const known = new Set(Object.keys(schema?.properties ?? {}));
 	if (!known.size) return { args, leaked: [] };
+	const cut: Record<string, unknown> = { ...args };
+	const cutKeys: string[] = [];
+	for (const [key, raw] of Object.entries(args)) {
+		if (typeof raw !== 'string' || !known.has(key)) continue;
+		const head = cutAtFunctionClose(raw, known);
+		if (head === undefined) continue;
+		cut[key] = head;
+		cutKeys.push(key);
+	}
+	if (cutKeys.length) {
+		notes.push(
+			`(argument ${cutKeys.join(', ')} ran past </function> into another tool call; ` +
+				'kept the value up to its close — send one call per tool_call)'
+		);
+		args = cut;
+	}
 	const out: Record<string, unknown> = { ...args };
-	const leaked: string[] = [];
+	const leaked: string[] = [...cutKeys];
 	for (const [key, raw] of Object.entries(args)) {
 		if (typeof raw !== 'string' || !known.has(key)) continue;
 		const split = splitLeakedParams(raw, known);
 		if (!split) continue;
-		leaked.push(key);
+		if (!leaked.includes(key)) leaked.push(key);
 		const names = split.recovered.map(r => r.key);
 		for (const r of split.recovered) {
 			if (r.key === key) {
