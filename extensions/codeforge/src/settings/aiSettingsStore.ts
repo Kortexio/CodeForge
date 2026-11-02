@@ -50,6 +50,12 @@ export interface AiServer {
 	/** Models available on this server (user-managed list). */
 	models: string[];
 	/**
+	 * Subset of `models` confirmed to accept image input, from "Refresh from API"
+	 * reading capability metadata (llama.cpp/llama-swap `capabilities: [...,"multimodal"]`).
+	 * Unset/empty → `visionRouting.visionModelsForServer` falls back to a name heuristic.
+	 */
+	visionModels?: string[];
+	/**
 	 * Context window for this server (tokens). UI label: "Context window".
 	 * Filled by Refresh from API when the server reports n_ctx / max_model_len.
 	 * Sent as options.num_ctx when supported; also drives client compact/caps.

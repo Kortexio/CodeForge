@@ -358,7 +358,7 @@ export class AiSettingsPanel {
 				const server = state.servers.find(s => s.id === serverId);
 				if (!server) return;
 				try {
-					const { models, contextWindow } = await fetchRemoteModels(server);
+					const { models, contextWindow, visionModels } = await fetchRemoteModels(server);
 					if (models.length) {
 						server.models = Array.from(new Set([...models, ...server.models]));
 						let ctxNote = '';
@@ -366,9 +366,16 @@ export class AiSettingsPanel {
 							server.numCtx = contextWindow;
 							ctxNote = ` Context window set to ${contextWindow.toLocaleString('en-US')}.`;
 						}
+						let visionNote = '';
+						if (visionModels?.length) {
+							server.visionModels = Array.from(
+								new Set([...visionModels, ...(server.visionModels ?? [])])
+							);
+							visionNote = ` ${visionModels.length} support image input.`;
+						}
 						await this.store.save(state);
 						void vscode.window.showInformationMessage(
-							`Loaded ${models.length} models from ${server.name}.${ctxNote}`
+							`Loaded ${models.length} models from ${server.name}.${ctxNote}${visionNote}`
 						);
 					} else {
 						void vscode.window.showWarningMessage('No models returned. Check base URL / API key.');
@@ -2072,7 +2079,7 @@ function sanitizeForWebview(state: AiSettingsState): AiSettingsState {
 
 async function fetchRemoteModels(
 	server: AiServer
-): Promise<{ models: string[]; contextWindow?: number }> {
+): Promise<{ models: string[]; contextWindow?: number; visionModels?: string[] }> {
 	const rawBase = (server.baseUrl || defaultBaseUrlFor(server.kind)).replace(/\/$/, '');
 	if (!rawBase) {
 		throw new Error('Base URL is empty');
@@ -2103,8 +2110,8 @@ async function fetchRemoteModels(
 				continue;
 			}
 			const data = (await res.json()) as {
-				data?: Array<{ id?: string }>;
-				models?: Array<{ name?: string; model?: string }>;
+				data?: Array<{ id?: string; capabilities?: string[] }>;
+				models?: Array<{ name?: string; model?: string; capabilities?: string[] }>;
 			};
 			let ids: string[] = [];
 			if (Array.isArray(data.data)) {
@@ -2125,7 +2132,8 @@ async function fetchRemoteModels(
 					? await fetchSlotsContextWindow(rawBase, server.apiKey, ids[0])
 					: undefined;
 			const contextWindow = fromList ?? fromSlots;
-			return { models: ids, contextWindow };
+			const visionModels = visionModelIdsFromModelsResponse(data);
+			return { models: ids, contextWindow, visionModels: visionModels.length ? visionModels : undefined };
 		} catch (err) {
 			errors.push(`${url} → ${err instanceof Error ? err.message : String(err)}`);
 		}
@@ -2134,6 +2142,28 @@ async function fetchRemoteModels(
 	throw new Error(
 		`No models endpoint found. Tried:\n${errors.join('\n')}\n\nTip: use a base URL like https://host/v1 (OpenAI-compatible) or http://localhost:11434 for Ollama.`
 	);
+}
+
+/**
+ * Model ids whose `capabilities` (llama.cpp/llama-swap `/v1/models` extension)
+ * lists "multimodal" or "vision". `data[]` entries key by `id`, `models[]`
+ * entries key by `name`/`model` — merge both since either side may carry it.
+ */
+function visionModelIdsFromModelsResponse(data: {
+	data?: Array<{ id?: string; capabilities?: string[] }>;
+	models?: Array<{ name?: string; model?: string; capabilities?: string[] }>;
+}): string[] {
+	const isVision = (caps: string[] | undefined): boolean =>
+		Array.isArray(caps) && caps.some(c => /^(multimodal|vision)$/i.test(c));
+	const ids = new Set<string>();
+	for (const m of data.data ?? []) {
+		if (m.id && isVision(m.capabilities)) ids.add(m.id);
+	}
+	for (const m of data.models ?? []) {
+		const id = m.name || m.model;
+		if (id && isVision(m.capabilities)) ids.add(id);
+	}
+	return Array.from(ids);
 }
 
 /** Fallback when /models has ids but no n_ctx — llama.cpp GET /slots. */

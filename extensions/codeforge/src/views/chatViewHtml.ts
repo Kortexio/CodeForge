@@ -943,6 +943,12 @@ export function getChatViewHtml(assets: ChatViewAssets): string {
         : (msg.configured ? 'pick model' : 'configure');
       modelChip.textContent = label;
       modelChip.title = (msg.serverName || '') + (msg.model ? ' · ' + msg.model : '');
+      var attachBtnEl = document.getElementById('attachBtn');
+      if (attachBtnEl) {
+        attachBtnEl.title = msg.canAttachImages
+          ? 'Attach files or images'
+          : 'Attach files (no vision model configured — images will be skipped)';
+      }
       attachmentCount = (msg.attachments || []).length;
       attachRow.innerHTML = (msg.attachments || []).map(function (a) {
         return '<span class="attach-chip"><span class="kind">' + escapeHtml(a.kind) + '</span> ' +

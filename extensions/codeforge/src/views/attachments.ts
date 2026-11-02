@@ -155,7 +155,10 @@ function attachmentKey(a: PendingAttachment): string {
 	return a.path || a.url || a.dataUrl?.slice(0, 64) || a.id;
 }
 
-export async function attachmentsFromUris(uris: vscode.Uri[]): Promise<PendingAttachment[]> {
+export async function attachmentsFromUris(
+	uris: vscode.Uri[],
+	canAttachImages = true
+): Promise<PendingAttachment[]> {
 	const out: PendingAttachment[] = [];
 	for (const uri of uris.slice(0, MAX_ATTACHMENTS)) {
 		try {
@@ -184,6 +187,12 @@ export async function attachmentsFromUris(uris: vscode.Uri[]): Promise<PendingAt
 			const rel = vscode.workspace.asRelativePath(uri);
 			const ext = path.extname(uri.fsPath).toLowerCase();
 			if (IMAGE_EXT.has(ext) || looksLikeImage(bytes)) {
+				if (!canAttachImages) {
+					void vscode.window.showWarningMessage(
+						`No image-capable model is configured — image not attached: ${rel}. Add a vision model (or refresh capabilities) in Settings.`
+					);
+					continue;
+				}
 				if (bytes.length > MAX_IMAGE_BYTES) {
 					void vscode.window.showWarningMessage(`Image too large to attach (>${MAX_IMAGE_BYTES / 1024 / 1024}MB): ${rel}`);
 					continue;
@@ -227,14 +236,23 @@ export async function attachmentsFromUris(uris: vscode.Uri[]): Promise<PendingAt
 	return out;
 }
 
-export function attachmentFromBlob(input: {
-	name: string;
-	mime?: string;
-	base64: string;
-}): PendingAttachment | undefined {
+export function attachmentFromBlob(
+	input: {
+		name: string;
+		mime?: string;
+		base64: string;
+	},
+	canAttachImages = true
+): PendingAttachment | undefined {
 	const mime = input.mime || 'application/octet-stream';
 	const buf = Buffer.from(input.base64, 'base64');
 	if (looksLikeImageMime(mime) || IMAGE_EXT.has(path.extname(input.name).toLowerCase())) {
+		if (!canAttachImages) {
+			void vscode.window.showWarningMessage(
+				`No image-capable model is configured — image not attached: ${input.name || 'image'}. Add a vision model (or refresh capabilities) in Settings.`
+			);
+			return undefined;
+		}
 		if (buf.length > MAX_IMAGE_BYTES) {
 			void vscode.window.showWarningMessage(`Image too large to attach: ${input.name}`);
 			return undefined;

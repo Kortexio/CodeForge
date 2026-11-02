@@ -21,6 +21,7 @@ import {
 } from '../agent/llamaSlots';
 import { runOrchestrated } from '../agent/orchestratorRun';
 import { runReviewPipeline } from '../agent/reviewPipeline';
+import { anyVisionModelAvailable, resolveVisionRoute } from '../agent/visionRouting';
 import { SessionStore, type MessageTimings } from '../sessions/sessionStore';
 import { getApprovalPolicy, PermissionLevel } from '../policy/approvalPolicy';
 import { ensureWorkspaceIndex, getIndexedCount } from '../intelligence/workspaceIndex';
@@ -943,6 +944,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		this.updateView();
 	}
 
+	/** No configured, enabled server has an image-capable model — images must not be attached. */
+	private canAttachImages(): boolean {
+		return anyVisionModelAvailable(this._store.getState());
+	}
+
 	private async pickAttachments(): Promise<void> {
 		const uris = await vscode.window.showOpenDialog({
 			canSelectMany: true,
@@ -951,7 +957,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			openLabel: 'Attach to Agent',
 		});
 		if (!uris?.length) return;
-		const next = await attachmentsFromUris(uris);
+		const next = await attachmentsFromUris(uris, this.canAttachImages());
 		this._pendingAttachments = mergeAttachments(this._pendingAttachments, next);
 		this.pushConfig();
 	}
@@ -959,7 +965,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 	private async attachFromUriList(uriList: string): Promise<void> {
 		const uris = parseDroppedUriList(uriList);
 		if (!uris.length) return;
-		const next = await attachmentsFromUris(uris);
+		const next = await attachmentsFromUris(uris, this.canAttachImages());
 		this._pendingAttachments = mergeAttachments(this._pendingAttachments, next);
 		this.pushConfig();
 	}
@@ -967,9 +973,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 	private attachFromBlobs(
 		blobs: Array<{ name: string; mime?: string; base64: string }>
 	): Promise<void> {
+		const canImages = this.canAttachImages();
 		const next: PendingAttachment[] = [];
 		for (const blob of blobs.slice(0, 8)) {
-			const att = attachmentFromBlob(blob);
+			const att = attachmentFromBlob(blob, canImages);
 			if (att) next.push(att);
 		}
 		if (!next.length) return Promise.resolve();
@@ -1123,6 +1130,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			hasAgentsMd: this._hasAgentsMd,
 			weakHarness: this._weakHarness,
 			slashCommands: SLASH_COMMANDS,
+			canAttachImages: this.canAttachImages(),
 			attachments: this._pendingAttachments.map(a => ({
 				id: a.id,
 				label: a.label,
@@ -1331,7 +1339,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		images: Array<{ mime: string; dataUrl: string; label?: string }> = []
 	): Promise<string> {
 		const root = this._bridge.getWorkspaceRoot();
-		const { server, model } = this._store.getActiveSelection();
+		let { server, model } = this._store.getActiveSelection();
 
 		if (!server) {
 			return [
@@ -1341,6 +1349,27 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 				`Add a server in Settings (⚙) or Command Palette → CodeForge AI: Settings.`,
 				`Then pick a model with the chip above.`,
 			].join('\n');
+		}
+
+		// A turn with image attachments must run against an image-capable model.
+		// Resolve that automatically — same server if it already has one, otherwise
+		// the first other configured, enabled server that does — before anything
+		// below picks provider/apiKey/baseUrl/model for this call.
+		if (images.length > 0) {
+			const state = this._store.getState();
+			const route = resolveVisionRoute(state, server.id, model);
+			if (route && !route.sameAsActive) {
+				const routed = state.servers.find(s => s.id === route.serverId);
+				if (routed) {
+					this.setPendingLiveStatus(
+						routed.id === server.id
+							? `Using ${route.model} for the attached image…`
+							: `Routing attached image to ${routed.name} (${route.model})…`
+					);
+					server = routed;
+					model = route.model;
+				}
+			}
 		}
 
 		const provider = server.kind;
