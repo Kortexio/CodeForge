@@ -2,10 +2,42 @@
  * Structural mutation gates. Path and file-diff only — not user-text intent.
  *
  * - During the spec edge-case check, no test-dir changes and no new workspace files.
+ * - A test file that was on disk when the turn started is the spec: not edited, rewritten or deleted.
  * - An edit/write of a test file that already existed must keep every assertion line.
  */
 
+import * as fs from 'fs';
+import * as path from 'path';
+
 const MUTATING = new Set(['write', 'edit', 'delete', 'rename', 'apply_patch']);
+
+/** True when `rel` is on disk under `root` and was last modified before `turnStartMs`. */
+export function existedBeforeTurn(root: string | undefined, rel: string, turnStartMs: number): boolean {
+	if (!root || !rel) return false;
+	try {
+		return fs.statSync(path.resolve(root, rel)).mtimeMs < turnStartMs;
+	} catch {
+		return false;
+	}
+}
+
+export function existingTestMutationRefusal(input: {
+	/** codeforge.ai.protectExistingTests (default true). */
+	enabled: boolean;
+	tool: string;
+	path: string;
+	isTestPath: boolean;
+	/** The file was on disk before this turn started (not created by this turn). */
+	existedAtTurnStart: boolean;
+}): string | undefined {
+	if (!input.enabled || !MUTATING.has(input.tool)) return undefined;
+	if (!input.isTestPath || !input.existedAtTurnStart) return undefined;
+	return [
+		`Not applied: ${input.path} is a test file that existed before this turn. Existing tests are the spec and stay unchanged.`,
+		'Make the change in the source files so these tests pass.',
+		'Add a new test file only when the user asked for tests.',
+	].join(' ');
+}
 
 export function specCheckMutationRefusal(input: {
 	/** True after the one-shot spec edge-case note was sent. */

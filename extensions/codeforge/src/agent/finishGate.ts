@@ -62,6 +62,11 @@ export type DiagFinishGateInput = {
 	diagFinishNudges: number;
 	/** Max refuses before accepting prose finish. */
 	maxDiagFinishNudges?: number;
+	/**
+	 * Implementation sub-run (orchestrator item): a reply with no tool at all is not a finish
+	 * either — there is no question to answer, only work to do.
+	 */
+	requireEffect?: boolean;
 };
 
 /**
@@ -72,7 +77,7 @@ export function shouldRefuseDiagFinish(input: DiagFinishGateInput): boolean {
 	if (input.planMode || input.askMode || input.coachMode || input.statusQuestion) return false;
 	if (input.blocked) return false;
 	if (input.effectfulCount > 0) return false;
-	if (input.anyToolCount < 1) return false;
+	if (input.anyToolCount < 1 && !input.requireEffect) return false;
 	const max = input.maxDiagFinishNudges ?? 2;
 	if (input.diagFinishNudges >= max) return false;
 	return true;

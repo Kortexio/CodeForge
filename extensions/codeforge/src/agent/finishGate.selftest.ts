@@ -49,6 +49,19 @@ assert(
 );
 
 assert(
+	!shouldRefuseDiagFinish({ effectfulCount: 0, anyToolCount: 0, diagFinishNudges: 0 }),
+	'no tools at all is a plain answer in chat'
+);
+assert(
+	shouldRefuseDiagFinish({ effectfulCount: 0, anyToolCount: 0, diagFinishNudges: 0, requireEffect: true }),
+	'implementation sub-run: a prose plan with no tool is refused (CS6 C05)'
+);
+assert(
+	!shouldRefuseDiagFinish({ effectfulCount: 1, anyToolCount: 1, diagFinishNudges: 0, requireEffect: true }),
+	'implementation sub-run with an edit may finish'
+);
+
+assert(
 	!shouldRefuseDiagFinish({
 		effectfulCount: 1,
 		anyToolCount: 5,

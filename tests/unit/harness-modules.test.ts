@@ -13,6 +13,9 @@ import { applyEdit, excerptAround } from '../../extensions/codeforge/src/agent/e
 import {
 	detectOracle,
 	formatOracleResult,
+	hasDotnetProjects,
+	missingRootBuildFile,
+	missingRootBuildFileNote,
 	parseDotnetErrors,
 	parseFailedTests,
 	runOracle,
@@ -297,6 +300,29 @@ describe('oracle', () => {
 		);
 		expect(cfg).toEqual({ source: 'npm', commands: ['npm run build --silent'] });
 		expect(detectOracle('/ws', memFs({ 'README.md': '' }))).toBeUndefined();
+	});
+
+	it('flags projects whose only solution is nested below the root (CS4 live run)', () => {
+		const fsx = memFs({
+			'Acme.Router/Acme.Router.slnx': '<Solution/>',
+			'src/Acme.Router.Domain/Acme.Router.Domain.csproj': '<Project/>',
+			'tests/Acme.Router.ArchitectureTests/Acme.Router.ArchitectureTests.csproj': '<Project/>',
+			'docs/C01.md': '# C01',
+		});
+		expect(hasDotnetProjects('/ws', fsx)).toBe(true);
+		expect(missingRootBuildFile('/ws', fsx)).toEqual({ nestedSolutions: ['Acme.Router/Acme.Router.slnx'] });
+		const note = missingRootBuildFileNote(['Acme.Router/Acme.Router.slnx']);
+		expect(note).toContain('MSB1003');
+		expect(note).toContain('Acme.Router/Acme.Router.slnx');
+	});
+
+	it('accepts a root solution or a root project, and an empty workspace', () => {
+		expect(
+			missingRootBuildFile('/ws', memFs({ 'Acme.slnx': '', 'src/A/A.csproj': '<Project/>' }))
+		).toBeUndefined();
+		expect(missingRootBuildFile('/ws', memFs({ 'App.csproj': '<Project/>' }))).toBeUndefined();
+		expect(missingRootBuildFile('/ws', memFs({ 'docs/C01.md': '# C01' }))).toBeUndefined();
+		expect(hasDotnetProjects('/ws', memFs({ 'docs/C01.md': '# C01' }))).toBe(false);
 	});
 
 	it('parses dotnet errors and failed tests', () => {

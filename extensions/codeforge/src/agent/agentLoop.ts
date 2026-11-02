@@ -148,6 +148,8 @@ import {
 import {
 	applyEditPreview,
 	assertionEditRefusal,
+	existedBeforeTurn,
+	existingTestMutationRefusal,
 	missingAssertions,
 	specCheckMutationRefusal,
 } from './mutationGuard';
@@ -182,7 +184,17 @@ import {
 	decideEditReadGate,
 	decideWriteReadGate,
 } from './readGate';
-import { detectOracle, exitCodeOf, formatOracleResult, nodeOracleFs, runOracle, type OracleResult } from './oracle';
+import {
+	detectOracle,
+	exitCodeOf,
+	formatOracleResult,
+	hasDotnetProjects,
+	missingRootBuildFile,
+	missingRootBuildFileNote,
+	nodeOracleFs,
+	runOracle,
+	type OracleResult,
+} from './oracle';
 import {
 	ASK_ALLOWED_TOOLS,
 	buildDotnetCommand,
@@ -1419,6 +1431,8 @@ export interface AgentLoopOptions {
 	isolated?: boolean;
 	/** Phase decided by the caller (orchestrator items) instead of inferred from the task text. */
 	basePhase?: AgentPhase;
+	/** Filled by the loop: successful effectful tools (edit/write/shell/…) in this run. */
+	runStats?: { effectful: number };
 	/** Extension agent mode. When omitted, the registry's active mode is used. */
 	agentModeId?: string;
 }
@@ -1750,6 +1764,11 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 	let specCheckActive = false;
 	/** Paths created by write this run — assertion gate applies only to tests that pre-existed. */
 	const createdThisRun = new Set<string>();
+	const turnStartMs = Date.now();
+	const protectExistingTests =
+		vscode.workspace.getConfiguration('codeforge.ai').get<boolean>('protectExistingTests') !== false;
+	/** Test paths already classified as pre-existing (true) or new this turn (false). */
+	const testExistedAtStart = new Map<string, boolean>();
 	/** Disk body + step for identical-read markers: (unchanged since step N). */
 	const readWindowBodies = new Map<string, { body: string; step: number }>();
 	const emitProtocol = (label: string, detail?: string) => {
@@ -1821,6 +1840,9 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 	let gateFinishRejections = 0;
 	const MAX_GATE_FINISH_REJECTIONS = 2;
 	let oracleCfg = opts.planMode || opts.askMode ? undefined : detectOracle(opts.workspaceRoot, nodeOracleFs);
+	const dotnetProjectsAtStart = hasDotnetProjects(opts.workspaceRoot, nodeOracleFs);
+	let rootBuildFileNudges = 0;
+	const MAX_ROOT_BUILD_FILE_NUDGES = 2;
 	let lastProgressMarker = '';
 	const progressMarker = () =>
 		`${successfulWriteCount}|${uiChangeCount}|${gates.buildRed ? 'red' : 'ok'}|${gates.lastBuildErrors.length}`;
@@ -2797,6 +2819,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 							anyToolCount,
 							diagFinishNudges,
 							maxDiagFinishNudges: modelProfile.finish.maxDiagFinishNudges,
+							requireEffect: opts.basePhase === 'implement',
 						}),
 					}) === 'continue' &&
 					step + 1 < stepBudget
@@ -2814,6 +2837,32 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					continue;
 				}
 				const changedFiles = successfulWriteCount > 0;
+				const effectThisTurn = changedFiles || effectfulCount > 0;
+				const rootGap =
+					!blocked &&
+					effectThisTurn &&
+					!dotnetProjectsAtStart &&
+					!opts.planMode &&
+					!opts.askMode &&
+					!opts.coachMode &&
+					rootBuildFileNudges < MAX_ROOT_BUILD_FILE_NUDGES &&
+					step + 1 < stepBudget
+						? missingRootBuildFile(opts.workspaceRoot, nodeOracleFs)
+						: undefined;
+				if (rootGap) {
+					rootBuildFileNudges += 1;
+					const note = missingRootBuildFileNote(rootGap.nestedSolutions);
+					trace?.info('harness', String(note.length));
+					messages.push({ role: 'assistant', content: summary });
+					messages.push({ role: 'user', content: note });
+					opts.onActivity?.({
+						kind: 'checkpoint',
+						label: 'Finish refused — no solution in the workspace root',
+						detail: rootGap.nestedSolutions.join(', ') || 'no solution file',
+					});
+					opts.onStatus?.('Continue: put the solution in the workspace root…');
+					continue;
+				}
 				let doneNote = '';
 				let loggedExperimentRound = false;
 				if (!oracleCfg && changedFiles && !opts.planMode && !opts.askMode && !opts.coachMode) {
@@ -3239,6 +3288,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 									: undefined;
 						if (isEffectfulTool(name, cmdForRuntime, effectfulTools)) {
 							effectfulCount += 1;
+							if (opts.runStats) opts.runStats.effectful += 1;
 						}
 						if (
 							countsAsRuntimeObserve(
@@ -3792,6 +3842,25 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					});
 					if (specRefusal) {
 						await refuse(specRefusal, 'spec check');
+						continue;
+					}
+					const isTestPath = isTestFilePath(`/${mutatePath}`);
+					if (isTestPath && !testExistedAtStart.has(mutateKey)) {
+						testExistedAtStart.set(
+							mutateKey,
+							!createdThisRun.has(mutateKey) &&
+								existedBeforeTurn(opts.workspaceRoot, mutatePath, turnStartMs)
+						);
+					}
+					const testRefusal = existingTestMutationRefusal({
+						enabled: protectExistingTests,
+						tool: name,
+						path: mutatePath,
+						isTestPath,
+						existedAtTurnStart: testExistedAtStart.get(mutateKey) === true,
+					});
+					if (testRefusal) {
+						await refuse(testRefusal, 'existing test');
 						continue;
 					}
 					if (

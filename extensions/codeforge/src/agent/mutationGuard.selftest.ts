@@ -1,9 +1,14 @@
 /**
  * Spec-check mutation gate and existing-test assertion gate.
  */
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 import {
 	applyEditPreview,
 	assertionEditRefusal,
+	existedBeforeTurn,
+	existingTestMutationRefusal,
 	missingAssertions,
 	specCheckMutationRefusal,
 } from './mutationGuard';
@@ -63,5 +68,47 @@ assert(missingAssertions(before, added).length === 0, 'adding an assertion is al
 const preview = applyEditPreview(before, 'Assert.Equal(30m, Totals.Subtotal(cart));', 'Assert.Equal(20m, Totals.Subtotal(cart));', false);
 assert(preview !== undefined && missingAssertions(before, preview).length === 1, 'preview feeds the gate');
 assert(applyEditPreview(before, 'not in file', 'x', false) === undefined, 'missing old_string is left to the edit tool');
+
+const cs2Append = {
+	enabled: true,
+	tool: 'edit',
+	path: 'tests/Acme.Billing.Tests/CartTests.cs',
+	isTestPath: true,
+	existedAtTurnStart: true,
+};
+assert(
+	/existed before this turn/.test(existingTestMutationRefusal(cs2Append) ?? ''),
+	'appending tests to a pre-existing test file is refused (CS2 live run)'
+);
+assert(
+	existingTestMutationRefusal({ ...cs2Append, tool: 'delete' }) !== undefined,
+	'deleting a pre-existing test file is refused'
+);
+assert(
+	existingTestMutationRefusal({ ...cs2Append, existedAtTurnStart: false }) === undefined,
+	'a test file created this turn may be edited'
+);
+assert(
+	existingTestMutationRefusal({ ...cs2Append, isTestPath: false, path: 'src/Acme.Billing/Coupons.cs' }) === undefined,
+	'source files are not affected'
+);
+assert(existingTestMutationRefusal({ ...cs2Append, enabled: false }) === undefined, 'setting off: allowed');
+assert(existingTestMutationRefusal({ ...cs2Append, tool: 'read' }) === undefined, 'reads are not mutations');
+
+const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cf-mutation-guard-'));
+try {
+	fs.mkdirSync(path.join(tmpRoot, 'tests'), { recursive: true });
+	fs.writeFileSync(path.join(tmpRoot, 'tests', 'Old.cs'), '// old');
+	const past = new Date(Date.now() - 60_000);
+	fs.utimesSync(path.join(tmpRoot, 'tests', 'Old.cs'), past, past);
+	const turnStart = Date.now();
+	fs.writeFileSync(path.join(tmpRoot, 'tests', 'New.cs'), '// new');
+	fs.utimesSync(path.join(tmpRoot, 'tests', 'New.cs'), new Date(turnStart + 1000), new Date(turnStart + 1000));
+	assert(existedBeforeTurn(tmpRoot, 'tests/Old.cs', turnStart), 'file modified before the turn existed');
+	assert(!existedBeforeTurn(tmpRoot, 'tests/New.cs', turnStart), 'file written during the turn is new');
+	assert(!existedBeforeTurn(tmpRoot, 'tests/Missing.cs', turnStart), 'missing file did not exist');
+} finally {
+	fs.rmSync(tmpRoot, { recursive: true, force: true });
+}
 
 console.log('mutationGuard.selftest: ok');

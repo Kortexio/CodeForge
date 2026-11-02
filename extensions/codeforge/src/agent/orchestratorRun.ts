@@ -12,6 +12,7 @@ import {
 	formatPlanReport,
 	itemPrompt,
 	loadPlan,
+	NO_EFFECT_ITEM_ERROR,
 	orderCards,
 	parsePlanJson,
 	planFromCards,
@@ -160,8 +161,10 @@ export async function runOrchestrated(
 				kind: 'thinking',
 				label: `Working on ${item.title} (${progress})${retry}…`,
 			});
+			const runStats = { effectful: 0 };
 			const reply = await runAgentWithTools({
 				...opts,
+				runStats,
 				task: itemPrompt(p, item, {
 					cardContent: card,
 					conventionsPath: conventions,
@@ -176,6 +179,9 @@ export async function runOrchestrated(
 			});
 			const blocked = parseBlockedClaim(reply);
 			if (blocked) return { ok: false, reply, blocked };
+			if (runStats.effectful === 0) {
+				return { ok: false, reply, error: NO_EFFECT_ITEM_ERROR };
+			}
 			const check = await verify();
 			if (check.ok) {
 				opts.onStatus?.(`Finished ${item.title} (${progress})…`);

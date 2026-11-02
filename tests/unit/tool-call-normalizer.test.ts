@@ -362,6 +362,37 @@ describe('toolCallNormalizer', () => {
 			expect(r.args.new_string).toBe(VIP_NEW);
 		});
 
+		it('splits </arg_key><arg_key="new_string"> into separate args (CS3 live run)', () => {
+			const r = normalizeToolCall({
+				name: 'edit',
+				args: {
+					path: 'src/Acme.Billing/PricingRules.cs',
+					old_string: `${VIP_OLD}\n</arg_key>\n<arg_key="new_string">\n${VIP_NEW}\n</arg_value>`,
+				},
+				activeToolNames: CORE,
+				toolSchemas: SCHEMAS,
+			});
+			expect(r.error).toBeUndefined();
+			expect(r.args.old_string).toBe(VIP_OLD);
+			expect(r.args.new_string).toBe(VIP_NEW);
+			expect(r.leakedArgs).toEqual(['old_string']);
+		});
+
+		it('accepts the unquoted <arg_key=new_string> form', () => {
+			const r = normalizeToolCall({
+				name: 'edit',
+				args: {
+					path: 'a.cs',
+					old_string: `${VIP_OLD}\n</arg_key>\n<arg_key=new_string>\n${VIP_NEW}`,
+				},
+				activeToolNames: CORE,
+				toolSchemas: SCHEMAS,
+			});
+			expect(r.error).toBeUndefined();
+			expect(r.args.old_string).toBe(VIP_OLD);
+			expect(r.args.new_string).toBe(VIP_NEW);
+		});
+
 		it('leaves file content alone when the names are not parameters of the tool', () => {
 			const html = '<div>\n</div>\n<parameter=color>\nred\n</parameter>';
 			const r = normalizeToolCall({

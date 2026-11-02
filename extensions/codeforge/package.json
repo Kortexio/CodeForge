@@ -346,6 +346,11 @@
           "default": false,
           "description": "Show DiffPreview before writing existing files (off by default)"
         },
+        "codeforge.ai.protectExistingTests": {
+          "type": "boolean",
+          "default": true,
+          "description": "The agent does not edit, rewrite or delete test files that existed before the turn started (new test files are still allowed). Turn off when you want the agent to change existing tests."
+        },
         "codeforge.ai.shellSandbox": {
           "type": "string",
           "enum": [

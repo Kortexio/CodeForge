@@ -40,6 +40,8 @@ export type RunLoopOptions = {
 	config?: Record<string, unknown>;
 	/** Optional LSP diagnostics map (path → diags) for __setDiagnostics. */
 	diagnostics?: Map<string, unknown> | Record<string, unknown>;
+	/** Same entry as chat/headless: runOrchestrated first, single loop when it declines. */
+	orchestrated?: boolean;
 };
 
 export type RunLoopResult = {
@@ -191,7 +193,10 @@ export async function runLoop(opts: RunLoopOptions): Promise<RunLoopResult> {
 		);
 		bridge.setFallbackWorkspaceRoot(workspaceRoot);
 
-		const reply = await runAgentWithTools({
+		const { runOrchestrated } = await import(
+			'../../../../extensions/codeforge/src/agent/orchestratorRun'
+		);
+		const agentOpts: Parameters<typeof runAgentWithTools>[0] = {
 			bridge,
 			provider: opts.provider ?? 'openai',
 			apiKey: opts.apiKey ?? 'test-key',
@@ -220,7 +225,11 @@ export async function runLoop(opts: RunLoopOptions): Promise<RunLoopResult> {
 			askMode: opts.askMode,
 			isolated: opts.isolated ?? true,
 			sessionId: opts.sessionId ?? null,
-		});
+		};
+		const orchestrated = opts.orchestrated
+			? await runOrchestrated(agentOpts, { forced: false })
+			: undefined;
+		const reply = orchestrated ?? (await runAgentWithTools(agentOpts));
 
 		const files = await readTree(workspaceRoot);
 		return {

@@ -270,6 +270,10 @@ export function itemPrompt(
 	return parts.join('\n');
 }
 
+/** Item sub-run that ended without any successful edit/write/shell: the item is not done. */
+export const NO_EFFECT_ITEM_ERROR =
+	'The previous attempt replied without changing any file or running any command, so this item is not implemented yet. Implement it with tools (edit/write), then run the build/test.';
+
 export interface ItemOutcome {
 	ok: boolean;
 	reply: string;

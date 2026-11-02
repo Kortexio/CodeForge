@@ -195,8 +195,11 @@ function coerceArgsBySchema(
  * Qwen XML tool format (`<parameter=k>\nv\n</parameter>`): when the model closes a value with
  * `</k>` instead of `</parameter>`, the server keeps reading and the next parameters end up
  * inside this value. Marker = close tag + `<parameter=name>` with both names known to the schema.
+ * Same leak with the GLM-style key tag: `</arg_key>` + `<arg_key="name">`.
  */
-const LEAKED_PARAM_MARKER = /\n?<\/([A-Za-z_][\w-]*)>[ \t]*\r?\n?[ \t]*<parameter=([A-Za-z_][\w-]*)>\r?\n?/;
+const LEAKED_PARAM_MARKER =
+	/\n?<\/([A-Za-z_][\w-]*)>[ \t]*\r?\n?[ \t]*<(?:parameter|arg_key)=["']?([A-Za-z_][\w-]*)["']?>\r?\n?/;
+const GRAMMAR_CLOSE_TAGS = new Set(['parameter', 'arg_key', 'arg_value']);
 
 function stripWrapNewlines(value: string): string {
 	return value.replace(/^\r?\n/, '').replace(/\r?\n$/, '');
@@ -207,7 +210,7 @@ type LeakSplit = { head: string; recovered: Array<{ key: string; value: string }
 function splitLeakedParams(value: string, known: Set<string>): LeakSplit | undefined {
 	const first = LEAKED_PARAM_MARKER.exec(value);
 	if (!first) return undefined;
-	const isKnownClose = (tag: string) => tag === 'parameter' || known.has(tag);
+	const isKnownClose = (tag: string) => GRAMMAR_CLOSE_TAGS.has(tag) || known.has(tag);
 	if (!isKnownClose(first[1]) || !known.has(first[2])) return undefined;
 
 	const head = value.slice(0, first.index);

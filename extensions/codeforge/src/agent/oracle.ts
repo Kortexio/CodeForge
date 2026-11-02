@@ -84,6 +84,48 @@ function findProjects(root: string, fsx: OracleFs, depth = 3): string[] {
 	return out.sort();
 }
 
+export function hasDotnetProjects(root: string | undefined, fsx: OracleFs): boolean {
+	return !!root && findProjects(root, fsx).length > 0;
+}
+
+/**
+ * Projects exist below the root, but the root has no .sln/.slnx/.csproj, so a bare
+ * `dotnet test` from the root fails with MSB1003. Returns the nested solutions found (may be empty).
+ */
+export function missingRootBuildFile(
+	root: string | undefined,
+	fsx: OracleFs
+): { nestedSolutions: string[] } | undefined {
+	if (!root) return undefined;
+	const isBuildFile = (n: string) => /\.(slnx|sln|csproj)$/i.test(n);
+	if (fsx.list(root).some(isBuildFile)) return undefined;
+	if (!findProjects(root, fsx).length) return undefined;
+	const nestedSolutions: string[] = [];
+	const walk = (rel: string, d: number) => {
+		const abs = rel ? path.join(root, rel) : root;
+		for (const name of fsx.list(abs)) {
+			if (SKIP_DIRS.has(name)) continue;
+			const childRel = rel ? `${rel}/${name}` : name;
+			if (/\.(slnx|sln)$/i.test(name)) nestedSolutions.push(childRel);
+			else if (d > 0 && fsx.isDir(path.join(abs, name))) walk(childRel, d - 1);
+		}
+	};
+	walk('', 2);
+	return { nestedSolutions: nestedSolutions.filter(s => s.includes('/')).sort() };
+}
+
+export function missingRootBuildFileNote(nestedSolutions: string[]): string {
+	const nested = nestedSolutions.length
+		? ` The solution was created at ${nestedSolutions.join(', ')}; move it to the workspace root (or create a new one there) and delete the nested copy.`
+		: '';
+	return [
+		'Not finished: the .NET projects created in this turn have no solution or project file in the workspace root,',
+		'so `dotnet test` run from the workspace root fails with MSB1003 (specify a project or solution file).' + nested,
+		'Create the solution with the workspace root as the working directory (`dotnet new sln -n <Name>`),',
+		'add every project to it with `dotnet sln add`, then run `dotnet test` from the workspace root with no arguments.',
+	].join(' ');
+}
+
 function isTestProject(rel: string, fsx: OracleFs, root: string): boolean {
 	if (/tests?\b|\.tests?\.csproj$/i.test(rel)) return true;
 	const text = fsx.readText(path.join(root, rel)) ?? '';
