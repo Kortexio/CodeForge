@@ -181,28 +181,96 @@ export class AiSettingsStore {
 
 	private secretsReady = false;
 	private secretOverlay: AiSettingsState | undefined;
+	/** Disk and secret writes in this window must not notify twice. */
+	private ignoreDiskEvents = false;
+	private lastNotified = '';
+	private externalReload: Promise<void> | undefined;
+	private reloadPending = false;
 
 	constructor(private readonly context: vscode.ExtensionContext) {
 		bindStore(this);
+		this.watchSharedSettings();
+	}
+
+	/**
+	 * Another window writes ~/.CodeForge/ai/settings.json and SecretStorage
+	 * without firing this window's `onDidChange`. Watch both and republish
+	 * only when the merged state actually differs.
+	 */
+	private watchSharedSettings(): void {
+		const file = aiSettingsFile();
+		const pattern = new vscode.RelativePattern(vscode.Uri.file(path.dirname(file)), path.basename(file));
+		const watcher = vscode.workspace.createFileSystemWatcher(pattern);
+		const reload = () => this.queueExternalReload();
+		this.context.subscriptions.push(
+			watcher,
+			watcher.onDidChange(reload),
+			watcher.onDidCreate(reload),
+			watcher.onDidDelete(reload),
+			this.context.secrets.onDidChange(reload)
+		);
+	}
+
+	private queueExternalReload(): void {
+		if (this.ignoreDiskEvents || this.activeProfileOverlay) return;
+		if (this.externalReload) {
+			this.reloadPending = true;
+			return;
+		}
+		this.externalReload = this.drainExternalReloads().finally(() => {
+			this.externalReload = undefined;
+		});
+	}
+
+	private async drainExternalReloads(): Promise<void> {
+		do {
+			this.reloadPending = false;
+			await this.reloadFromExternal();
+		} while (this.reloadPending && !this.ignoreDiskEvents && !this.activeProfileOverlay);
+	}
+
+	private async reloadFromExternal(): Promise<void> {
+		const raw = this.readDiskSync() ?? this.readRawState();
+		if (this.secretsReady) {
+			const servers = await loadServerSecrets(this.context, raw.servers ?? []);
+			const mcpServers = await loadMcpSecrets(this.context, raw.mcpServers ?? []);
+			this.secretOverlay = { ...raw, servers, mcpServers };
+		}
+		if (this.ignoreDiskEvents || this.activeProfileOverlay) return;
+		const state = this.getState();
+		const fingerprint = JSON.stringify(state);
+		if (fingerprint === this.lastNotified) return;
+		this.lastNotified = fingerprint;
+		this._onDidChange.fire(state);
+	}
+
+	private emitChange(state: AiSettingsState): void {
+		this.lastNotified = JSON.stringify(state);
+		this._onDidChange.fire(state);
 	}
 
 	/** Load API keys / MCP secrets from SecretStorage (call once during activation). */
 	async bootstrapSecrets(): Promise<void> {
 		if (this.secretsReady) return;
-		const raw = this.readRawState();
-		await migrateLegacySecretsToStorage(this.context, raw);
-		const withServers = await loadServerSecrets(this.context, raw.servers);
-		const withMcp = await loadMcpSecrets(this.context, raw.mcpServers);
-		const merged: AiSettingsState = {
-			...raw,
-			servers: withServers,
-			mcpServers: withMcp,
-		};
-		this.secretOverlay = merged;
-		await this.context.globalState.update(STATE_KEY, this.stripSecretsForPersistence(merged));
-		await this.writeDisk(this.stripSecretsForPersistence(merged));
-		this.secretsReady = true;
-		this._onDidChange.fire(this.getState());
+		this.ignoreDiskEvents = true;
+		try {
+			const raw = this.readRawState();
+			await migrateLegacySecretsToStorage(this.context, raw);
+			const withServers = await loadServerSecrets(this.context, raw.servers);
+			const withMcp = await loadMcpSecrets(this.context, raw.mcpServers);
+			const merged: AiSettingsState = {
+				...raw,
+				servers: withServers,
+				mcpServers: withMcp,
+			};
+			this.secretOverlay = merged;
+			await this.context.globalState.update(STATE_KEY, this.stripSecretsForPersistence(merged));
+			await this.writeDisk(this.stripSecretsForPersistence(merged));
+			this.secretsReady = true;
+			this.emitChange(this.getState());
+		} finally {
+			this.ignoreDiskEvents = false;
+		}
 	}
 
 	private readRawState(): AiSettingsState {
@@ -257,7 +325,7 @@ export class AiSettingsStore {
 		this.activeProfileOverlay = profile
 			? { ...profile, state: structuredClone(profile.state) }
 			: undefined;
-		this._onDidChange.fire(this.getState());
+		this.emitChange(this.getState());
 	}
 
 	/** @deprecated use applyProfile */
@@ -312,8 +380,10 @@ export class AiSettingsStore {
 	}
 
 	/**
-	 * One-shot: merge install (CodeForge) + vscode:dev profiles into ~/.CodeForge/ai/settings.json
-	 * so both share the same server catalog. Never deletes user servers.
+	 * Import install + vscode:dev catalogs into ~/.CodeForge/ai/settings.json only
+	 * when that file does not exist yet. Once it exists, it is the catalog:
+	 * a removed server or a cleared URL/model list must not come back from an
+	 * older profile database on the next launch.
 	 */
 	async unifyProfiles(log?: (line: string) => void): Promise<AiSettingsState> {
 		if (this.unifiedOnce) {
@@ -321,17 +391,17 @@ export class AiSettingsStore {
 		}
 		this.unifiedOnce = true;
 
-		const current = this.getState();
-		const fromProfiles = await readSettingsFromProfileDbs(log);
-		let merged = current;
-		for (const other of fromProfiles) {
-			merged = mergeSettingsStates(merged, other);
-		}
 		const disk = this.readDiskSync();
-		if (disk) {
-			merged = mergeSettingsStates(merged, disk);
+		if (!shouldImportProfileCatalogs(disk)) {
+			log?.(
+				`AI settings kept from ${aiSettingsFile()} (${disk?.servers.length ?? 0} server(s)); profile catalogs are not merged back`
+			);
+			return this.getState();
 		}
 
+		const current = this.getState();
+		const fromProfiles = await readSettingsFromProfileDbs(log);
+		const merged = resolveSharedCatalog(undefined, [current, ...fromProfiles]);
 		await this.save(merged);
 		log?.(
 			`AI settings unified: ${merged.servers.length} server(s), active=${merged.activeModel ?? '(none)'} → ${aiSettingsFile()}`
@@ -340,29 +410,34 @@ export class AiSettingsStore {
 	}
 
 	async save(state: AiSettingsState): Promise<void> {
-		for (const s of state.servers) {
-			await persistServerSecret(this.context, s.id, s.apiKey);
+		this.ignoreDiskEvents = true;
+		try {
+			for (const s of state.servers) {
+				await persistServerSecret(this.context, s.id, s.apiKey);
+			}
+			for (const m of state.mcpServers) {
+				await persistMcpSecrets(this.context, m);
+			}
+			const persisted = this.stripSecretsForPersistence(state);
+			if (this.activeProfileOverlay?.onSave) {
+				this.activeProfileOverlay.state = state;
+				await this.activeProfileOverlay.onSave(persisted);
+				this.emitChange(this.getState());
+				return;
+			}
+			// Overlay without onSave must not trap getState() on a stale in-memory copy
+			// (e.g. a tenant MCP push that only set mcpServers). Persist globally.
+			if (this.activeProfileOverlay) {
+				this.activeProfileOverlay = undefined;
+			}
+			this.secretOverlay = state;
+			await this.context.globalState.update(STATE_KEY, persisted);
+			await this.writeDisk(persisted);
+			await this.syncActiveToWorkspaceSettings(state);
+			this.emitChange(this.getState());
+		} finally {
+			this.ignoreDiskEvents = false;
 		}
-		for (const m of state.mcpServers) {
-			await persistMcpSecrets(this.context, m);
-		}
-		const persisted = this.stripSecretsForPersistence(state);
-		if (this.activeProfileOverlay?.onSave) {
-			this.activeProfileOverlay.state = state;
-			await this.activeProfileOverlay.onSave(persisted);
-			this._onDidChange.fire(state);
-			return;
-		}
-		// Overlay without onSave must not trap getState() on a stale in-memory copy
-		// (e.g. a tenant MCP push that only set mcpServers). Persist globally.
-		if (this.activeProfileOverlay) {
-			this.activeProfileOverlay = undefined;
-		}
-		this.secretOverlay = state;
-		await this.context.globalState.update(STATE_KEY, persisted);
-		await this.writeDisk(persisted);
-		await this.syncActiveToWorkspaceSettings(state);
-		this._onDidChange.fire(state);
 	}
 
 	private readDiskSync(): AiSettingsState | undefined {
@@ -736,6 +811,32 @@ export function defaultModelsFor(kind: ServerKind): string[] {
 
 export function defaultBaseUrlFor(kind: ServerKind): string {
 	return DEFAULT_BASE_URL[kind] ?? '';
+}
+
+/**
+ * Profile databases are imported only before the shared settings file exists.
+ * An existing file, even with an empty server list, is the user's catalog.
+ */
+export function shouldImportProfileCatalogs(disk: AiSettingsState | undefined): boolean {
+	return !(disk && Array.isArray(disk.servers));
+}
+
+/**
+ * When `disk` is present, return it unchanged.
+ * Otherwise fold profile snapshots with {@link mergeSettingsStates}.
+ */
+export function resolveSharedCatalog(
+	disk: AiSettingsState | undefined,
+	profileSnapshots: AiSettingsState[]
+): AiSettingsState {
+	if (disk && Array.isArray(disk.servers)) {
+		return disk;
+	}
+	let merged = emptyState();
+	for (const other of profileSnapshots) {
+		merged = mergeSettingsStates(merged, other);
+	}
+	return merged;
 }
 
 /** Merge catalogs by server id, then by kind+baseUrl+name. Prefer keys / richer model lists. */

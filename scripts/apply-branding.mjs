@@ -57,6 +57,10 @@ product.configurationDefaults = {
 	'chat.disableAIFeatures': true,
 	// Code-OSS lacks Microsoft's extension signing infrastructure.
 	'extensions.verifySignature': false,
+	// CodeForge is a local agent IDE. Do not put every folder in Restricted Mode.
+	'security.workspace.trust.enabled': false,
+	'security.workspace.trust.banner': 'never',
+	'security.workspace.trust.startupPrompt': 'never',
 };
 
 // Do not keep GitHub Copilot Chat as a built-in to auto-update or as a trusted
@@ -85,6 +89,17 @@ if (product.defaultChatAgent) {
 	delete product.defaultChatAgent.resolveMergeConflictsCommand;
 }
 
+// The Agents window runs every turn through the CodeForge extension: it must load
+// there, and it needs the default-participant and request-session proposals.
+const CODEFORGE_EXTENSION_ID = 'kortexio.codeforge';
+const allowedInAgents = new Set(product.sessionsWindowAllowedExtensions || []);
+allowedInAgents.add(CODEFORGE_EXTENSION_ID);
+product.sessionsWindowAllowedExtensions = [...allowedInAgents];
+product.extensionEnabledApiProposals = {
+	...(product.extensionEnabledApiProposals || {}),
+	[CODEFORGE_EXTENSION_ID]: ['defaultChatParticipant', 'chatParticipantPrivate'],
+};
+
 // Keep existing AppIds / UUIDs from upstream if present; only set if missing
 if (!product.win32x64AppId) {
 	product.win32x64AppId = '{{F8A2A209-72B3-11EC-90D6-0242AC120003}';
@@ -106,6 +121,7 @@ console.log(`  applicationName: ${product.applicationName}`);
 console.log(`  dataFolderName: ${product.dataFolderName}`);
 console.log(`  chat.disableAIFeatures: ${product.configurationDefaults['chat.disableAIFeatures']}`);
 console.log(`  extensions.verifySignature: ${product.configurationDefaults['extensions.verifySignature']}`);
+console.log(`  security.workspace.trust.enabled: ${product.configurationDefaults['security.workspace.trust.enabled']}`);
 
 // Windows window / installer / taskbar icons (gulp embeds resources/win32/code.ico into the .exe)
 const win32Dir = path.join(root, 'vscode', 'resources', 'win32');

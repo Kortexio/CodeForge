@@ -13,8 +13,45 @@
   "activationEvents": [
     "onStartupFinished"
   ],
+  "enabledApiProposals": [
+    "defaultChatParticipant",
+    "chatParticipantPrivate"
+  ],
   "main": "./out/extension.js",
   "contributes": {
+    "languageModelChatProviders": [
+      {
+        "vendor": "codeforge",
+        "displayName": "CodeForge"
+      }
+    ],
+    "chatParticipants": [
+      {
+        "id": "codeforge.agent",
+        "name": "codeforge",
+        "fullName": "CodeForge",
+        "description": "CodeForge agent harness (models, guardrails, loops, approvals)",
+        "isDefault": true,
+        "commands": [
+          { "name": "help", "description": "List available slash commands" },
+          { "name": "clear", "description": "Start a new chat" },
+          { "name": "ask", "description": "Switch to Ask mode (read/search/web)" },
+          { "name": "plan", "description": "Switch to Plan mode (explore + wiki plan only)" },
+          { "name": "agent", "description": "Switch to Agent mode" },
+          { "name": "auto", "description": "Allow all edits + shell this session (Agent mode)" },
+          { "name": "permissions", "description": "Cycle Default → Assisted → Allow all" },
+          { "name": "instructions", "description": "Generate AGENTS.md for this workspace" },
+          { "name": "cards", "description": "Implement docs/C*.md cards one by one (optional: C01-C05)" },
+          { "name": "plan-run", "description": "Plan the request in steps and run each step with a clean context" },
+          { "name": "review", "description": "Find bugs: build/test signals, per-file review, BUGS.md" }
+        ],
+        "modes": [
+          "ask",
+          "edit",
+          "agent"
+        ]
+      }
+    ],
     "viewsContainers": {
       "secondarySidebar": [
         {

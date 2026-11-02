@@ -61,6 +61,13 @@ import {
 import { randomBytes } from 'crypto';
 import { getChatViewHtml } from './chatViewHtml';
 import type { ExternalChatHandle, ExternalChatSession } from '../api';
+import {
+	CONTINUE_TURN_PROMPT,
+	type AgentsTurnResult,
+	type LoopExit,
+	type TurnObserver,
+	type TurnOutcome,
+} from './turnContract';
 
 const OPEN_TABS_KEY = 'codeforge.ai.openSessionIds';
 
@@ -148,7 +155,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 	private _hasAgentsMd = false;
 	private _running = false;
 	/** Last tool-loop exit reason from runAgentWithTools (for Continue button). */
-	private _lastLoopExit: 'budget' | 'stuck' | 'length' | 'done' | 'cancelled' | 'error' | undefined;
+	private _lastLoopExit: LoopExit | undefined;
+	private _turnObserver: TurnObserver | undefined;
+	private _turnSettled: ((outcome: TurnOutcome) => void) | undefined;
 	private _queue = new SteeringQueue();
 	/** Set by /cards, /plan-run and /review for the next run only. */
 	private _runKind?: 'cards' | 'plan-run' | 'review';
@@ -250,6 +259,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			void this.refreshEditSummary();
 		});
 		vscode.workspace.onDidChangeConfiguration(e => {
+			if (e.affectsConfiguration('codeforge.ai.mode')) {
+				const next = normalizeMode(vscode.workspace.getConfiguration('codeforge.ai').get<string>('mode'));
+				if (next !== this._mode) {
+					this._mode = next;
+					this.pushConfig();
+				}
+			}
 			if (
 				e.affectsConfiguration('codeforge.ai.collapseToolCards') ||
 				e.affectsConfiguration('codeforge.ai.enabled') ||
@@ -276,7 +292,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		return this._currentSessionId;
 	}
 
-	async loadSession(sessionId: string): Promise<void> {
+	async loadSession(sessionId: string, options: { reveal?: boolean } = {}): Promise<void> {
 		if (this._running && this._currentSessionId && this._currentSessionId !== sessionId) {
 			void vscode.window.showWarningMessage('Stop the agent before switching chats.');
 			return;
@@ -348,7 +364,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		this._currentTurn = lastTurn;
 		this._queue.clear();
 		this.pushQueue();
-		await this.focus();
+		if (options.reveal !== false) {
+			await this.focus();
+		}
 		this.updateView();
 		this.pushTabs();
 		if (this._view) {
@@ -595,6 +613,64 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		this.updateView();
 	}
 
+	/**
+	 * Runs one turn for the Agents window through the same pipeline as the side chat
+	 * (sessions, harness, approvals, telemetry). Resolves when the turn's outcome is
+	 * known; queued side-chat follow-ups keep running afterwards without blocking it.
+	 */
+	async runAgentsTurn(
+		task: string,
+		sessionId: string | undefined,
+		observer: TurnObserver,
+		token: vscode.CancellationToken
+	): Promise<AgentsTurnResult> {
+		if (this._running) {
+			return { kind: 'busy' };
+		}
+		if (sessionId && this._sessions.get(sessionId)) {
+			if (this._currentSessionId !== sessionId) {
+				await this.loadSession(sessionId, { reveal: false });
+			}
+		} else if (this._currentSessionId) {
+			this.newChat();
+		}
+
+		const settled = new Promise<TurnOutcome>(resolve => {
+			this._turnSettled = resolve;
+		});
+		this._turnObserver = observer;
+		const cancel = token.onCancellationRequested(() => {
+			if (this._turnObserver === observer) {
+				void this.cancelTask();
+			}
+		});
+		try {
+			const handled = this.handleUserMessage(task).then((): TurnOutcome => {
+				const last = this._messages[this._messages.length - 1];
+				return {
+					sessionId: this._currentSessionId,
+					reply: last?.role === 'assistant' ? last.content : '',
+					loopExit: 'done',
+				};
+			});
+			const outcome = await Promise.race([settled, handled]);
+			return { kind: 'finished', ...outcome };
+		} finally {
+			cancel.dispose();
+			if (this._turnObserver === observer) {
+				this._turnObserver = undefined;
+				this._turnSettled = undefined;
+			}
+		}
+	}
+
+	private settleTurn(outcome: TurnOutcome): void {
+		const settle = this._turnSettled;
+		this._turnSettled = undefined;
+		this._turnObserver = undefined;
+		settle?.(outcome);
+	}
+
 	async runTask(task: string, mode?: AgentMode) {
 		if (mode) {
 			await this.setMode(mode);
@@ -602,11 +678,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		const aiEnabled =
 			vscode.workspace.getConfiguration('codeforge.ai').get<boolean>('enabled') !== false;
 		if (!aiEnabled) {
+			const disabled =
+				'AI Agent is disabled. Enable it in Settings → AI → Agent (`codeforge.ai.enabled`), then try again.';
 			this.addMessage('user', task);
-			this.addMessage(
-				'assistant',
-				'AI Agent is disabled. Enable it in Settings → AI → Agent (`codeforge.ai.enabled`), then try again.'
-			);
+			this.addMessage('assistant', disabled);
+			this.settleTurn({ sessionId: this._currentSessionId, reply: disabled, loopExit: 'error' });
 			return;
 		}
 		if (this._running) {
@@ -709,11 +785,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		this.pushQueue();
 
 		this._lastLoopExit = undefined;
-		let loopExit = 'done';
+		let loopExit = 'done' as LoopExit;
+		let finalReply = '';
 		try {
 			const reply = await this.executeLocalAgent(agentTask, images);
 			if (!this._cancelled) {
-				loopExit = this._lastLoopExit ?? 'done';
+				loopExit = (this._lastLoopExit as LoopExit | undefined) ?? 'done';
+				finalReply = reply;
 				const extra = {
 					reasoning: this._turnReasoning || undefined,
 					timings: this._turnTimings,
@@ -738,6 +816,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			const message = error instanceof Error ? error.message : String(error);
 			if (this._cancelled || /abort/i.test(message)) {
 				loopExit = 'cancelled';
+				finalReply = 'Cancelled.';
 				this.updateLastMessage('assistant', 'Cancelled.');
 				if (this._currentSessionId) {
 					const session = this._sessions.get(this._currentSessionId);
@@ -749,6 +828,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 				}
 			} else {
 				loopExit = 'error';
+				finalReply = `Error: ${message}`;
 				this.updateLastMessage('assistant', `Error: ${message}`);
 				if (this._currentSessionId) {
 					await this._sessions.appendMessage(
@@ -784,11 +864,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			this.pushConfig();
 			this.pushQueue();
 			this.updateView();
+			this.settleTurn({ sessionId: this._currentSessionId, reply: finalReply, loopExit });
 			await this.drainQueue();
 		}
 	}
 
 	private observeActivity(ev: AgentActivityEvent): void {
+		this._turnObserver?.onActivity(ev);
 		this.pushActivity(ev);
 		this._protocolAgg?.observe(ev);
 	}
@@ -904,7 +986,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		this.pushConfig();
 	}
 
-	private async setMode(mode: AgentMode) {
+	getMode(): AgentMode {
+		return this._mode;
+	}
+
+	getPermissions(): Permissions {
+		return this._permissions;
+	}
+
+	async setMode(mode: AgentMode) {
 		this._mode = mode;
 		await vscode.workspace
 			.getConfiguration('codeforge.ai')
@@ -925,7 +1015,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		this.pushConfig();
 	}
 
-	private async setPermissions(level: Permissions) {
+	async setPermissions(level: Permissions) {
 		try {
 			await getApprovalPolicy().applyPermissionLevel(level);
 			this._permissions = level;
@@ -1805,9 +1895,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			delete last.continueAvailable;
 			this.updateView();
 		}
-		await this.runTask(
-			'Continue the unfinished work from the previous turn. Pick up from the last tool results and remaining plan items.'
-		);
+		await this.runTask(CONTINUE_TURN_PROMPT);
 	}
 
 	/**
@@ -1816,6 +1904,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 	 * Cleared when the pending bubble leaves `pending` (see updateLastMessage).
 	 */
 	private setPendingLiveStatus(text: string): void {
+		this._turnObserver?.onStatus(text);
 		let cleaned = String(text || '')
 			.replace(/\s+/g, ' ')
 			.trim();

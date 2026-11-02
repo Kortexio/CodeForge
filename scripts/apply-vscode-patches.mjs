@@ -394,6 +394,335 @@ if (fs.existsSync(gulpVscodeWinPath)) {
 	}
 }
 
+// CodeForge: the Agents window must not demand GitHub / Google / Apple / GHE sign-in.
+const sessionsSetUpPath = path.join(
+	root,
+	'vscode',
+	'src',
+	'vs',
+	'sessions',
+	'browser',
+	'sessionsSetUpService.ts'
+);
+/** Reads a source file with LF line endings; `write` restores the file's original endings. */
+function readNormalized(file) {
+	const raw = fs.readFileSync(file, 'utf8');
+	const crlf = raw.includes('\r\n');
+	return {
+		src: crlf ? raw.replace(/\r\n/g, '\n') : raw,
+		write: (next) => fs.writeFileSync(file, crlf ? next.replace(/\n/g, '\r\n') : next, 'utf8'),
+	};
+}
+
+if (fs.existsSync(sessionsSetUpPath)) {
+	const setupFile = readNormalized(sessionsSetUpPath);
+	let setupSrc = setupFile.src;
+	// _start opens the window; every later sign-in path (_reevaluateSignedOut,
+	// _watchSignInState, ...) ends in _showWelcome. _proceedWithoutGitHub also calls
+	// _ensureAIFeaturesEnabled, which must not re-enable Copilot. The flag is typed
+	// `boolean` so the original bodies stay reachable for the compiler.
+	const setupMarker = 'CODEFORGE_SKIP_VENDOR_SIGN_IN';
+	if (setupSrc.includes(setupMarker)) {
+		console.log('Agents window vendor sign-in skip already applied');
+	} else {
+		const configAnchor = `const AIDisabledConfig = 'chat.disableAIFeatures';\n`;
+		const startHead = '\tprivate _start(): void {\n';
+		const welcomeHead = '\tprivate async _showWelcome(isFirstLaunch: boolean): Promise<void> {\n';
+		const ensureHead = '\tprivate async _ensureAIFeaturesEnabled(): Promise<void> {\n';
+		if (![configAnchor, startHead, welcomeHead, ensureHead].every(anchor => setupSrc.includes(anchor))) {
+			console.warn('Could not find SessionsSetUpWidget sign-in anchors — upstream may have changed');
+		} else {
+			const skip = `		if (${setupMarker}) {
+			this.logService.info('[sessions welcome] Skipping vendor sign-in');
+			this.dialogRef.clear();
+			this.onCompleted();
+			return;
+		}
+`;
+			setupSrc = setupSrc.replace(configAnchor, `${configAnchor}
+// CodeForge: the Agents window never signs in with GitHub, Google, Apple, or GHE,
+// and never turns chat.disableAIFeatures back on.
+const ${setupMarker}: boolean = true;
+`);
+			setupSrc = setupSrc.replace(startHead, `${startHead}${skip}`);
+			setupSrc = setupSrc.replace(welcomeHead, `${welcomeHead}${skip}`);
+			setupSrc = setupSrc.replace(ensureHead, `${ensureHead}		if (${setupMarker}) {
+			return;
+		}
+`);
+			setupFile.write(setupSrc);
+			console.log('Patched sessionsSetUpService.ts to skip vendor sign-in');
+		}
+	}
+}
+
+// CodeForge: the Agents window runs on the CodeForge harness. Copy the CodeForge
+// sessions provider overlay, register it in place of the Copilot and Agent Host
+// providers, and point Customize at the CodeForge settings.
+const overlayRoot = path.join(root, 'resources', 'vscode-overlay');
+function copyOverlay(dir) {
+	for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+		const from = path.join(dir, entry.name);
+		const to = path.join(root, 'vscode', path.relative(overlayRoot, from));
+		if (entry.isDirectory()) {
+			copyOverlay(from);
+			continue;
+		}
+		const next = fs.readFileSync(from);
+		if (fs.existsSync(to) && fs.readFileSync(to).equals(next)) {
+			continue;
+		}
+		fs.mkdirSync(path.dirname(to), { recursive: true });
+		fs.writeFileSync(to, next);
+		console.log(`Copied overlay ${path.relative(root, to)}`);
+	}
+}
+if (fs.existsSync(overlayRoot)) {
+	copyOverlay(overlayRoot);
+}
+
+function patchFile(relPath, label, edits) {
+	const file = path.join(root, 'vscode', ...relPath.split('/'));
+	if (!fs.existsSync(file)) {
+		console.warn(`${label}: ${relPath} not found`);
+		return;
+	}
+	const normalized = readNormalized(file);
+	let src = normalized.src;
+	let changed = false;
+	for (const { from, to } of edits) {
+		if (src.includes(to)) {
+			continue;
+		}
+		if (!src.includes(from)) {
+			console.warn(`${label}: anchor not found in ${relPath} — upstream may have changed: ${from.trim()}`);
+			continue;
+		}
+		src = src.replace(from, to);
+		changed = true;
+	}
+	if (changed) {
+		normalized.write(src);
+		console.log(`${label}: patched ${relPath}`);
+	} else {
+		console.log(`${label}: already applied`);
+	}
+}
+
+const disabledImport = (line) => `// CodeForge: provider disabled in the Agents window.\n// ${line}`;
+
+patchFile('src/vs/sessions/sessions.common.main.ts', 'Agents window providers', [
+	{
+		from: `import './contrib/providers/copilotChatSessions/browser/copilotChatSessions.contribution.js';`,
+		to: `${disabledImport(`import './contrib/providers/copilotChatSessions/browser/copilotChatSessions.contribution.js';`)}\nimport './contrib/providers/codeforge/browser/codeforgeSessions.contribution.js';`,
+	},
+]);
+
+patchFile('src/vs/sessions/sessions.desktop.main.ts', 'Agents window providers (desktop)', [
+	`import './contrib/providers/remoteAgentHost/browser/cloudSandboxAgentHost.contribution.js';`,
+	`import './contrib/providers/agentHost/browser/localAgentHost.contribution.js';`,
+	`import './contrib/providers/agentHost/electron-browser/localAgentHostLifecycle.contribution.js';`,
+].map(line => ({ from: `${line}\n`, to: `${disabledImport(line)}\n` })));
+
+patchFile('src/vs/sessions/sessions.web.main.ts', 'Agents window providers (web)', [
+	`import './contrib/providers/remoteAgentHost/browser/cloudSandboxAgentHost.contribution.js';`,
+].map(line => ({ from: `${line}\n`, to: `${disabledImport(line)}\n` })));
+
+// Models come from CodeForge servers, so the picker never asks for a Copilot sign-in.
+patchFile('src/vs/workbench/contrib/chat/browser/widget/input/modelPicker/modelPickerWidget.ts', 'Model picker sign-in', [
+	{
+		from: `\tprivate _requiresSetup(): boolean {\n`,
+		to: `\tprivate _requiresSetup(): boolean {\n\t\tif (CODEFORGE_MODELS_WITHOUT_SIGN_IN) {\n\t\t\treturn false;\n\t\t}\n`,
+	},
+	{
+		from: `export class ModelPickerWidget`,
+		to: `// CodeForge: models come from CodeForge servers; Copilot sign-in is never required.\nconst CODEFORGE_MODELS_WITHOUT_SIGN_IN: boolean = true;\n\nexport class ModelPickerWidget`,
+	},
+]);
+
+// CodeForge sessions contribute their own mode and permission chips to the chat input
+// (`codeforgeSessions.contribution.ts`). `sessionProviderId` is the Agents window key;
+// workbench code cannot import it from vs/sessions.
+const NOT_CODEFORGE_SESSION = `ContextKeyExpr.notEquals('sessionProviderId', 'codeforge'),`;
+patchFile('src/vs/workbench/contrib/chat/browser/actions/chatExecuteActions.ts', 'Chat input pickers for CodeForge sessions', [
+	{
+		from: `\t\t\t\t\t\t// Hide the agent picker while a delegation (continue in) target is pending\n\t\t\t\t\t\tChatContextKeys.hasPendingDelegationTarget.negate(),\n`,
+		to: `\t\t\t\t\t\t// Hide the agent picker while a delegation (continue in) target is pending\n\t\t\t\t\t\tChatContextKeys.hasPendingDelegationTarget.negate(),\n\t\t\t\t\t\t${NOT_CODEFORGE_SESSION}\n`,
+	},
+	{
+		from: `\t\t\t\t\t\tChatContextKeys.chatModeKind.notEqualsTo(ChatModeKind.Ask),\n\t\t\t\t\t\tChatContextKeys.inQuickChat.negate(),\n`,
+		to: `\t\t\t\t\t\tChatContextKeys.chatModeKind.notEqualsTo(ChatModeKind.Ask),\n\t\t\t\t\t\tChatContextKeys.inQuickChat.negate(),\n\t\t\t\t\t\t${NOT_CODEFORGE_SESSION}\n`,
+	},
+]);
+
+patchFile('src/vs/sessions/contrib/chat/browser/newChatWidget.ts', 'Agents window Customize', [
+	{
+		from: `import { OPEN_CUSTOMIZATIONS_COMMAND_ID } from '../../../common/customizations.js';\n`,
+		to: `// CodeForge: Customize opens codeforge.openSettings, not the customization overview.\n`,
+	},
+	{
+		from: `const run = () => this.commandService.executeCommand(OPEN_CUSTOMIZATIONS_COMMAND_ID).catch(onUnexpectedError);`,
+		to: `// CodeForge: Customize opens the CodeForge settings (servers, models, guardrails, agent).
+		const run = () => this.commandService.executeCommand('codeforge.openSettings').catch(onUnexpectedError);`,
+	},
+	{
+		from: `content: localize('newSessionCustomizeTooltip', "Open customization overview"),`,
+		to: `content: localize('newSessionCustomizeTooltip', "Open CodeForge settings"),`,
+	},
+]);
+
+// Manage Models, the account Settings entry, and Agent Customizations open CodeForge settings.
+patchFile('src/vs/workbench/contrib/chat/browser/widget/input/modelPicker/modelPickerItems.ts', 'Model picker opens CodeForge settings', [
+	{
+		from: `export function shouldShowManageModelsAction(chatEntitlementService: IChatEntitlementService): boolean {\n\treturn chatEntitlementService.clientByokEnabled ||`,
+		to: `// CodeForge: the gear always opens CodeForge settings, for every entitlement.\nconst CODEFORGE_MANAGE_MODELS_OPENS_SETTINGS: boolean = true;\n\nexport function shouldShowManageModelsAction(chatEntitlementService: IChatEntitlementService): boolean {\n\tif (CODEFORGE_MANAGE_MODELS_OPENS_SETTINGS) {\n\t\treturn true;\n\t}\n\treturn chatEntitlementService.clientByokEnabled ||`,
+	},
+	{
+		from: `\t\trun: () => { commandService.executeCommand(MANAGE_CHAT_COMMAND_ID); },`,
+		to: `\t\trun: () => {\n\t\t\tif (CODEFORGE_MANAGE_MODELS_OPENS_SETTINGS) {\n\t\t\t\tcommandService.executeCommand('codeforge.openSettings', 'models');\n\t\t\t\treturn;\n\t\t\t}\n\t\t\tcommandService.executeCommand(MANAGE_CHAT_COMMAND_ID);\n\t\t},`,
+	},
+]);
+
+patchFile('src/vs/sessions/contrib/accountMenu/browser/account.contribution.ts', 'Account settings opens CodeForge settings', [
+	{
+		from: `\t\tid: 'workbench.action.openSettings',\n\t\ttitle: localize('settings', "Settings"),`,
+		to: `\t\tid: 'codeforge.openSettings',\n\t\ttitle: localize('settings', "Settings"),`,
+	},
+	{
+		from: `// Actions registered at module level so Menus.TitleBarRightLayout is non-empty when the\n// toolbar is first constructed. The run() is a no-op — rendering is handled by the custom\n// view items registered in AccountWidgetContribution.\nregisterAction2(class extends Action2 {`,
+		to: `// CodeForge: the titlebar account widget only hosts Copilot and Codex sign-in.\nconst CODEFORGE_HIDE_VENDOR_ACCOUNT: boolean = true;\n// Actions registered at module level so Menus.TitleBarRightLayout is non-empty when the\n// toolbar is first constructed. The run() is a no-op — rendering is handled by the custom\n// view items registered in AccountWidgetContribution.\nif (!CODEFORGE_HIDE_VENDOR_ACCOUNT) {\nregisterAction2(class extends Action2 {`,
+	},
+	{
+		from: `\trun(): void { }\n});\n\nclass AccountWidgetContribution`,
+		to: `\trun(): void { }\n});\n}\n\nclass AccountWidgetContribution`,
+	},
+]);
+
+patchFile('src/vs/sessions/browser/parts/mobile/mobileTitlebarPart.ts', 'Mobile settings icon', [
+	{
+		from: `\t\t\tcase 'workbench.action.openSettings': return Codicon.settingsGear;`,
+		to: `\t\t\tcase 'workbench.action.openSettings':\n\t\t\tcase 'codeforge.openSettings': return Codicon.settingsGear;`,
+	},
+]);
+
+patchFile('src/vs/sessions/contrib/sessions/browser/customizationsToolbar.contribution.ts', 'Customizations open CodeForge settings', [
+	{
+		from: `import { OPEN_CUSTOMIZATIONS_COMMAND_ID } from '../../../common/customizations.js';\n`,
+		to: `import { OPEN_CUSTOMIZATIONS_COMMAND_ID } from '../../../common/customizations.js';\nimport { ICommandService } from '../../../../platform/commands/common/commands.js';\n\n// CodeForge: customization entry points open CodeForge settings, not the VS Code editor.\nconst CODEFORGE_CUSTOMIZATIONS_OPEN_SETTINGS: boolean = true;\n`,
+	},
+	{
+		from: `\tprivate _readCount(reader: Parameters<Parameters<typeof autorun>[0]>[0]): number {\n\t\tif (this._config.modelSection) {`,
+		to: `\tprivate _readCount(reader: Parameters<Parameters<typeof autorun>[0]>[0]): number {\n\t\tif (CODEFORGE_CUSTOMIZATIONS_OPEN_SETTINGS) {\n\t\t\treturn 0;\n\t\t}\n\t\tif (this._config.modelSection) {`,
+	},
+	{
+		from: `\t\t\tasync run(accessor: ServicesAccessor, session?: IActiveSession): Promise<void> {\n\t\t\t\tawait openCustomizationOverviewPage(`,
+		to: `\t\t\tasync run(accessor: ServicesAccessor, session?: IActiveSession): Promise<void> {\n\t\t\t\tif (CODEFORGE_CUSTOMIZATIONS_OPEN_SETTINGS) {\n\t\t\t\t\tawait accessor.get(ICommandService).executeCommand('codeforge.openSettings');\n\t\t\t\t\treturn;\n\t\t\t\t}\n\t\t\t\tawait openCustomizationOverviewPage(`,
+	},
+	{
+		from: `\t\tfor (const [index, config] of CUSTOMIZATION_ITEMS.entries()) {\n\t\t\tif (!config.section) {\n\t\t\t\tcontinue;\n\t\t\t}`,
+		to: `\t\tfor (const [index, config] of CUSTOMIZATION_ITEMS.entries()) {\n\t\t\tif (!config.section || (CODEFORGE_CUSTOMIZATIONS_OPEN_SETTINGS && config.id === 'sessions.customization.harnessSettings')) {\n\t\t\t\tcontinue;\n\t\t\t}`,
+	},
+	{
+		from: `\t\t\t\tasync run(accessor: ServicesAccessor): Promise<void> {\n\t\t\t\t\tconst editorService = accessor.get(IEditorService);\n\t\t\t\t\tconst harnessService = accessor.get(ICustomizationHarnessService);\n\t\t\t\t\tconst sessionsService = accessor.get(ISessionsService);\n\t\t\t\t\tawait openCustomizationSectionPage(editorService, harnessService, sessionsService, section);`,
+		to: `\t\t\t\tasync run(accessor: ServicesAccessor): Promise<void> {\n\t\t\t\t\tif (CODEFORGE_CUSTOMIZATIONS_OPEN_SETTINGS) {\n\t\t\t\t\t\tconst tab = section === AICustomizationManagementSection.McpServers ? 'mcp'\n\t\t\t\t\t\t\t: section === AICustomizationManagementSection.Plugins ? 'plugins'\n\t\t\t\t\t\t\t: section === AICustomizationManagementSection.Tools ? 'agent'\n\t\t\t\t\t\t\t: 'guardrails';\n\t\t\t\t\t\tawait accessor.get(ICommandService).executeCommand('codeforge.openSettings', tab);\n\t\t\t\t\t\treturn;\n\t\t\t\t\t}\n\t\t\t\t\tconst editorService = accessor.get(IEditorService);\n\t\t\t\t\tconst harnessService = accessor.get(ICustomizationHarnessService);\n\t\t\t\t\tconst sessionsService = accessor.get(ISessionsService);\n\t\t\t\t\tawait openCustomizationSectionPage(editorService, harnessService, sessionsService, section);`,
+	},
+]);
+
+patchFile('src/vs/sessions/contrib/aiCustomizationTreeView/browser/aiCustomizationTreeView.contribution.ts', 'Open Customizations command', [
+	{
+		from: `import { ChatContextKeys } from '../../../../workbench/contrib/chat/common/actions/chatContextKeys.js';\n`,
+		to: `import { ChatContextKeys } from '../../../../workbench/contrib/chat/common/actions/chatContextKeys.js';\n\n// CodeForge: Open Chat Customizations opens CodeForge settings.\nconst CODEFORGE_CUSTOMIZATIONS_OPEN_SETTINGS: boolean = true;\n`,
+	},
+	{
+		from: `\tasync run(accessor: ServicesAccessor): Promise<void> {\n\t\tif (accessor.get(IConfigurationService).getValue<boolean>(ChatConfiguration.CustomizationEntryPoints)) {`,
+		to: `\tasync run(accessor: ServicesAccessor): Promise<void> {\n\t\tif (CODEFORGE_CUSTOMIZATIONS_OPEN_SETTINGS) {\n\t\t\tawait accessor.get(ICommandService).executeCommand('codeforge.openSettings');\n\t\t\treturn;\n\t\t}\n\t\tif (accessor.get(IConfigurationService).getValue<boolean>(ChatConfiguration.CustomizationEntryPoints)) {`,
+	},
+]);
+
+patchFile('src/vs/sessions/contrib/chat/browser/sessionCustomizations.ts', 'Session customization pills', [
+	{
+		from: `import type { IActiveSession } from '../../../services/sessions/common/sessionsManagement.js';\n`,
+		to: `import type { IActiveSession } from '../../../services/sessions/common/sessionsManagement.js';\n\n// CodeForge: session customization pills open CodeForge settings.\nconst CODEFORGE_CUSTOMIZATIONS_OPEN_SETTINGS: boolean = true;\n`,
+	},
+	{
+		from: `\tprivate _reveal(customization: ISessionChatCustomization): void {\n\t\tvoid this._commandService.executeCommand(AICustomizationManagementCommands.OpenEditor, {`,
+		to: `\tprivate _reveal(customization: ISessionChatCustomization): void {\n\t\tif (CODEFORGE_CUSTOMIZATIONS_OPEN_SETTINGS) {\n\t\t\tvoid this._commandService.executeCommand('codeforge.openSettings', 'guardrails');\n\t\t\treturn;\n\t\t}\n\t\tvoid this._commandService.executeCommand(AICustomizationManagementCommands.OpenEditor, {`,
+	},
+]);
+
+// The Agents window lists CodeForge participant commands, not the VS Code slash commands or built-in skills.
+patchFile('src/vs/workbench/contrib/chat/browser/chatSlashCommands.ts', 'Sessions window skips built-in slash commands', [
+	{
+		from: `export class ChatSlashCommandsContribution extends Disposable {\n`,
+		to: `// CodeForge: the Agents window uses the CodeForge participant's slash commands.\nconst CODEFORGE_SESSIONS_SKIP_BUILTIN_SLASH: boolean = true;\n\nexport class ChatSlashCommandsContribution extends Disposable {\n`,
+	},
+	{
+		from: `\t\tsuper();\n\n\t\tthis._store.add(slashCommandService.registerSlashCommand({\n\t\t\tcommand: 'vscode-pet',`,
+		to: `\t\tsuper();\n\n\t\tif (CODEFORGE_SESSIONS_SKIP_BUILTIN_SLASH && this.environmentService.isSessionsWindow) {\n\t\t\treturn;\n\t\t}\n\n\t\tthis._store.add(slashCommandService.registerSlashCommand({\n\t\t\tcommand: 'vscode-pet',`,
+	},
+]);
+
+patchFile('src/vs/sessions/contrib/chat/browser/btwSlashCommand.contribution.ts', 'Sessions window skips /btw', [
+	{
+		from: `\t\tif (!environmentService.isSessionsWindow) {\n\t\t\treturn;\n\t\t}\n\n\t\tthis._register(slashCommandService.registerSlashCommand({\n\t\t\tcommand: 'btw',`,
+		to: `\t\t// CodeForge: /btw is a VS Code side chat, not a CodeForge command.\n\t\tconst CODEFORGE_SESSIONS_SKIP_BUILTIN_SLASH: boolean = true;\n\t\tif (!environmentService.isSessionsWindow || CODEFORGE_SESSIONS_SKIP_BUILTIN_SLASH) {\n\t\t\treturn;\n\t\t}\n\n\t\tthis._register(slashCommandService.registerSlashCommand({\n\t\t\tcommand: 'btw',`,
+	},
+]);
+
+patchFile('src/vs/sessions/contrib/chat/browser/slashCommands.ts', 'New session slash commands from CodeForge', [
+	{
+		from: `import { IChatPetService } from '../../../../workbench/contrib/chat/browser/chatPetService.js';\n`,
+		to: `import { IChatPetService } from '../../../../workbench/contrib/chat/browser/chatPetService.js';\nimport { IChatAgentService } from '../../../../workbench/contrib/chat/common/participants/chatAgents.js';\nimport { ChatAgentLocation } from '../../../../workbench/contrib/chat/common/constants.js';\n\n// CodeForge: the new-session composer lists the default agent's commands (CodeForge).\nconst CODEFORGE_SESSIONS_USE_AGENT_SLASH: boolean = true;\n`,
+	},
+	{
+		from: `\t\t@IChatPetService private readonly chatPetService: IChatPetService,\n\t\t@IChatSubmitRequestHandlerService submitRequestHandlerService: IChatSubmitRequestHandlerService,`,
+		to: `\t\t@IChatPetService private readonly chatPetService: IChatPetService,\n\t\t@IChatAgentService private readonly chatAgentService: IChatAgentService,\n\t\t@IChatSubmitRequestHandlerService submitRequestHandlerService: IChatSubmitRequestHandlerService,`,
+	},
+	{
+		from: `\tprivate _registerSlashCommands(): void {\n\t\tconst openSection = (section: AICustomizationManagementSection) =>`,
+		to: `\tprivate _registerSlashCommands(): void {\n\t\tif (CODEFORGE_SESSIONS_USE_AGENT_SLASH) {\n\t\t\treturn;\n\t\t}\n\t\tconst openSection = (section: AICustomizationManagementSection) =>`,
+	},
+	{
+		from: `\t\t\t\treturn {\n\t\t\t\t\tsuggestions: this._slashCommands.map((c, i): CompletionItem => {`,
+		to: `\t\t\t\tconst commands = CODEFORGE_SESSIONS_USE_AGENT_SLASH\n\t\t\t\t\t? (this.chatAgentService.getDefaultAgent(ChatAgentLocation.Chat)?.slashCommands ?? []).map(c => ({ command: c.name, detail: c.description, sortText: undefined as string | undefined, executeImmediately: false as boolean | undefined }))\n\t\t\t\t\t: this._slashCommands;\n\t\t\t\treturn {\n\t\t\t\t\tsuggestions: commands.map((c, i): CompletionItem => {`,
+	},
+	{
+		from: `\t\tconst commandName = match[1];\n\t\tconst slashCommand = this._slashCommands.find(c => c.command === commandName);\n\t\tconst promptCommand = this._cachedPromptCommands.find(c => c.name === commandName);\n\t\tif (!slashCommand && !promptCommand) {`,
+		to: `\t\tconst commandName = match[1];\n\t\tconst slashCommand = this._slashCommands.find(c => c.command === commandName);\n\t\tconst agentCommand = CODEFORGE_SESSIONS_USE_AGENT_SLASH\n\t\t\t? this.chatAgentService.getDefaultAgent(ChatAgentLocation.Chat)?.slashCommands.find(c => c.name === commandName)\n\t\t\t: undefined;\n\t\tconst promptCommand = this._cachedPromptCommands.find(c => c.name === commandName);\n\t\tif (!slashCommand && !agentCommand && !promptCommand) {`,
+	},
+	{
+		from: `\t\tconst detail = slashCommand?.detail ?? promptCommand?.argumentHint;`,
+		to: `\t\tconst detail = slashCommand?.detail ?? agentCommand?.description ?? promptCommand?.argumentHint;`,
+	},
+]);
+
+patchFile('src/vs/sessions/contrib/chat/browser/promptsService.ts', 'Sessions window skips built-in skills', [
+	{
+		from: `\tprotected override async getBuiltinPromptFiles(type: PromptsType, token: CancellationToken): Promise<readonly IBuiltinPromptPath[]> {\n\t\tif (type !== PromptsType.skill) {\n\t\t\treturn [];\n\t\t}\n\t\treturn this.getBuiltinSkillPaths();`,
+		to: `\tprotected override async getBuiltinPromptFiles(type: PromptsType, token: CancellationToken): Promise<readonly IBuiltinPromptPath[]> {\n\t\t// CodeForge: bundled vs/sessions/skills are not CodeForge skills.\n\t\tconst CODEFORGE_SKIP_BUILTIN_SESSION_SKILLS: boolean = true;\n\t\tif (CODEFORGE_SKIP_BUILTIN_SESSION_SKILLS || type !== PromptsType.skill) {\n\t\t\treturn [];\n\t\t}\n\t\treturn this.getBuiltinSkillPaths();`,
+	},
+]);
+
+// Agents window defaults that `disallowConfigurationDefault` would otherwise ignore.
+patchFile('src/vs/sessions/services/configuration/browser/configurationService.ts', 'CodeForge Agents window settings', [
+	{
+		from: `import { ChatAIDisabledSettingId } from '../../../../platform/chat/common/chatSettings.js';\n`,
+		to: `import { ChatAIDisabledSettingId } from '../../../../platform/chat/common/chatSettings.js';\nimport { codeforgeAgentsWindowSetting } from '../common/codeforgeAgentsWindowSettings.js';\n`,
+	},
+	{
+		from: `\tprotected override getDefaultValue(_key: string, propertySchema: IRegisteredConfigurationPropertySchema): unknown {\n\t\tif (propertySchema.agentsWindow && propertySchema.defaultValueSource !== 'experiments') {\n\t\t\treturn deepClone(propertySchema.agentsWindow.default);\n\t\t}\n\t\treturn super.getDefaultValue(_key, propertySchema);\n\t}`,
+		to: `\tprotected override getDefaultValue(_key: string, propertySchema: IRegisteredConfigurationPropertySchema): unknown {\n\t\tconst codeforge = codeforgeAgentsWindowSetting(_key);\n\t\tif (codeforge) {\n\t\t\treturn deepClone(codeforge.value);\n\t\t}\n\t\tif (propertySchema.agentsWindow && propertySchema.defaultValueSource !== 'experiments') {\n\t\t\treturn deepClone(propertySchema.agentsWindow.default);\n\t\t}\n\t\treturn super.getDefaultValue(_key, propertySchema);\n\t}`,
+	},
+	{
+		from: `\t\tfor (const key in properties) {\n\t\t\tif (properties[key].agentsWindow?.readOnly) {\n\t\t\t\tthis.agentsWindowReadOnlyKeys.add(key);\n\t\t\t}\n\t\t}`,
+		to: `\t\tfor (const key in properties) {\n\t\t\tif (properties[key].agentsWindow?.readOnly || codeforgeAgentsWindowSetting(key)) {\n\t\t\t\tthis.agentsWindowReadOnlyKeys.add(key);\n\t\t\t}\n\t\t}`,
+	},
+	{
+		from: `\t\t\tif (properties[key]?.agentsWindow?.readOnly) {\n\t\t\t\tthis.agentsWindowReadOnlyKeys.add(key);\n\t\t\t} else {\n\t\t\t\tthis.agentsWindowReadOnlyKeys.delete(key);\n\t\t\t}`,
+		to: `\t\t\tif (properties[key]?.agentsWindow?.readOnly || codeforgeAgentsWindowSetting(key)) {\n\t\t\t\tthis.agentsWindowReadOnlyKeys.add(key);\n\t\t\t} else {\n\t\t\t\tthis.agentsWindowReadOnlyKeys.delete(key);\n\t\t\t}`,
+	},
+]);
+
 // Git must not start Copilot Chat setup (commit message / merge conflicts / edit sessions).
 const gitRepoPath = path.join(root, 'vscode', 'extensions', 'git', 'src', 'repository.ts');
 if (fs.existsSync(gitRepoPath)) {

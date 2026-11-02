@@ -8,6 +8,8 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
 import { ChatViewProvider } from './views/chatView';
+import { registerAgentsBridge } from './agents/agentsBridge';
+import { registerLanguageModelProvider } from './agents/languageModelProvider';
 import { SessionsTreeProvider } from './views/sessionsTree';
 import { TasksTreeProvider } from './views/tasksTree';
 import { ApprovalDialog } from './ui/approvalDialog';
@@ -156,6 +158,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<CodeFo
             webviewOptions: { retainContextWhenHidden: true },
         })
     );
+    registerLanguageModelProvider(context, settingsStore);
+    registerAgentsBridge(context, chatViewProvider, settingsStore);
     context.subscriptions.push(
         vscode.window.registerTreeDataProvider('codeforge.sessions', sessionsTreeProvider)
     );
@@ -275,9 +279,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<CodeFo
 
     context.subscriptions.push(
         vscode.commands.registerCommand('codeforge.openSettings', (tab?: string) => {
-            const allowed = new Set(['models', 'mcp', 'guardrails', 'agent', 'benchmark']);
+            const allowed = new Set(['models', 'mcp', 'guardrails', 'agent', 'benchmark', 'plugins']);
             const initial = allowed.has(String(tab))
-                ? (tab as 'models' | 'mcp' | 'guardrails' | 'agent' | 'benchmark')
+                ? (tab as 'models' | 'mcp' | 'guardrails' | 'agent' | 'benchmark' | 'plugins')
                 : 'models';
             AiSettingsPanel.show(context, settingsStore, governance, initial);
         })

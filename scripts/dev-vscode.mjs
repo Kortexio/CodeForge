@@ -42,6 +42,8 @@ if (!fs.existsSync(extensionOut)) {
 const args = [
 	`--extensionDevelopmentPath=${extensionPath}`,
 	'--disable-workspace-trust',
+	// Packaged builds strip extensions/copilot; dev runs from source, so turn it off here.
+	'--disable-extension=GitHub.copilot-chat',
 	...process.argv.slice(2),
 ];
 
