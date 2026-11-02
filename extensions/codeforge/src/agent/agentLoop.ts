@@ -59,7 +59,12 @@ import {
 import { batchRunsInParallel, batchTerminates, finishAgentTurn, prepareAgentRound } from './agentLoopHooks';
 import { recoverToolCalls as universalRecoverToolCalls } from './universal/families/registry';
 import { repairToolCallAgainstSchema } from './universal/schemaRepair';
-import { detectPhantomToolUse, shouldRetryPhantomToolUse, DEFAULT_PHANTOM_RETRY_CAP } from './universal/phantomToolUse';
+import {
+	detectPhantomToolUse,
+	shouldRetryPhantomToolUse,
+	buildPhantomRetryPrompt,
+	DEFAULT_PHANTOM_RETRY_CAP,
+} from './universal/phantomToolUse';
 import { resolveModelFamilyProfile, type ModelFamilyProfile } from './universal/modelFamily';
 import { thinkingFields as universalThinkingFields } from './universal/thinkingFields';
 import { StreamBuffer } from './universal/streamBuffer';
@@ -1656,12 +1661,21 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 		.filter(Boolean)
 		.join('\n');
 
+	// Older turns can have stored a raw think-prefixed reply as the "answer" (the bug this
+	// harness now guards against live, in the no-tool-calls branch). Replaying that verbatim
+	// into every later prompt re-teaches the model its own malformed style and bloats context.
+	// Strip it here too so a corrupted turn from before the fix cannot poison new turns.
+	const sanitizeHistoryContent = (role: 'user' | 'assistant', raw: string): string => {
+		if (role !== 'assistant') return raw;
+		const { content: withoutThink } = splitThinkContent(raw);
+		return withoutThink || '(no answer was given for this turn)';
+	};
 	const history = (opts.history ?? [])
 		.filter(m => m.content?.trim())
 		.slice(-16)
 		.map(m => ({
 			role: m.role,
-			content: clipData(m.content.trim(), 6000),
+			content: clipData(sanitizeHistoryContent(m.role, m.content.trim()), 6000),
 		}));
 
 	let facts: StableFacts = emptyStableFacts();
@@ -1792,6 +1806,8 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 	let truncatedToolRetries = 0;
 	/** Retries when model dumps tool JSON in content but parse fails. */
 	let proseToolParseRetries = 0;
+	/** Retries when the model names a tool (announced or bare) without calling it. */
+	let phantomToolNudges = 0;
 	/** One-shot repair when Anthropic rejects orphan tool_use without tool_result. */
 	let toolHistoryRepairedOnce = false;
 	let phase: AgentPhase = 'implement';
@@ -2705,6 +2721,40 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 						detail: `${maxLengthRetries} continuations exhausted`,
 					});
 					break;
+				}
+
+				// Model named a tool (announced it, or typed only the bare tool name) but never
+				// called it — structural check against known tool identifiers, not a text guess.
+				if (!trivial) {
+					const phantom = detectPhantomToolUse({
+						text: content,
+						hasToolCalls: false,
+						toolNames: activeToolNames,
+					});
+					if (
+						phantom.isPhantom &&
+						shouldRetryPhantomToolUse(phantomToolNudges, DEFAULT_PHANTOM_RETRY_CAP) &&
+						step + 1 < stepBudget
+					) {
+						phantomToolNudges += 1;
+						emitProtocol('phantomToolUse', '1');
+						trace?.info('harness', phantom.reason ?? 'phantom tool use');
+						messages.push({ role: 'assistant', content });
+						messages.push({
+							role: 'user',
+							content: buildPhantomRetryPrompt(phantom.matchedToolName!),
+						});
+						opts.onActivity?.({
+							kind: 'checkpoint',
+							label: 'Named a tool without calling it — retrying',
+							detail: phantom.matchedToolName,
+						});
+						opts.onStatus?.(
+							`Retrying ${phantom.matchedToolName} call (${phantomToolNudges}/${DEFAULT_PHANTOM_RETRY_CAP})…`
+						);
+						if (tryRefundContinue()) continue;
+						continue;
+					}
 				}
 
 				// Empty/trivial finish: one protocol retry, then accept (not an intent crutch).

@@ -75,6 +75,15 @@ assert(split.content === 'hello\nworld' || split.content.includes('hello'), 'str
 assert(split.reasoning.includes('secret'), 'capture think');
 assert(!split.content.includes('<think'), 'no think tags left');
 
+// qwen3.6-35b's harness-only reply was `<thought>...</thought>` with nothing after it — a tag
+// name THINK_BLOCK_RE did not match, so the whole block became the final answer and the turn
+// ended with zero tool calls (benchmarks/results T1 run, loopExit=done, steps=0).
+const thoughtTagOnly = splitThinkContent(
+	'<thought>\nThe user wants me to find and fix the failing tests. Let me run them first.\n</thought>'
+);
+assert(thoughtTagOnly.content === '', '<thought>-only reply is not a final answer either');
+assert(thoughtTagOnly.reasoning.includes('failing tests'), '<thought> tag content is captured as reasoning');
+
 const escalated = {
 	model: 'qwen3.6-35b',
 	withTools: true,
@@ -245,6 +254,20 @@ assert(!String(softOff[0].content).includes('/no_think'), 'system stays clean');
 const softOn = applySoftThinkSwitch([{ role: 'user', content: 'plan this\n/no_think' }], false);
 assert(String(softOn[0].content).includes('/think'), 'soft /think');
 assert(!String(softOn[0].content).includes('/no_think'), 'opposite tag removed');
+
+const thoughtOnly = splitThinkContent(
+	'think: The user is asking what I can do. I should explain my capabilities.'
+);
+assert(thoughtOnly.content === '', 'think-only reply is not a final answer');
+assert(thoughtOnly.reasoning.includes('what I can do'), 'think-only text is reasoning');
+const thoughtThenAnswer = splitThinkContent('think: plan the step.\n\nCreated MyApp and ran it.');
+assert(thoughtThenAnswer.reasoning === 'plan the step.', 'leading think paragraph is reasoning');
+assert(thoughtThenAnswer.content === 'Created MyApp and ran it.', 'text after the think paragraph stays');
+assert(
+	splitThinkContent('I think: this is the answer the user should see.').content ===
+		'I think: this is the answer the user should see.',
+	'a sentence that merely contains think is kept'
+);
 
 assert(splitThinkContent('/no_think').content === '', 'echoed soft switch alone is empty');
 assert(splitThinkContent('  /think  \n').content === '', 'echoed /think alone is empty');

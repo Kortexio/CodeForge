@@ -155,19 +155,28 @@ export function toolAwareMaxTokens(
 	return Math.min(completionCap, readOnly);
 }
 
-const THINK_BLOCK_RE = /<think\b[^>]*>[\s\S]*?<\/think>/gi;
+// Covers the tag names models actually emit for chain-of-thought: `<think>` (Qwen3/DeepSeek-R1
+// family) and `<thought>` (seen from qwen3.6-35b in this harness). The backreference requires a
+// matching close tag so a truncated block is left alone rather than guessed at.
+const THINK_BLOCK_RE = /<(think|thinking|thought)\b[^>]*>([\s\S]*?)<\/\1>/gi;
 const CHANNEL_THINK_RE =
 	/<\|channel\|>analysis<\|message\|>[\s\S]*?(?=<\|start\|>assistant<\|channel\|>final<\|message\|>|$)/gi;
 /** Lines that only echo the soft switch the harness appends to user turns. */
 const SOFT_SWITCH_LINE_RE = /^[ \t]*\/(?:no_)?think[ \t]*$/gim;
+/**
+ * The think tool written as a leading label (`think: …`) instead of a tool call.
+ * The first paragraph is reasoning. Text after a blank line stays the answer.
+ * A message that is only that paragraph becomes empty, so the loop continues.
+ */
+const PROSE_THINK_RE =
+	/^(?:[ \t]*\n)*[ \t]*(?:think|thinking)[ \t]*:[ \t]*([\s\S]*?)(?:\n[ \t]*\n|$)/i;
 
 /** Pull visible CoT out of assistant text for the UI; strip before history. */
 export function splitThinkContent(raw: string): { content: string; reasoning: string } {
 	const text = String(raw ?? '');
 	if (!text) return { content: '', reasoning: '' };
 	const parts: string[] = [];
-	let without = text.replace(THINK_BLOCK_RE, m => {
-		const inner = m.replace(/^<think\b[^>]*>/i, '').replace(/<\/think>$/i, '');
+	let without = text.replace(THINK_BLOCK_RE, (_m, _tag, inner: string) => {
 		if (inner.trim()) parts.push(inner.trim());
 		return '';
 	});
@@ -179,6 +188,12 @@ export function splitThinkContent(raw: string): { content: string; reasoning: st
 		return '';
 	});
 	without = without.replace(SOFT_SWITCH_LINE_RE, '');
+	const proseThink = PROSE_THINK_RE.exec(without);
+	if (proseThink) {
+		const thought = proseThink[1].trim();
+		if (thought) parts.push(thought);
+		without = without.slice(proseThink[0].length);
+	}
 	return {
 		content: without.replace(/^\s+|\s+$/g, '').replace(/\n{3,}/g, '\n\n'),
 		reasoning: parts.join('\n\n').trim(),

@@ -35,6 +35,17 @@ export function detectPhantomToolUse(input: PhantomToolUseInput): PhantomToolUse
 	const folded = new Map<string, string>();
 	for (const t of input.toolNames) folded.set(foldToolToken(t), t);
 
+	// A weak model sometimes types the tool name by itself instead of emitting a tool call
+	// (e.g. the entire completion is "update_status"). Compare against known tool names only —
+	// no guess at what the user meant, just whether this text IS a tool identifier.
+	const bare = input.text.trim().replace(/^[`'"*_]+|[`'"*_.!?:]+$/g, '');
+	if (bare && bare.length <= 40) {
+		const matched = folded.get(foldToolToken(bare));
+		if (matched) {
+			return { isPhantom: true, matchedToolName: matched, reason: `replied with the tool name "${bare}" instead of calling it` };
+		}
+	}
+
 	for (const re of ANNOUNCE_RES) {
 		const m = re.exec(input.text);
 		if (!m) continue;

@@ -62,4 +62,43 @@ describe('runLoop smoke', () => {
 		expect(result.reply).toMatch(/Hello/i);
 		expect(result.activities.some(a => a.tool === 'read')).toBe(true);
 	}, 60_000);
+
+	it('replying with just the tool name is retried, not shown to the user as the answer', async () => {
+		const result = await runLoop({
+			files: { 'hello.txt': 'Hello, World!\n' },
+			task: 'e então?',
+			askMode: true,
+			script: [
+				reply({ content: 'update_status' }),
+				reply({ content: 'I can read, search and answer questions about this workspace.' }),
+			],
+			maxSteps: 8,
+			isolated: true,
+		});
+		expect(result.reply).not.toBe('update_status');
+		expect(result.reply).toMatch(/read, search/i);
+		expect(result.activities.some(a => a.label?.includes('without calling it'))).toBe(true);
+	}, 60_000);
+
+	it('strips a think-only reply stored from before the fix out of the history it replays', async () => {
+		const result = await runLoop({
+			files: { 'hello.txt': 'Hello, World!\n' },
+			task: 'e então?',
+			askMode: true,
+			history: [
+				{ role: 'user', content: 'pode criar um agente para gmail?' },
+				{
+					role: 'assistant',
+					content:
+						'think: The user is asking for Gmail automation. I should explain the security risk instead.',
+				},
+			],
+			script: [reply({ content: 'I can read and search this workspace, but not Gmail.' })],
+			maxSteps: 8,
+			isolated: true,
+		});
+		const firstRequestMessages = JSON.stringify(result.requests[0]?.body.messages ?? []);
+		expect(firstRequestMessages).not.toMatch(/think: The user is asking for Gmail/);
+		expect(firstRequestMessages).toMatch(/no answer was given for this turn/);
+	}, 60_000);
 });
