@@ -77,6 +77,46 @@ export interface VisionRoute {
 }
 
 /**
+ * Every vision-capable server+model, in priority order: active server/model
+ * first (no switch), then another model on the active server, then every
+ * other configured, enabled server. Local setups commonly keep only one
+ * model process up at a time (manual swap, or a swap-manager like
+ * llama-swap) — the caller is expected to probe reachability and fall
+ * through the list rather than assume the first candidate is actually up.
+ */
+export function candidateVisionRoutes(
+	state: AiSettingsState,
+	activeServerId: string | undefined,
+	activeModel: string | undefined
+): VisionRoute[] {
+	const servers = (state.servers ?? []).filter(s => s.enabled);
+	if (!servers.length) return [];
+
+	const routes: VisionRoute[] = [];
+	const active = servers.find(s => s.id === activeServerId);
+	if (active) {
+		const activeVision = visionModelsForServer(active);
+		if (activeModel && activeVision.includes(activeModel)) {
+			routes.push({ serverId: active.id, model: activeModel, sameAsActive: true });
+		}
+		// Prefer staying on the active server with a different vision-capable
+		// model over switching servers, when it has one.
+		for (const m of activeVision) {
+			if (m === activeModel) continue;
+			routes.push({ serverId: active.id, model: m, sameAsActive: false });
+		}
+	}
+	for (const server of servers) {
+		if (server.id === activeServerId) continue;
+		const visionModels = visionModelsForServer(server);
+		for (const m of visionModels) {
+			routes.push({ serverId: server.id, model: m, sameAsActive: false });
+		}
+	}
+	return routes;
+}
+
+/**
  * Pick the server+model to use for a turn that carries image attachments.
  * Returns `null` when no configured, enabled server has an image-capable model.
  */
@@ -85,37 +125,61 @@ export function resolveVisionRoute(
 	activeServerId: string | undefined,
 	activeModel: string | undefined
 ): VisionRoute | null {
-	const servers = (state.servers ?? []).filter(s => s.enabled);
-	if (!servers.length) return null;
-
-	const active = servers.find(s => s.id === activeServerId);
-	if (active && activeModel) {
-		const activeVision = visionModelsForServer(active);
-		if (activeVision.includes(activeModel)) {
-			return { serverId: active.id, model: activeModel, sameAsActive: true };
-		}
-	}
-
-	// Prefer staying on the active server with a different (vision-capable) model
-	// over switching servers, when it has one.
-	if (active) {
-		const activeVision = visionModelsForServer(active);
-		if (activeVision.length) {
-			return { serverId: active.id, model: activeVision[0], sameAsActive: false };
-		}
-	}
-
-	for (const server of servers) {
-		if (server.id === activeServerId) continue;
-		const visionModels = visionModelsForServer(server);
-		if (visionModels.length) {
-			return { serverId: server.id, model: visionModels[0], sameAsActive: false };
-		}
-	}
-	return null;
+	return candidateVisionRoutes(state, activeServerId, activeModel)[0] ?? null;
 }
 
 /** Whether at least one configured, enabled server has an image-capable model — gates the attach-image UI. */
 export function anyVisionModelAvailable(state: AiSettingsState): boolean {
 	return (state.servers ?? []).some(s => s.enabled && serverSupportsVision(s));
+}
+
+const DEFAULT_PROBE_TIMEOUT_MS = 1500;
+
+/**
+ * Quick "is this server actually up" check — a local llama.cpp/llama-swap setup
+ * commonly keeps only one model process running at a time (manual swap, or a
+ * swap manager that unloads the previous model), so a server can be "enabled"
+ * in settings and still be unreachable right now. One short-timeout GET against
+ * the OpenAI-compat models endpoint; any HTTP response (even an error status)
+ * counts as reachable — only a network failure or timeout counts as down.
+ */
+export async function isServerReachable(server: AiServer, timeoutMs = DEFAULT_PROBE_TIMEOUT_MS): Promise<boolean> {
+	const base = (server.baseUrl || '').replace(/\/$/, '');
+	if (!base) return false;
+	const url = base.endsWith('/v1') ? `${base}/models` : `${base}/v1/models`;
+	try {
+		const res = await fetch(url, {
+			headers: server.apiKey ? { Authorization: `Bearer ${server.apiKey}` } : {},
+			signal: AbortSignal.timeout(timeoutMs),
+		});
+		return res.status > 0;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Walk {@link candidateVisionRoutes} in priority order and return the first one
+ * whose server actually answers. The already-active server is never probed —
+ * the caller is already talking to it, so skip the extra round trip.
+ * Returns `null` when every vision-capable candidate is configured but down
+ * (the common case for a one-model-at-a-time local setup when the loaded model
+ * isn't the vision one right now) — the caller must drop the image rather than
+ * fail the whole turn.
+ */
+export async function resolveReachableVisionRoute(
+	state: AiSettingsState,
+	activeServerId: string | undefined,
+	activeModel: string | undefined,
+	probeTimeoutMs = DEFAULT_PROBE_TIMEOUT_MS
+): Promise<VisionRoute | null> {
+	const candidates = candidateVisionRoutes(state, activeServerId, activeModel);
+	for (const route of candidates) {
+		if (route.sameAsActive) return route;
+		const server = (state.servers ?? []).find(s => s.id === route.serverId);
+		if (server && (await isServerReachable(server, probeTimeoutMs))) {
+			return route;
+		}
+	}
+	return null;
 }

@@ -1,7 +1,10 @@
 import type { AiServer, AiSettingsState } from '../../extensions/codeforge/src/settings/aiSettingsStore';
 import {
 	anyVisionModelAvailable,
+	candidateVisionRoutes,
+	isServerReachable,
 	modelLikelySupportsVision,
+	resolveReachableVisionRoute,
 	resolveVisionRoute,
 	serverSupportsVision,
 	visionModelsForServer,
@@ -108,6 +111,86 @@ describe('resolveVisionRoute', () => {
 		const textOnly = server({ id: 'text-srv', models: ['qwen3.6-35b'] });
 		const st = state([textOnly, vision]);
 		expect(resolveVisionRoute(st, 'text-srv', 'qwen3.6-35b')).toBeNull();
+	});
+});
+
+describe('candidateVisionRoutes', () => {
+	it('orders active model, then other models on the active server, then other servers', () => {
+		const mixed = server({ id: 'mixed-srv', models: ['qwen3.6-35b', 'qwen3-vl-4b'] });
+		const other = server({ id: 'other-srv', models: ['llava-7b'] });
+		const st = state([mixed, other]);
+		const candidates = candidateVisionRoutes(st, 'mixed-srv', 'qwen3.6-35b');
+		expect(candidates).toEqual([
+			{ serverId: 'mixed-srv', model: 'qwen3-vl-4b', sameAsActive: false },
+			{ serverId: 'other-srv', model: 'llava-7b', sameAsActive: false },
+		]);
+	});
+
+	it('is empty when nothing anywhere supports vision', () => {
+		const textOnly = server({ id: 'text-srv', models: ['qwen3.6-35b'] });
+		expect(candidateVisionRoutes(state([textOnly]), 'text-srv', 'qwen3.6-35b')).toEqual([]);
+	});
+});
+
+describe('isServerReachable', () => {
+	const realFetch = global.fetch;
+	afterEach(() => {
+		global.fetch = realFetch;
+	});
+
+	it('is true when the server answers, even with an error status', async () => {
+		global.fetch = jest.fn().mockResolvedValue({ status: 404 }) as unknown as typeof fetch;
+		const s = server({ id: 'a', models: ['m'], baseUrl: 'http://127.0.0.1:11435/v1' });
+		expect(await isServerReachable(s)).toBe(true);
+	});
+
+	it('is false when the request throws (connection refused, timeout, ...)', async () => {
+		global.fetch = jest.fn().mockRejectedValue(new Error('ECONNREFUSED')) as unknown as typeof fetch;
+		const s = server({ id: 'a', models: ['m'], baseUrl: 'http://127.0.0.1:11435/v1' });
+		expect(await isServerReachable(s)).toBe(false);
+	});
+
+	it('is false with no base URL configured', async () => {
+		const s = server({ id: 'a', models: ['m'], baseUrl: '' });
+		expect(await isServerReachable(s)).toBe(false);
+	});
+});
+
+describe('resolveReachableVisionRoute', () => {
+	const realFetch = global.fetch;
+	afterEach(() => {
+		global.fetch = realFetch;
+	});
+
+	it('returns the active route without probing it', async () => {
+		global.fetch = jest.fn() as unknown as typeof fetch;
+		const vision = server({ id: 'vision-srv', models: ['qwen3-vl-4b'] });
+		const st = state([vision]);
+		const route = await resolveReachableVisionRoute(st, 'vision-srv', 'qwen3-vl-4b');
+		expect(route).toEqual({ serverId: 'vision-srv', model: 'qwen3-vl-4b', sameAsActive: true });
+		expect(global.fetch).not.toHaveBeenCalled();
+	});
+
+	it('skips a configured vision server that is enabled but not actually running (one-model-at-a-time setup)', async () => {
+		global.fetch = jest.fn().mockRejectedValue(new Error('ECONNREFUSED')) as unknown as typeof fetch;
+		const textOnly = server({ id: 'text-srv', models: ['qwen3.6-35b'] });
+		const vision = server({ id: 'vision-srv', models: ['qwen3-vl-4b'] });
+		const st = state([textOnly, vision]);
+		const route = await resolveReachableVisionRoute(st, 'text-srv', 'qwen3.6-35b');
+		expect(route).toBeNull();
+	});
+
+	it('falls through to the next candidate when the first vision server is down', async () => {
+		global.fetch = jest.fn().mockImplementation((url: string) => {
+			if (String(url).includes('11435')) return Promise.reject(new Error('ECONNREFUSED'));
+			return Promise.resolve({ status: 200 });
+		}) as unknown as typeof fetch;
+		const textOnly = server({ id: 'text-srv', models: ['qwen3.6-35b'] });
+		const down = server({ id: 'down-srv', models: ['llava-7b'], baseUrl: 'http://127.0.0.1:11435/v1' });
+		const up = server({ id: 'up-srv', models: ['qwen3-vl-4b'], baseUrl: 'http://127.0.0.1:11436/v1' });
+		const st = state([textOnly, down, up]);
+		const route = await resolveReachableVisionRoute(st, 'text-srv', 'qwen3.6-35b');
+		expect(route).toEqual({ serverId: 'up-srv', model: 'qwen3-vl-4b', sameAsActive: false });
 	});
 });
 

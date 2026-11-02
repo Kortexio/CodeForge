@@ -21,7 +21,7 @@ import {
 } from '../agent/llamaSlots';
 import { runOrchestrated } from '../agent/orchestratorRun';
 import { runReviewPipeline } from '../agent/reviewPipeline';
-import { anyVisionModelAvailable, resolveVisionRoute } from '../agent/visionRouting';
+import { anyVisionModelAvailable, resolveReachableVisionRoute } from '../agent/visionRouting';
 import { SessionStore, type MessageTimings } from '../sessions/sessionStore';
 import { getApprovalPolicy, PermissionLevel } from '../policy/approvalPolicy';
 import { ensureWorkspaceIndex, getIndexedCount } from '../intelligence/workspaceIndex';
@@ -1354,11 +1354,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		// A turn with image attachments must run against an image-capable model.
 		// Resolve that automatically — same server if it already has one, otherwise
 		// the first other configured, enabled server that does — before anything
-		// below picks provider/apiKey/baseUrl/model for this call.
+		// below picks provider/apiKey/baseUrl/model for this call. A local setup
+		// commonly keeps only one model process up at a time, so the resolved
+		// server may be configured but not actually running right now: probe it
+		// and drop the image (not the whole turn) rather than fail on a server
+		// that isn't there to answer.
 		if (images.length > 0) {
 			const state = this._store.getState();
-			const route = resolveVisionRoute(state, server.id, model);
-			if (route && !route.sameAsActive) {
+			const route = await resolveReachableVisionRoute(state, server.id, model);
+			if (!route) {
+				this._pendingImages = [];
+				images = [];
+				void vscode.window.showWarningMessage(
+					'No vision-capable model is reachable right now — sending this turn without the attached image(s).'
+				);
+			} else if (!route.sameAsActive) {
 				const routed = state.servers.find(s => s.id === route.serverId);
 				if (routed) {
 					this.setPendingLiveStatus(
