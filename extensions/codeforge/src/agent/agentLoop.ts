@@ -44,7 +44,6 @@ import {
 import {
 	applySoftThinkSwitch,
 	llmSamplingOptions,
-	llmThinkingRequestFields,
 	shouldDisableThinking,
 	shouldEnableThinking,
 	splitThinkContent,
@@ -53,6 +52,16 @@ import {
 	toolAwareMaxTokens,
 	type ThinkingRoundInput,
 } from './llmThinking';
+// Plano A (multi-model harness, `feature/harness-multi-model`): per-family grammar recovery,
+// Ajv schema repair, phantom-tool-use retry and format-aware thinking fields — ported from
+// `@msf/agent-harness`. Additive: every call site below keeps its original Qwen/Hermes-shaped
+// path as the fallback when a model name matches no family in `universal/defaults.json`.
+import { recoverToolCalls as universalRecoverToolCalls } from './universal/families/registry';
+import { repairToolCallAgainstSchema } from './universal/schemaRepair';
+import { detectPhantomToolUse, shouldRetryPhantomToolUse, DEFAULT_PHANTOM_RETRY_CAP } from './universal/phantomToolUse';
+import { resolveModelFamilyProfile, type ModelFamilyProfile } from './universal/modelFamily';
+import { thinkingFields as universalThinkingFields } from './universal/thinkingFields';
+import { StreamBuffer } from './universal/streamBuffer';
 import * as lsp from '../intelligence/lspBridge';
 import * as git from '../intelligence/gitTools';
 import {
@@ -2545,7 +2554,10 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 			// Local models (Tabby/Qwen/Granite) often paste tool_calls as JSON in `content`
 			// instead of native message.tool_calls — lift them into real tool calls.
 			if (!toolCalls.length && content) {
-				const parsed = parseProseToolCalls(content);
+				const parsed = parseProseToolCalls(content, {
+					profile: resolveModelFamilyProfile({ modelId: opts.model }),
+					toolNames: roundTools.map(t => t.function.name),
+				});
 				if (parsed.length) {
 					toolCalls = parsed;
 					proseToolParseRetries = 0;
@@ -3603,8 +3615,23 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					);
 					continue;
 				}
-				const name = normalized.name;
+				let name = normalized.name;
 				args = normalized.args;
+				// Plano A: a second, Ajv-driven repair pass against the tool's real JSON Schema —
+				// catches shapes `normalizeToolCall` above does not (stringified nested
+				// arrays/objects, numeric/boolean strings, a mangled tool name) — only applied
+				// when the repair actually lands on a schema-valid result.
+				const schemaFix = repairToolCallAgainstSchema({
+					toolName: name,
+					args,
+					schema: agentToolSchemas[name] as unknown as Record<string, unknown> | undefined,
+					activeToolNames,
+				});
+				if (schemaFix.valid && schemaFix.appliedRules.length) {
+					name = schemaFix.name;
+					args = schemaFix.args;
+					toolAdvice.push(`(auto-repaired arguments: ${schemaFix.appliedRules.join(', ')})`);
+				}
 				if (!isExploreToolName(name)) {
 					await flushLane();
 				}
@@ -5100,6 +5127,10 @@ async function postAgentRound(
 	const withTools = !opts.proseToolsOnly && tools.length > 0 && toolChoice !== 'none';
 	const toolRoundThinking = opts.modelProfile?.thinking?.toolRounds === true;
 	const thinkingSupported = opts.modelProfile?.thinking?.supported;
+	// Plano A: resolved purely from `opts.model`'s name today (no settings-schema change yet) —
+	// `undefined` when nothing matches, in which case `universalThinkingFields` below falls back
+	// to the original `llmThinkingRequestFields(thinkInput)` call unchanged.
+	const familyProfile = resolveModelFamilyProfile({ modelId: opts.model });
 	const thinkInput: ThinkingRoundInput & { tools?: typeof AGENT_TOOLS } = {
 		model: opts.model,
 		thinkingSupported,
@@ -5150,6 +5181,11 @@ async function postAgentRound(
 		opts.proseToolsOnly || tools.length === 0
 			? {}
 			: { tools, tool_choice: toolChoice };
+	// Plano A: a profiled family may flag its streaming tool-call parser as fragile
+	// (`ModelFamilyProfile.preferNonStreamTools`) — buffer the whole reply instead when this
+	// round actually offers tools. `readChatCompletionResponse` already branches on the real
+	// response content-type, so a buffered JSON reply needs no further changes downstream.
+	const useStream = !(withTools && familyProfile?.preferNonStreamTools);
 
 	let response = await fetch(openaiUrl, {
 		method: 'POST',
@@ -5166,12 +5202,12 @@ async function postAgentRound(
 			top_p: sampling.top_p,
 			...samplingExtras,
 			max_tokens: cappedTokens,
-			stream: true,
-			stream_options: { include_usage: true },
+			stream: useStream,
+			...(useStream ? { stream_options: { include_usage: true } } : {}),
 			...toolPayload,
 			...llmContextOptions(getContextBudget(opts.numCtx)),
 			...llmJsonOptions(opts.forceJson),
-			...llmThinkingRequestFields(thinkInput),
+			...universalThinkingFields(familyProfile?.thinkingFormat, thinkInput),
 		}),
 	});
 	// Some gateways reject tool_choice:none — fall back to empty tools once.
@@ -5197,7 +5233,7 @@ async function postAgentRound(
 					stream_options: { include_usage: true },
 					...llmContextOptions(getContextBudget(opts.numCtx)),
 					...llmJsonOptions(opts.forceJson),
-					...llmThinkingRequestFields({
+					...universalThinkingFields(familyProfile?.thinkingFormat, {
 						model: opts.model,
 						thinkingSupported,
 						planMode: !!opts.planMode,
@@ -5215,14 +5251,18 @@ async function postAgentRound(
 	}
 	try {
 		let lastUi = 0;
-		const data = await readChatCompletionResponse(response, partial => {
-			// Stream visible prose into the pending bubble; skip tool-JSON spam.
-			if (!partial || looksLikeToolJson(partial)) return;
-			const now = Date.now();
-			if (now - lastUi < 60 && partial.length < 40) return;
-			lastUi = now;
-			opts.onStatus?.(partial);
-		});
+		const data = await readChatCompletionResponse(
+			response,
+			partial => {
+				// Stream visible prose into the pending bubble; skip tool-JSON spam.
+				if (!partial || looksLikeToolJson(partial)) return;
+				const now = Date.now();
+				if (now - lastUi < 60 && partial.length < 40) return;
+				lastUi = now;
+				opts.onStatus?.(partial);
+			},
+			{ profile: familyProfile, toolNames: tools.map(t => t.function.name) }
+		);
 		return { ok: true, status: 200, errorText: '', data };
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
@@ -5287,7 +5327,8 @@ function pickServerTimings(raw: unknown): ServerLlmTimings | undefined {
  */
 async function readChatCompletionResponse(
 	response: Response,
-	onDelta?: (contentSoFar: string) => void
+	onDelta?: (contentSoFar: string) => void,
+	recovery?: FamilyRecoveryContext
 ): Promise<ChatCompletionData> {
 	const ctype = (response.headers.get('content-type') || '').toLowerCase();
 	const canStream =
@@ -5301,27 +5342,28 @@ async function readChatCompletionResponse(
 	if (canStream && response.body) {
 		// Do not fall through to response.text(): the stream reader already
 		// consumed the body, and a second read hides the real failure.
-		return await streamSseChatCompletion(response.body, onDelta);
+		return await streamSseChatCompletion(response.body, onDelta, recovery);
 	}
 
 	const text = await response.text();
 	const trimmed = text.trim();
 	if (trimmed.startsWith('data:') || trimmed.startsWith(':')) {
-		const data = aggregateSseChatCompletion(trimmed);
+		const data = aggregateSseChatCompletion(trimmed, recovery);
 		if (data.choices?.[0]?.message?.content) {
 			onDelta?.(String(data.choices[0].message.content));
 		}
 		return data;
 	}
 	const parsed = JSON.parse(text) as ChatCompletionData & { timings?: unknown };
-	const lifted = liftProseToolsFromCompletion(parsed);
+	const lifted = liftProseToolsFromCompletion(parsed, recovery);
 	const timings = pickServerTimings(parsed.timings) ?? lifted.timings;
 	return timings ? { ...lifted, timings } : lifted;
 }
 
 async function streamSseChatCompletion(
 	body: ReadableStream<Uint8Array>,
-	onDelta?: (contentSoFar: string) => void
+	onDelta?: (contentSoFar: string) => void,
+	recovery?: FamilyRecoveryContext
 ): Promise<ChatCompletionData> {
 	const reader = body.getReader();
 	const decoder = new TextDecoder();
@@ -5341,6 +5383,21 @@ async function streamSseChatCompletion(
 
 	const markFirstToken = () => {
 		if (firstTokenAt === undefined) firstTokenAt = Date.now();
+	};
+
+	// Plano A: hold back a short tail of the live UI preview so a family marker split across
+	// SSE chunks (`<tool_c` | `all>`) never flashes half-formed in `opts.onStatus`. `content`
+	// itself (used for the final parse once the stream ends) always keeps every character —
+	// only what we hand to `onDelta` as-we-go is buffered.
+	const previewBuffer = new StreamBuffer();
+	let shownContent = '';
+	const emitPreview = (delta: string) => {
+		if (!onDelta) return;
+		const safe = previewBuffer.push(delta);
+		if (safe) {
+			shownContent += safe;
+			onDelta(shownContent);
+		}
 	};
 
 	const appendReasoning = (raw: unknown) => {
@@ -5395,7 +5452,7 @@ async function streamSseChatCompletion(
 			if (choice.message.content) {
 				content += choice.message.content;
 				markFirstToken();
-				if (!sawToolDelta) onDelta?.(content);
+				if (!sawToolDelta) emitPreview(choice.message.content);
 			}
 			appendReasoning(choice.message.reasoning_content);
 			appendReasoning(choice.message.reasoning);
@@ -5422,7 +5479,7 @@ async function streamSseChatCompletion(
 		if (typeof delta.content === 'string' && delta.content) {
 			content += delta.content;
 			markFirstToken();
-			if (!sawToolDelta) onDelta?.(content);
+			if (!sawToolDelta) emitPreview(delta.content);
 		}
 		appendReasoning(delta.reasoning_content);
 		appendReasoning(delta.reasoning);
@@ -5459,6 +5516,10 @@ async function streamSseChatCompletion(
 		const trimmed = buffer.trim();
 		if (trimmed.startsWith('data:')) applyChunk(trimmed.slice(5).trim());
 	}
+	if (!sawToolDelta) {
+		const rest = previewBuffer.flush();
+		if (rest) onDelta?.(shownContent + rest);
+	}
 
 	const generationMs =
 		firstTokenAt !== undefined ? Math.max(1, Date.now() - firstTokenAt) : undefined;
@@ -5469,7 +5530,7 @@ async function streamSseChatCompletion(
 		.filter(t => t.function.name);
 
 	if (!tool_calls.length && content.trim()) {
-		const lifted = parseProseToolCalls(content);
+		const lifted = parseProseToolCalls(content, recovery);
 		if (lifted.length) {
 			return {
 				choices: [
@@ -5486,22 +5547,25 @@ async function streamSseChatCompletion(
 		}
 	}
 
-	return liftProseToolsFromCompletion({
-		choices: [
-			{
-				message: {
-					content: content || null,
-					tool_calls: tool_calls.length ? tool_calls : undefined,
-					...(reasoning ? { reasoning_content: reasoning } : {}),
+	return liftProseToolsFromCompletion(
+		{
+			choices: [
+				{
+					message: {
+						content: content || null,
+						tool_calls: tool_calls.length ? tool_calls : undefined,
+						...(reasoning ? { reasoning_content: reasoning } : {}),
+					},
+					finish_reason: finishReason,
+					stop_reason: stopReason,
 				},
-				finish_reason: finishReason,
-				stop_reason: stopReason,
-			},
-		],
-		usage,
-		timings,
-		generationMs,
-	});
+			],
+			usage,
+			timings,
+			generationMs,
+		},
+		recovery
+	);
 }
 
 /**
@@ -5538,14 +5602,14 @@ function coerceMessageContent(raw: unknown): string {
 }
 
 /** Lift prose {"tool_calls":[...]} from content into native tool_calls when missing. */
-function liftProseToolsFromCompletion(data: ChatCompletionData): ChatCompletionData {
+function liftProseToolsFromCompletion(data: ChatCompletionData, recovery?: FamilyRecoveryContext): ChatCompletionData {
 	const choice = data.choices?.[0];
 	const msg = choice?.message;
 	if (!msg) return data;
 	if (msg.tool_calls?.length) return data;
 	const text = coerceMessageContent(msg.content).trim();
 	if (!text) return data;
-	const lifted = parseProseToolCalls(text);
+	const lifted = parseProseToolCalls(text, recovery);
 	if (!lifted.length) return data;
 	return {
 		...data,
@@ -5562,7 +5626,7 @@ function liftProseToolsFromCompletion(data: ChatCompletionData): ChatCompletionD
 	};
 }
 
-function aggregateSseChatCompletion(raw: string): ChatCompletionData {
+function aggregateSseChatCompletion(raw: string, recovery?: FamilyRecoveryContext): ChatCompletionData {
 	let content = '';
 	let reasoning = '';
 	const toolMap = new Map<
@@ -5674,7 +5738,7 @@ function aggregateSseChatCompletion(raw: string): ChatCompletionData {
 
 	// If the model streamed tool JSON only into content (no native tool_calls deltas)
 	if (!tool_calls.length && content.trim()) {
-		const lifted = parseProseToolCalls(content);
+		const lifted = parseProseToolCalls(content, recovery);
 		if (lifted.length) {
 			return {
 				choices: [
@@ -6037,9 +6101,13 @@ async function runProseToolFallback(
 		throw new Error(`LLM error ${response.status}: ${await response.text()}`);
 	}
 
-	const data = await readChatCompletionResponse(response);
+	const recovery: FamilyRecoveryContext = {
+		profile: resolveModelFamilyProfile({ modelId: opts.model }),
+		toolNames: actions,
+	};
+	const data = await readChatCompletionResponse(response, undefined, recovery);
 	const text = data.choices?.[0]?.message?.content ?? '';
-	const calls = parseProseToolCalls(text);
+	const calls = parseProseToolCalls(text, recovery);
 
 	if (!calls.length) {
 		return text || '(empty)';
@@ -6431,7 +6499,18 @@ function splitGluedJsonValues(text: string): string[] {
 	return out;
 }
 
-export function parseProseToolCalls(text: string): ToolCall[] {
+/**
+ * Plano A: the per-family grammar context a `parseProseToolCalls` caller may supply so a
+ * non-Qwen leaked tool-call shape (Kimi sentinels, Mistral `[TOOL_CALLS]`, Harmony channels…)
+ * gets one more recovery attempt when every pre-existing JSON/XML heuristic below finds
+ * nothing. Omitted (the default at most call sites) — this function's behavior is unchanged.
+ */
+export interface FamilyRecoveryContext {
+	profile?: ModelFamilyProfile;
+	toolNames?: Iterable<string>;
+}
+
+export function parseProseToolCalls(text: string, recovery?: FamilyRecoveryContext): ToolCall[] {
 	const cleaned = stripMarkdownFences(stripThinkForProtocol(text));
 	const span = extractJsonObjectSpan(cleaned) ?? cleaned;
 
@@ -6636,6 +6715,22 @@ export function parseProseToolCalls(text: string): ToolCall[] {
 	// Qwen/Hermes XML tool markup → native tool_calls
 	const fromXml = parseXmlToolCalls(cleaned);
 	if (fromXml.length) return fromXml;
+
+	// Plano A: one more pass through the profiled model's own family grammars (Kimi sentinels,
+	// Mistral `[TOOL_CALLS]`, Harmony channels, DeepSeek-R1/GLM/Granite/… — see
+	// `universal/families/`) for shapes none of the heuristics above recognize. No-op unless the
+	// caller resolved a family profile and passed the tools actually offered this turn.
+	const familyNames = recovery?.toolNames ? new Set(recovery.toolNames) : undefined;
+	if (familyNames?.size && recovery?.profile?.grammars.length) {
+		const recovered = universalRecoverToolCalls({
+			text: cleaned,
+			toolNames: familyNames,
+			hasNativeToolCalls: false,
+			families: recovery.profile.grammars,
+			mode: recovery.profile.mode,
+		});
+		if (recovered.calls.length) return recovered.calls;
+	}
 
 	return [];
 }

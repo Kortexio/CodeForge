@@ -1,0 +1,130 @@
+{
+  "profiles": [
+    {
+      "id": "qwen",
+      "match": ["qwen", "qwq", "hermes"],
+      "grammars": ["qwen"],
+      "mode": "recover",
+      "searchReasoning": false,
+      "thinkingFormat": "qwen"
+    },
+    {
+      "id": "deepseek-r1",
+      "match": ["deepseek-r1", "deepseek r1"],
+      "grammars": ["deepseek-r1", "qwen"],
+      "mode": "recover",
+      "searchReasoning": true,
+      "thinkingFormat": "deepseek"
+    },
+    {
+      "id": "deepseek-dsml",
+      "match": ["deepseek-v3", "deepseek-v4", "deepseek-chat", "deepseek"],
+      "grammars": ["dsml", "deepseek-r1"],
+      "mode": "recover",
+      "searchReasoning": true,
+      "thinkingFormat": "deepseek",
+      "anchorBleed": false
+    },
+    {
+      "id": "gemma4",
+      "match": ["gemma-4", "gemma4", "gemma-3n"],
+      "grammars": ["gemma4"],
+      "mode": "recover",
+      "searchReasoning": false,
+      "thinkingFormat": "none"
+    },
+    {
+      "id": "harmony",
+      "match": ["gpt-oss", "gpt_oss"],
+      "grammars": ["harmony"],
+      "mode": "recover",
+      "searchReasoning": false,
+      "thinkingFormat": "openai"
+    },
+    {
+      "id": "mistral",
+      "match": ["mistral", "ministral", "mixtral", "magistral"],
+      "grammars": ["mistral"],
+      "mode": "recover",
+      "searchReasoning": false,
+      "thinkingFormat": "none",
+      "toolCallIdFormat": "mistral9"
+    },
+    {
+      "id": "llama",
+      "match": ["llama-3", "llama3", "llama-4", "llama4"],
+      "grammars": ["llama"],
+      "mode": "recover",
+      "searchReasoning": false,
+      "thinkingFormat": "none"
+    },
+    {
+      "id": "kimi",
+      "match": ["kimi"],
+      "grammars": ["kimi"],
+      "mode": "recover",
+      "searchReasoning": true,
+      "thinkingFormat": "none",
+      "toolCallIdFormat": "kimi",
+      "anchorBleed": true
+    },
+    {
+      "id": "glm",
+      "match": ["glm-4", "glm-5", "chatglm", "zai"],
+      "grammars": ["glm"],
+      "mode": "recover",
+      "searchReasoning": false,
+      "thinkingFormat": "chat-template",
+      "anchorBleed": true
+    },
+    {
+      "id": "granite",
+      "match": ["granite"],
+      "grammars": ["granite"],
+      "mode": "recover",
+      "searchReasoning": false,
+      "thinkingFormat": "none"
+    },
+    {
+      "id": "minimax",
+      "match": ["minimax-m", "minimax m"],
+      "grammars": ["minimax"],
+      "mode": "recover",
+      "searchReasoning": false,
+      "thinkingFormat": "none",
+      "anchorBleed": true
+    },
+    {
+      "id": "minimax-text",
+      "match": ["minimax-text"],
+      "grammars": ["minimax-text"],
+      "mode": "recover",
+      "searchReasoning": false,
+      "thinkingFormat": "none"
+    },
+    {
+      "id": "olmo",
+      "match": ["olmo"],
+      "grammars": ["olmo"],
+      "mode": "recover",
+      "searchReasoning": false,
+      "thinkingFormat": "none"
+    },
+    {
+      "id": "phi4",
+      "match": ["phi-4", "phi4"],
+      "grammars": ["phi4"],
+      "mode": "recover",
+      "searchReasoning": false,
+      "thinkingFormat": "none"
+    },
+    {
+      "id": "claude-invoke",
+      "match": ["claude", "anthropic"],
+      "grammars": ["minimax"],
+      "mode": "strip",
+      "searchReasoning": false,
+      "thinkingFormat": "none"
+    }
+  ]
+}
