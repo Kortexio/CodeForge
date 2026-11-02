@@ -20,7 +20,7 @@ const TASKS = [
 	'CS3-nav-vip-rate',
 ];
 const FIXTURES = ['shop', 'billing'];
-const ROOT_FILES = ['bench.mjs', 'headlessAgent.mjs', 'layout.mjs'];
+const ROOT_FILES = ['bench.mjs', 'headlessAgent.mjs', 'layout.mjs', 'externalAgents.mjs'];
 
 function rmrf(dir) {
 	fs.rmSync(dir, { recursive: true, force: true });

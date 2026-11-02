@@ -8,6 +8,8 @@
  *   node benchmarks/bench.mjs report
  *   node benchmarks/bench.mjs selftest
  *   node benchmarks/bench.mjs run T1 --label baseline-qwen35b [--server id] [--model id] [--weak on|off]
+ *   node benchmarks/bench.mjs run-external CS5 --agent aider|openhands [--timeoutMin 60]
+ *   node benchmarks/bench.mjs suite --agent codeforge|aider|openhands --tasks CS4,CS5,CS6 --reps 5
  *
  * Runs live in %USERPROFILE%/codeforge-bench (override with CODEFORGE_BENCH_DIR).
  * Headless `run` uses the active server/model from ~/.CodeForge/ai/settings.json.
@@ -19,6 +21,7 @@ import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { resolveBenchLayout } from './layout.mjs';
+import { EXTERNAL_AGENTS, externalAgentVersion, runExternalAgent } from './externalAgents.mjs';
 
 const LAYOUT = resolveBenchLayout();
 const HERE = LAYOUT.here;
@@ -855,6 +858,199 @@ function cmdRun(taskKey, flags) {
 	fs.writeFileSync(resultPath, JSON.stringify(merged, null, 2));
 	console.log(`Merged headless metrics → results/${meta.name}.json`);
 	return merged;
+}
+
+/**
+ * Same task, model and server as `run`, driven by a baseline agent (aider | openhands).
+ * Scored by the same `cmdCheck`; session metrics stay empty because there is no CodeForge session.
+ */
+async function cmdRunExternal(taskKey, flags) {
+	const agent = String(flags.agent || '');
+	if (!EXTERNAL_AGENTS[agent]) die(`run-external needs --agent ${Object.keys(EXTERNAL_AGENTS).join('|')}`);
+	const { server, model } = benchServer(flags);
+	if (!model) die('run-external needs --model <id> (or an active model in settings)');
+	const task = findTask(taskKey);
+	const label = String(flags.label || agent).replace(/[^\w.-]+/g, '_');
+	const meta = cmdSetup(task.id, { ...flags, label, quiet: true });
+	const prompt = fs.readFileSync(path.join(RUNS_ROOT, `${meta.name}.prompt.txt`), 'utf8');
+	const logDir = path.join(RESULTS_DIR, meta.name);
+	const numCtx = Number(process.env.CODEFORGE_BENCH_NUM_CTX) || Number(server.numCtx) || 32768;
+	const timeoutMs = Number(flags.timeoutMin || 60) * 60_000;
+	console.log(`External run ${meta.name} (${agent})…`);
+	let ext;
+	try {
+		ext = await runExternalAgent(agent, {
+			workspace: meta.dir,
+			task,
+			prompt,
+			baseUrl: String(server.baseUrl).replace(/\/+$/, ''),
+			apiKey: server.apiKey || '',
+			model,
+			numCtx,
+			logDir,
+			timeoutMs,
+		});
+	} catch (err) {
+		const reason = err instanceof Error ? err.message : String(err);
+		if (!flags.softFail) die(reason);
+		return { pass: false, score: 0, notRun: true, infrastructureError: true, reason, loopExit: 'error', task: task.id, run: meta.name };
+	}
+	const scored = cmdCheck(meta.name, { save: true, print: true });
+	const merged = {
+		...scored,
+		runtime: `external:${agent}`,
+		model,
+		server: server.id,
+		agent: ext.agent,
+		agentVersion: ext.agentVersion,
+		loopExit: ext.loopExit,
+		exitCode: ext.exitCode,
+		elapsedMs: ext.elapsedMs,
+		verifyCommand: ext.verifyCommand,
+		preloadedFiles: ext.preloadedFiles,
+		agentLog: ext.log,
+		// No CodeForge session, so there is no final reply to test for a green claim.
+		falseDone: null,
+		replyTail: ext.replyTail,
+	};
+	fs.writeFileSync(path.join(RESULTS_DIR, `${meta.name}.json`), JSON.stringify(merged, null, 2));
+	console.log(`  exit          ${ext.loopExit} (code ${ext.exitCode}) · ${Math.round(ext.elapsedMs / 60000)} min · ${ext.agentVersion}`);
+	console.log(`Merged external metrics → results/${meta.name}.json`);
+	return merged;
+}
+
+function suiteStats(rows) {
+	const scored = rows.filter(r => !r.notRun);
+	const scores = scored.map(r => Number(r.score) || 0);
+	const n = scores.length;
+	const mean = n ? scores.reduce((a, b) => a + b, 0) / n : null;
+	const sd = n > 1 ? Math.sqrt(scores.reduce((s, x) => s + (x - mean) ** 2, 0) / (n - 1)) : n ? 0 : null;
+	const exits = {};
+	for (const r of scored) exits[r.loopExit || 'unknown'] = (exits[r.loopExit || 'unknown'] || 0) + 1;
+	return {
+		n,
+		notRun: rows.length - n,
+		mean: mean === null ? null : Math.round(mean * 10) / 10,
+		sd: sd === null ? null : Math.round(sd * 10) / 10,
+		min: n ? Math.min(...scores) : null,
+		max: n ? Math.max(...scores) : null,
+		passes: scored.filter(r => r.pass).length,
+		falseDone: scored.filter(r => r.falseDone === true).length,
+		exits,
+		scores,
+	};
+}
+
+/**
+ * Run a task list × reps with one agent and write a summary next to the per-run results.
+ * CodeForge runs with an empty learned harness (contract + finish gates only).
+ */
+async function cmdSuite(flags) {
+	const agent = String(flags.agent || 'codeforge');
+	if (agent !== 'codeforge' && !EXTERNAL_AGENTS[agent]) {
+		die(`suite --agent must be codeforge|${Object.keys(EXTERNAL_AGENTS).join('|')}`);
+	}
+	const tasks = String(flags.tasks || 'CS4,CS5,CS6')
+		.split(',')
+		.map(s => s.trim())
+		.filter(Boolean)
+		.map(k => findTask(k).id);
+	const reps = Math.max(1, Number(flags.reps || 5));
+	const { slotCtx, model: alias } = await verifyServerConfig(flags);
+	const { server, model } = benchServer(flags);
+	let agentVersion = 'codeforge (workspace build)';
+	if (agent !== 'codeforge') {
+		const v = externalAgentVersion(agent);
+		if (v.error) die(v.error);
+		agentVersion = v.version;
+	} else if (!flags.skipBuild && !LAYOUT.packaged) {
+		const compile = spawnSync('npm', ['run', 'build:extensions'], {
+			cwd: LAYOUT.repoRoot,
+			encoding: 'utf8',
+			shell: true,
+			timeout: 300_000,
+		});
+		if (compile.status !== 0) die(`build:extensions failed:\n${compile.stdout}\n${compile.stderr}`);
+	}
+	const stamp = new Date().toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 15);
+	const labelBase = String(flags.label || `suite-${agent}-${stamp}`).replace(/[^\w.-]+/g, '_');
+	const summaryPath = path.join(RESULTS_DIR, `${labelBase}.summary.json`);
+	const emptyHarness = path.join(os.tmpdir(), 'codeforge-empty-harness.json');
+	if (agent === 'codeforge') {
+		fs.writeFileSync(
+			emptyHarness,
+			JSON.stringify({ version: 1, revision: 0, sections: {}, knobs: {}, history: [] }, null, 2)
+		);
+	}
+	const header = {
+		agent,
+		agentVersion,
+		model,
+		modelAlias: alias,
+		server: server.id,
+		slotCtx,
+		tasks,
+		reps,
+		timeoutMin: Number(flags.timeoutMin || 60),
+		startedAt: new Date().toISOString(),
+	};
+	const rows = [];
+	const writeSummary = done => {
+		const byTask = {};
+		for (const t of tasks) byTask[t.split('-')[0]] = suiteStats(rows.filter(r => r.task === t));
+		fs.mkdirSync(RESULTS_DIR, { recursive: true });
+		fs.writeFileSync(
+			summaryPath,
+			JSON.stringify({ ...header, ...(done ? { finishedAt: new Date().toISOString() } : { inProgress: true }), byTask, rows }, null, 2)
+		);
+		return byTask;
+	};
+	for (let rep = 1; rep <= reps; rep++) {
+		for (const task of tasks) {
+			console.log(`\n=== suite ${agent} ${task} rep ${rep}/${reps} (${labelBase}) ===`);
+			const label = `${labelBase}-r${rep}`;
+			let r;
+			try {
+				r =
+					agent === 'codeforge'
+						? cmdRun(task, {
+								...flags,
+								label,
+								model,
+								server: server.id,
+								skipBuild: true,
+								disableHysteresis: true,
+								softFail: true,
+								weak: flags.weak ?? 'on',
+								harnessFile: emptyHarness,
+							})
+						: await cmdRunExternal(task, { ...flags, agent, label, model, server: server.id, softFail: true });
+			} catch (err) {
+				r = { pass: false, score: 0, notRun: true, infrastructureError: true, reason: String(err?.message || err) };
+			}
+			rows.push({
+				task,
+				rep,
+				run: r.run || null,
+				score: r.score,
+				pass: !!r.pass,
+				falseDone: r.falseDone ?? null,
+				loopExit: r.loopExit || null,
+				elapsedMs: r.elapsedMs ?? null,
+				hidden: r.review ? { f1: r.review.f1 } : r.hidden ? { pass: r.hidden.pass, fail: r.hidden.fail, cards: r.hidden.cards?.map(c => `${c.card} ${c.pass}/${c.pass + c.fail}`) } : null,
+				...(r.notRun ? { notRun: true, reason: r.reason || 'agent did not run' } : {}),
+			});
+			writeSummary(false);
+		}
+	}
+	const byTask = writeSummary(true);
+	console.log(`\nSuite ${labelBase} (${agentVersion} · ${model})`);
+	for (const [t, s] of Object.entries(byTask)) {
+		console.log(
+			`  ${t.padEnd(5)} mean ${s.mean ?? '-'} ± ${s.sd ?? '-'}  pass ${s.passes}/${s.n}  notRun ${s.notRun}  exits ${JSON.stringify(s.exits)}  scores ${s.scores.join(' ')}`
+		);
+	}
+	console.log(`Summary → ${summaryPath}`);
 }
 
 function cmdSelftest(filter) {
@@ -2075,6 +2271,20 @@ switch (pos[0]) {
 				process.exit(1);
 			});
 		break;
+	case 'run-external':
+		verifyServerConfig(flags)
+			.then(() => cmdRunExternal(pos[1], flags))
+			.catch(err => {
+				console.error(err instanceof Error ? err.message : err);
+				process.exit(1);
+			});
+		break;
+	case 'suite':
+		cmdSuite(flags).catch(err => {
+			console.error(err instanceof Error ? err.message : err);
+			process.exit(1);
+		});
+		break;
 	case 'calibrate':
 		cmdCalibrate(flags).catch(err => {
 			console.error(err instanceof Error ? err.message : err);
@@ -2095,6 +2305,6 @@ switch (pos[0]) {
 		break;
 	default:
 		console.log(
-			'Usage: node benchmarks/bench.mjs <list | setup <task> --label <name> [--open] | check [run|latest] | report | selftest [CS] | run <task> --label <name> | calibrate [--model m | --weak-model m --strong-model m] [--reps n] | revise [--model m] [--reps n] [--tasks T2,T4] [--holdout CS2,CS3] [--steps k] [--harnessFile path] | transfer --harnessFile path [--tasks CS2,CS3] [--reps n] [--from tag]>'
+			'Usage: node benchmarks/bench.mjs <list | setup <task> --label <name> [--open] | check [run|latest] | report | selftest [CS] | run <task> --label <name> | run-external <task> --agent aider|openhands [--timeoutMin 60] | suite [--agent codeforge|aider|openhands] [--tasks CS4,CS5,CS6] [--reps 5] [--timeoutMin 60] | calibrate [--model m | --weak-model m --strong-model m] [--reps n] | revise [--model m] [--reps n] [--tasks T2,T4] [--holdout CS2,CS3] [--steps k] [--harnessFile path] | transfer --harnessFile path [--tasks CS2,CS3] [--reps n] [--from tag]>'
 		);
 }
