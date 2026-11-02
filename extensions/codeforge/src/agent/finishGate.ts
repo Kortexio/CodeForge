@@ -32,12 +32,19 @@ export function isReadOnlyShellCommand(command: string): boolean {
 	return READ_ONLY_SHELL_RE.test(c);
 }
 
-export function isEffectfulTool(name: string, command?: string): boolean {
+/** Profile list when set, otherwise the built-in set. An empty declared list is ignored. */
+export function resolveEffectfulTools(declared?: readonly string[]): Set<string> {
+	return new Set(declared?.length ? declared : EFFECTFUL_TOOLS);
+}
+
+export function isEffectfulTool(name: string, command?: string, declared?: ReadonlySet<string>): boolean {
+	const set = declared ?? EFFECTFUL_TOOLS;
 	if (name === 'shell' || name === 'dotnet') {
+		if (!set.has(name)) return false;
 		if (command !== undefined && isReadOnlyShellCommand(command)) return false;
 		return true;
 	}
-	return EFFECTFUL_TOOLS.has(name);
+	return set.has(name);
 }
 
 export type DiagFinishGateInput = {

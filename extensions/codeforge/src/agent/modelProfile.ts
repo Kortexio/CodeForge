@@ -7,6 +7,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { modelProfileDir } from '../storage/paths';
 import { applyOnlineHysteresis } from './profileHysteresis';
+import { EFFECTFUL_TOOLS } from './finishGate';
 
 export type ModelProfile = {
 	version: 1;
@@ -60,6 +61,11 @@ export type ModelProfile = {
 		maxDiagFinishNudges: number;
 		specSelfCheckMaxNudges: number;
 		specSelfCheckEnabled: boolean;
+		/**
+		 * Plano B: tools that count as an effect for the diagnose-only finish gate.
+		 * Default is the set the gate used when the list lived in code.
+		 */
+		effectfulTools: string[];
 	};
 	prompt: {
 		renameSearchRule: boolean;
@@ -125,6 +131,7 @@ export function defaultModelProfile(serverId = '', model = ''): ModelProfile {
 			maxDiagFinishNudges: 2,
 			specSelfCheckMaxNudges: 1,
 			specSelfCheckEnabled: true,
+			effectfulTools: [...EFFECTFUL_TOOLS],
 		},
 		prompt: {
 			renameSearchRule: true,

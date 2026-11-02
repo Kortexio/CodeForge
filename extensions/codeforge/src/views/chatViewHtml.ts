@@ -648,10 +648,12 @@ export function getChatViewHtml(assets: ChatViewAssets): string {
       sendButton.className = 'stop';
       sendButton.textContent = '■';
       sendButton.title = 'Stop';
+      input.placeholder = 'Enter steers now · Ctrl+Enter queues a follow-up';
     } else {
       sendButton.className = 'send';
       sendButton.textContent = '↑';
       sendButton.title = 'Send';
+      input.placeholder = 'Plan, @ for context, / for commands';
     }
     busyToast.classList.toggle('visible', !!busy);
   }
@@ -661,8 +663,9 @@ export function getChatViewHtml(assets: ChatViewAssets): string {
     queuePanel.classList.toggle('visible', queuedItems.length > 0);
     queueCount.textContent = String(queuedItems.length);
     queueList.innerHTML = queuedItems.map(function (item, i) {
+      var tag = item.kind === 'steer' ? 'steer' : 'follow-up';
       return '<div class="queue-item"><span class="idx">' + (i + 1) + '</span>' +
-        '<span class="qtext">' + escapeHtml(item.text) + '</span>' +
+        '<span class="qtext"><b>' + tag + '</b> · ' + escapeHtml(item.text) + '</span>' +
         '<button type="button" data-id="' + escapeHtml(item.id) + '" title="Remove">×</button></div>';
     }).join('');
     queueList.querySelectorAll('.queue-item button').forEach(function (btn) {
@@ -732,6 +735,14 @@ export function getChatViewHtml(assets: ChatViewAssets): string {
   function sendOrStop() {
     if (busy) { vscode.postMessage({ type: 'cancel' }); return; }
     sendMessage();
+  }
+  function steerOrFollow(kind) {
+    var text = input.value.trim();
+    if (!busy) { sendMessage(); return; }
+    if (!text) { vscode.postMessage({ type: 'cancel' }); return; }
+    vscode.postMessage({ type: kind === 'followup' ? 'followUp' : 'steer', text: text, mode: mode });
+    input.value = '';
+    hideSlash();
   }
   function sendMessage() {
     const text = input.value.trim();
@@ -866,7 +877,8 @@ export function getChatViewHtml(assets: ChatViewAssets): string {
     }
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
-      sendOrStop();
+      if (busy && (e.ctrlKey || e.metaKey)) steerOrFollow('followup');
+      else steerOrFollow('steer');
     }
   });
   input.addEventListener('input', updateSlashFromInput);

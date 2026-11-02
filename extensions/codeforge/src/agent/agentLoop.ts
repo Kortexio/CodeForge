@@ -56,6 +56,7 @@ import {
 // Ajv schema repair, phantom-tool-use retry and format-aware thinking fields — ported from
 // `@msf/agent-harness`. Additive: every call site below keeps its original Qwen/Hermes-shaped
 // path as the fallback when a model name matches no family in `universal/defaults.json`.
+import { batchRunsInParallel, batchTerminates, finishAgentTurn, prepareAgentRound } from './agentLoopHooks';
 import { recoverToolCalls as universalRecoverToolCalls } from './universal/families/registry';
 import { repairToolCallAgainstSchema } from './universal/schemaRepair';
 import { detectPhantomToolUse, shouldRetryPhantomToolUse, DEFAULT_PHANTOM_RETRY_CAP } from './universal/phantomToolUse';
@@ -135,6 +136,7 @@ import {
 	countsAsRuntimeObserve,
 	isEffectfulTool,
 	shouldRefuseDiagFinish,
+	resolveEffectfulTools,
 	shouldRequestRuntimeVerify,
 	shouldRequestSpecSelfCheck,
 } from './finishGate';
@@ -1354,6 +1356,8 @@ export interface AgentLoopOptions {
 		tokensPerSecond?: number;
 		reasoning?: string;
 	}) => void;
+	/** Plano B: steering notes typed during this turn. Drained once per model round. */
+	drainSteering?: () => string[];
 	/** User-turn index for tool traces (0-based). */
 	turnIndex?: number;
 	onTaskUpdate?: (update: {
@@ -1762,6 +1766,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 	let diagFinishNudges = 0;
 	/** Successful effectful tools this run (edit/shell/browser act/…). */
 	let effectfulCount = 0;
+	const effectfulTools = resolveEffectfulTools(modelProfile.finish.effectfulTools);
 	/** Any tool executed this run (incl. explore-only). */
 	let anyToolCount = 0;
 	/** Browser actions that reported UI changed (checkpoint progress). */
@@ -2264,10 +2269,16 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 				keepReasoningThisTurn = true;
 				emitProtocol('escalatedRounds', '1');
 			}
+			const preparedRound = prepareAgentRound({
+				messages,
+				keepReasoning: keepReasoningThisTurn,
+				drainSteering: opts.drainSteering,
+				sanitize: sanitizeMessages,
+			});
 			const round = await postAgentRound(
 				opts,
 				url,
-				sanitizeMessages(messages, keepReasoningThisTurn),
+				preparedRound.outbound,
 				roundMaxTokens,
 				roundTools,
 				'auto',
@@ -2725,17 +2736,19 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 				const blocked = parseBlockedClaim(summary);
 				// Exploration-only then prose: refuse finish (structural tool counts — not user-phrase matchers).
 				if (
-					shouldRefuseDiagFinish({
-						planMode: opts.planMode,
-						askMode: opts.askMode,
-						coachMode: opts.coachMode,
-						statusQuestion,
-						blocked: !!blocked,
-						effectfulCount,
-						anyToolCount,
-						diagFinishNudges,
-						maxDiagFinishNudges: modelProfile.finish.maxDiagFinishNudges,
-					}) &&
+					finishAgentTurn({
+						refuseDiag: shouldRefuseDiagFinish({
+							planMode: opts.planMode,
+							askMode: opts.askMode,
+							coachMode: opts.coachMode,
+							statusQuestion,
+							blocked: !!blocked,
+							effectfulCount,
+							anyToolCount,
+							diagFinishNudges,
+							maxDiagFinishNudges: modelProfile.finish.maxDiagFinishNudges,
+						}),
+					}) === 'continue' &&
 					step + 1 < stepBudget
 				) {
 					diagFinishNudges += 1;
@@ -3174,7 +3187,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 								: name === 'shell'
 									? String(args.command ?? '')
 									: undefined;
-						if (isEffectfulTool(name, cmdForRuntime)) {
+						if (isEffectfulTool(name, cmdForRuntime, effectfulTools)) {
 							effectfulCount += 1;
 						}
 						if (
@@ -3510,6 +3523,12 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 				AGENT_TOOLS.map(t => [t.function.name, t.function.parameters as JsonSchemaLike])
 			) as Record<string, JsonSchemaLike>;
 
+			const parallelBatch = batchRunsInParallel(
+				toolCalls.map(c => String(c.function?.name ?? '')),
+				agentToolNeedsUserApproval
+			);
+			const actionsAtBatchStart = actions.length;
+
 			for (const call of toolCalls) {
 				if (opts.cancelled() || opts.abortSignal?.aborted) {
 					lane.length = 0;
@@ -3632,7 +3651,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					args = schemaFix.args;
 					toolAdvice.push(`(auto-repaired arguments: ${schemaFix.appliedRules.join(', ')})`);
 				}
-				if (!isExploreToolName(name)) {
+				if (!parallelBatch || !isExploreToolName(name)) {
 					await flushLane();
 				}
 				const refuse = async (content: string, label: string) => {
@@ -4169,7 +4188,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					readWindowKey,
 					readAliases,
 				};
-				if (isExploreToolName(name)) {
+				if (parallelBatch && isExploreToolName(name)) {
 					lane.push(job);
 					continue;
 				}
@@ -4177,6 +4196,18 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 			}
 
 			await flushLane();
+
+			const batchActions = actions.slice(actionsAtBatchStart);
+			if (
+				batchTerminates(toolCalls.map(c => String(c.function?.name ?? ''))) &&
+				batchActions.length === toolCalls.length &&
+				batchActions.every(
+					a => a.startsWith('update_status') && !/\b(blocked|threw|failed|denied|rejected)\b/.test(a)
+				)
+			) {
+				opts.onLoopExit?.('done');
+				return batchActions.join('\n') || 'Done.';
+			}
 
 			if (pendingPlanAdvance) {
 				const advanced = await pendingPlanAdvance;

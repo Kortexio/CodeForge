@@ -12,6 +12,7 @@ import * as path from 'path';
 import { VSCodeAIBridge } from '../bridge/vscodeBridge';
 import { AiSettingsStore } from '../settings/aiSettingsStore';
 import { runAgentWithTools, AgentActivityEvent, type AgentLoopOptions } from '../agent/agentLoop';
+import { SteeringQueue } from '../agent/steeringQueue';
 import {
 	cachedLlamaSlots,
 	effectiveContextBudget,
@@ -148,7 +149,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 	private _running = false;
 	/** Last tool-loop exit reason from runAgentWithTools (for Continue button). */
 	private _lastLoopExit: 'budget' | 'stuck' | 'length' | 'done' | 'cancelled' | 'error' | undefined;
-	private _queue: Array<{ id: string; text: string; mode?: AgentMode }> = [];
+	private _queue = new SteeringQueue();
 	/** Set by /cards, /plan-run and /review for the next run only. */
 	private _runKind?: 'cards' | 'plan-run' | 'review';
 	private _currentTurn = 0;
@@ -345,7 +346,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			model: session.model,
 		}));
 		this._currentTurn = lastTurn;
-		this._queue = [];
+		this._queue.clear();
 		this.pushQueue();
 		await this.focus();
 		this.updateView();
@@ -480,8 +481,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 					this.removeQueued(String(message.id ?? ''));
 					break;
 				case 'clearQueue':
-					this._queue = [];
+					this._queue.clear();
 					this.pushQueue();
+					break;
+				case 'steer':
+					await this.enqueueSteering(String(message.text ?? ''), message.mode as AgentMode | undefined);
+					break;
+				case 'followUp':
+					this.enqueueMessage(String(message.text ?? ''), message.mode as AgentMode | undefined);
 					break;
 				case 'undoAll':
 					await this.undoAllEdits();
@@ -525,7 +532,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		this.stopPython();
 		this._messages = [];
 		this._timeline = [];
-		this._queue = [];
+		this._queue.clear();
 		this._running = false;
 		this._cancelled = false;
 		this._abort?.abort();
@@ -787,34 +794,45 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 	}
 
 	private enqueueMessage(text: string, mode?: AgentMode): void {
-		const trimmed = text.trim();
-		if (!trimmed) return;
-		this._queue.push({
-			id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-			text: trimmed,
-			mode,
-		});
+		this._queue.push('followup', text, `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, mode);
+		this.pushQueue();
+	}
+
+	/** Mid-turn note: visible in the transcript and injected before the next model request. */
+	private async enqueueSteering(text: string, mode?: AgentMode): Promise<void> {
+		const item = this._queue.push('steer', text, `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, mode);
+		if (!item) return;
+		this.addMessage('user', item.text);
+		if (this._currentSessionId) {
+			await this._sessions.appendMessage(this._currentSessionId, 'user', item.text);
+		}
 		this.pushQueue();
 	}
 
 	private removeQueued(id: string): void {
-		this._queue = this._queue.filter(item => item.id !== id);
+		this._queue.remove(id);
 		this.pushQueue();
 	}
 
 	private pushQueue(): void {
 		void this._view?.webview.postMessage({
 			type: 'queue',
-			items: this._queue.map(item => ({ id: item.id, text: item.text })),
+			items: this._queue.items.map(item => ({ id: item.id, text: item.text, kind: item.kind })),
 			running: this._running,
 		});
 	}
 
+	private takeSteering(): string[] {
+		const notes = this._queue.drainSteering();
+		if (notes.length) this.pushQueue();
+		return notes;
+	}
+
 	private async drainQueue(): Promise<void> {
-		const next = this._queue.shift();
+		const next = this._queue.shiftFollowUp();
 		this.pushQueue();
 		if (!next) return;
-		await this.handleUserMessage(next.text, next.mode);
+		await this.handleUserMessage(next.text, next.mode as AgentMode | undefined);
 	}
 
 	async cancelTask() {
@@ -1290,6 +1308,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 					this.pushConfig();
 				},
 				onTurnMetrics: metrics => this.applyTurnMetrics(metrics),
+				drainSteering: () => this.takeSteering(),
 				sessionStore: this._sessions,
 				sessionId: this._currentSessionId,
 				turnIndex: this._currentTurn,
@@ -1336,6 +1355,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 					this.pushConfig();
 				},
 				onTurnMetrics: metrics => this.applyTurnMetrics(metrics),
+				drainSteering: () => this.takeSteering(),
 				onTaskUpdate: this._onTaskUpdate,
 				sessionStore: this._sessions,
 				sessionId: this._currentSessionId,
@@ -1395,6 +1415,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 				this.pushConfig();
 			},
 			onTurnMetrics: metrics => this.applyTurnMetrics(metrics),
+			drainSteering: () => this.takeSteering(),
 			onTaskUpdate: this._onTaskUpdate,
 			sessionStore: this._sessions,
 			sessionId: this._currentSessionId,
