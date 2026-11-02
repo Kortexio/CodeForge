@@ -307,16 +307,17 @@ export function getChatViewHtml(assets: ChatViewAssets): string {
     background: var(--vscode-input-background); border-radius: 10px; padding: 8px 10px 6px;
     position: relative;
   }
-  .composer-box.drag-over {
-    outline: 2px dashed var(--vscode-focusBorder); outline-offset: 2px;
+  .drop-overlay {
+    display: none; position: fixed; inset: 0; z-index: 50;
+    background: color-mix(in srgb, var(--vscode-focusBorder) 14%, transparent);
+    align-items: center; justify-content: center; font-size: 0.95em;
+    color: var(--vscode-foreground); pointer-events: none;
   }
-  .drop-hint {
-    display: none; position: absolute; inset: 0; border-radius: 10px;
-    background: color-mix(in srgb, var(--vscode-focusBorder) 18%, transparent);
-    align-items: center; justify-content: center; font-size: 0.85em;
-    color: var(--vscode-foreground); pointer-events: none; z-index: 2;
+  .drop-overlay .drop-overlay-box {
+    border: 2px dashed var(--vscode-focusBorder); border-radius: 10px;
+    background: var(--vscode-sideBar-background); padding: 18px 24px;
   }
-  .composer-box.drag-over .drop-hint { display: flex; }
+  .drop-overlay.show { display: flex; }
   textarea#messageInput {
     width: 100%; min-height: 56px; max-height: 160px; resize: vertical; border: 0;
     outline: none; background: transparent; color: var(--vscode-input-foreground);
@@ -433,6 +434,7 @@ export function getChatViewHtml(assets: ChatViewAssets): string {
 </style>
 </head>
 <body>
+  <div class="drop-overlay" id="dropOverlay"><div class="drop-overlay-box">Drop files or images anywhere to attach</div></div>
   <div class="tab-strip" id="tabStrip" role="tablist"></div>
   <div class="toast-busy" id="busyToast">Agent is running — stop it before switching or branching.</div>
 
@@ -477,7 +479,6 @@ export function getChatViewHtml(assets: ChatViewAssets): string {
       <div id="queueList"></div>
     </div>
     <div class="composer-box" id="composerBox">
-      <div class="drop-hint">Drop files, images, or links</div>
       <div class="slash-menu" id="slashMenu"></div>
       <div class="mode-menu" id="modeMenu" role="menu">
         <div class="mode-item active" data-mode="agent">
@@ -497,7 +498,7 @@ export function getChatViewHtml(assets: ChatViewAssets): string {
       <div class="attach-row" id="attachRow"></div>
       <textarea id="messageInput" placeholder="Plan, @ for context, / for commands"></textarea>
       <div class="composer-actions">
-        <button type="button" class="icon-btn" id="attachBtn" title="Attach files">📎</button>
+        <button type="button" class="icon-btn" id="attachBtn" title="Attach files · or drag & drop / paste images and files anywhere here">📎</button>
         <button type="button" class="mode-chip" id="modeChip" title="Switch mode (Shift+Tab)">Agent ▾</button>
         <button type="button" class="model-chip" id="modelChip" title="Switch model">model</button>
         <button type="button" class="perm-chip" id="permChip" title="Permissions">Default</button>
@@ -884,19 +885,28 @@ export function getChatViewHtml(assets: ChatViewAssets): string {
   input.addEventListener('input', updateSlashFromInput);
   sendButton.addEventListener('click', sendOrStop);
 
-  ['dragenter', 'dragover'].forEach(function (ev) {
-    composerBox.addEventListener(ev, function (e) {
-      e.preventDefault(); e.stopPropagation(); composerBox.classList.add('drag-over');
-    });
+  // Drag & drop works anywhere in the panel, not just the composer — a full-panel
+  // overlay shows while dragging. dragenter/dragleave fire on every element the
+  // pointer crosses, so a depth counter (not a boolean) avoids the overlay flicker
+  // that a naive enter/leave toggle would cause when the pointer crosses children.
+  var dropOverlay = document.getElementById('dropOverlay');
+  var dragDepth = 0;
+  document.addEventListener('dragenter', function (e) {
+    e.preventDefault();
+    dragDepth++;
+    if (dropOverlay) dropOverlay.classList.add('show');
   });
-  ['dragleave', 'drop'].forEach(function (ev) {
-    composerBox.addEventListener(ev, function (e) {
-      e.preventDefault(); e.stopPropagation();
-      if (ev === 'dragleave') composerBox.classList.remove('drag-over');
-    });
+  document.addEventListener('dragover', function (e) {
+    e.preventDefault();
   });
-  composerBox.addEventListener('drop', function (e) {
-    composerBox.classList.remove('drag-over');
+  document.addEventListener('dragleave', function () {
+    dragDepth = Math.max(0, dragDepth - 1);
+    if (dragDepth === 0 && dropOverlay) dropOverlay.classList.remove('show');
+  });
+  document.addEventListener('drop', function (e) {
+    e.preventDefault();
+    dragDepth = 0;
+    if (dropOverlay) dropOverlay.classList.remove('show');
     var dt = e.dataTransfer;
     if (!dt) return;
     var uriList = collectUriList(dt);
@@ -908,8 +918,37 @@ export function getChatViewHtml(assets: ChatViewAssets): string {
     }
   });
 
+  // Paste works anywhere in the panel. Only intercept when the clipboard actually
+  // carries a file/image (a screenshot, or a file copied from the OS file manager) —
+  // plain-text paste must keep landing in whatever is focused, unchanged.
+  document.addEventListener('paste', function (e) {
+    var cd = e.clipboardData;
+    if (!cd) return;
+    var files = filesFromClipboard(cd);
+    if (!files.length) return;
+    e.preventDefault();
+    readFilesAsBlobs(files).then(function (blobs) {
+      if (blobs.length) vscode.postMessage({ type: 'attachBlobs', blobs: blobs });
+    });
+  });
+
   function collectUriList(dt) {
     try { return dt.getData('text/uri-list') || dt.getData('text/plain') || ''; } catch (e) { return ''; }
+  }
+  function filesFromClipboard(cd) {
+    var fromFiles = Array.prototype.slice.call(cd.files || []);
+    if (fromFiles.length) return fromFiles;
+    var out = [];
+    var items = cd.items;
+    if (items) {
+      for (var i = 0; i < items.length; i++) {
+        if (items[i].kind === 'file') {
+          var f = items[i].getAsFile();
+          if (f) out.push(f);
+        }
+      }
+    }
+    return out;
   }
   function readFilesAsBlobs(fileList) {
     var files = Array.prototype.slice.call(fileList || []);
@@ -946,8 +985,8 @@ export function getChatViewHtml(assets: ChatViewAssets): string {
       var attachBtnEl = document.getElementById('attachBtn');
       if (attachBtnEl) {
         attachBtnEl.title = msg.canAttachImages
-          ? 'Attach files or images'
-          : 'Attach files (no vision model configured — images will be skipped)';
+          ? 'Attach files or images · or drag & drop / paste anywhere here'
+          : 'Attach files (no vision model configured — images will be skipped) · or drag & drop / paste anywhere here';
       }
       attachmentCount = (msg.attachments || []).length;
       attachRow.innerHTML = (msg.attachments || []).map(function (a) {
