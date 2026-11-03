@@ -4,7 +4,7 @@
   "fixture": "billing",
   "runtime": "dotnet",
   "title": "Fix failing tests (Subtotal skips the last item)",
-  "prompt": "The project tests fail (run `dotnet test`). Find the cause and fix the code in `src/` — do not change the tests.",
+  "prompt": "The project tests fail (run `dotnet test`). Find the cause and fix the code in `src/` — do not change the tests. Do not create new files.",
   "protected": ["tests/"],
   "checks": [],
   "bonus": []

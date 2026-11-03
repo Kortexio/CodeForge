@@ -270,8 +270,13 @@ function repairLeakedParams(
 	}
 	const out: Record<string, unknown> = { ...args };
 	const leaked: string[] = [...cutKeys];
-	for (const [key, raw] of Object.entries(args)) {
-		if (typeof raw !== 'string' || !known.has(key)) continue;
+	/** Separate values replaced by the part of a cut argument that came before </function>. */
+	const fromNextCall = new Set<string>();
+	const entries = Object.entries(args).sort(
+		([a], [b]) => Number(cutKeys.includes(b)) - Number(cutKeys.includes(a))
+	);
+	for (const [key, raw] of entries) {
+		if (typeof raw !== 'string' || !known.has(key) || fromNextCall.has(key)) continue;
 		const split = splitLeakedParams(raw, known);
 		if (!split) continue;
 		if (!leaked.includes(key)) leaked.push(key);
@@ -291,6 +296,14 @@ function repairLeakedParams(
 					existing === split.head
 				) {
 					out[r.key] = r.value;
+					continue;
+				}
+				// This argument ran past </function>, so its leaked parameters belong to this call.
+				// A separate value that carries leaked markup itself was read from the next call.
+				if (cutKeys.includes(key) && typeof existing === 'string' && LEAKED_PARAM_MARKER.test(existing)) {
+					out[r.key] = r.value;
+					fromNextCall.add(r.key);
+					if (!leaked.includes(r.key)) leaked.push(r.key);
 					continue;
 				}
 			}

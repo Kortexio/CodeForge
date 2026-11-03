@@ -63,6 +63,7 @@ const expected = [
 	'edit',
 	'apply_patch',
 	'dotnet',
+	'set_verify_command',
 	'list',
 	'search',
 	'retrieve',
@@ -117,6 +118,12 @@ for (const name of expected) {
 	const d = toolDescription(name as typeof expected[number]);
 	assert(typeof d === 'string' && d.trim().length > 20, `thin description: ${name}`);
 }
+assert(
+	/README, CI config, build\/manifest files/.test(toolDescription('set_verify_command')) &&
+		/exit code 0 is green/.test(toolDescription('set_verify_command')) &&
+		!/dotnet|npm|pytest|cargo/i.test(toolDescription('set_verify_command')),
+	'verification contract: the agent finds the commands; no stack named'
+);
 assert(/old_string/i.test(toolDescription('edit')), 'edit contract mentions old_string');
 assert(/read/i.test(toolDescription('edit')), 'edit contract requires read');
 

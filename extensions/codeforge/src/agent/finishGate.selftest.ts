@@ -23,7 +23,8 @@ assert(!isEffectfulTool('shell', 'dir src'), 'readonly shell not effectful');
 assert(!isEffectfulTool('shell', 'git status'), 'git status not effectful');
 assert(!isEffectfulTool('shell', 'type README.md'), 'type not effectful');
 assert(!countsAsRuntimeObserve('shell', 'dir'), 'readonly shell not runtime observe');
-assert(isOracleBuildOrTestCommand('dotnet test'), 'dotnet test is oracle');
+assert(isOracleBuildOrTestCommand('cargo test --quiet', ['cargo test']), 'recorded command (with extra args) is the oracle');
+assert(!isOracleBuildOrTestCommand('dotnet test'), 'no stack is the oracle by name');
 assert(
 	!isOracleBuildOrTestCommand('echo npm test was mentioned', ['npm test']),
 	'oracle match requires full command'
@@ -164,15 +165,13 @@ assert(
 	'tests touched → skip even with spec'
 );
 
-assert(isOracleBuildOrTestCommand('npm test --silent'), 'npm test is oracle');
-assert(isOracleBuildOrTestCommand('dotnet build Foo.sln -nologo -v q'), 'dotnet build is oracle');
-assert(!isOracleBuildOrTestCommand('npm start'), 'npm start is runtime');
+assert(!isOracleBuildOrTestCommand('npm start', ['npm test --silent']), 'start is not the recorded verification');
 assert(
 	countsAsRuntimeObserve('browser_snapshot'),
 	'snapshot counts (even if not effectful)'
 );
-assert(countsAsRuntimeObserve('shell', 'npm start'), 'start shell counts');
-assert(!countsAsRuntimeObserve('shell', 'npm test --silent'), 'test shell does not count');
+assert(countsAsRuntimeObserve('shell', 'npm start', ['npm test --silent']), 'start shell counts');
+assert(!countsAsRuntimeObserve('shell', 'npm test --silent', ['npm test --silent']), 'the recorded verification does not count');
 
 assert(
 	shouldRequestRuntimeVerify({

@@ -13,10 +13,10 @@ import { applyEdit, excerptAround } from '../../extensions/codeforge/src/agent/e
 import {
 	detectOracle,
 	formatOracleResult,
-	hasDotnetProjects,
-	missingRootBuildFile,
-	missingRootBuildFileNote,
-	parseDotnetErrors,
+	commandNotFound,
+	parseCompilerErrors,
+	parseOracleConfig,
+	serializeOracleConfig,
 	parseFailedTests,
 	runOracle,
 	type OracleFs,
@@ -29,7 +29,7 @@ import {
 	mentionsErrorFile,
 	toolNamesFor,
 } from '../../extensions/codeforge/src/agent/toolsets';
-import { claimsBuildOrTestGreen, parseBlockedClaim, specSelfCheckNote } from '../../extensions/codeforge/src/agent/nudges';
+import { parseBlockedClaim, specSelfCheckNote } from '../../extensions/codeforge/src/agent/nudges';
 import {
 	appendProjectStatus,
 	buildDigest,
@@ -266,83 +266,83 @@ describe('oracle', () => {
 		};
 	}
 
-	it('prefers .CodeForge/oracle.json', () => {
-		const fsx = memFs({ '.CodeForge/oracle.json': '{"command":"make check"}', 'App.slnx': '' });
-		expect(detectOracle('/ws', fsx)).toEqual({ commands: ['make check'], source: 'oracle.json' });
-	});
-
-	it('uses the root solution', () => {
-		const cfg = detectOracle('/ws', memFs({ 'Acme.slnx': '' }));
-		expect(cfg?.commands[0]).toBe('dotnet build Acme.slnx -nologo -v q');
-		expect(cfg?.commands[1]).toContain('dotnet test Acme.slnx --no-build');
-	});
-
-	it('falls back to csproj files and tests only test projects', () => {
-		const cfg = detectOracle(
-			'/ws',
-			memFs({
-				'src/Lib/Lib.csproj': '<Project/>',
-				'tests/Lib.Tests/Lib.Tests.csproj': '<PackageReference Include="Microsoft.NET.Test.Sdk"/>',
-				'src/Lib/bin/Debug/Other.csproj': '',
-			})
-		);
-		expect(cfg?.commands).toEqual([
-			'dotnet build src/Lib/Lib.csproj -nologo -v q',
-			'dotnet build tests/Lib.Tests/Lib.Tests.csproj -nologo -v q',
-			'dotnet test tests/Lib.Tests/Lib.Tests.csproj --no-build -nologo -v q',
-		]);
-	});
-
-	it('uses package.json scripts and ignores the npm placeholder test', () => {
-		const cfg = detectOracle(
-			'/ws',
-			memFs({ 'package.json': JSON.stringify({ scripts: { build: 'tsc', test: 'echo "Error: no test specified"' } }) })
-		);
-		expect(cfg).toEqual({ source: 'npm', commands: ['npm run build --silent'] });
-		expect(detectOracle('/ws', memFs({ 'README.md': '' }))).toBeUndefined();
-	});
-
-	it('flags projects whose only solution is nested below the root (CS4 live run)', () => {
-		const fsx = memFs({
-			'Acme.Router/Acme.Router.slnx': '<Solution/>',
-			'src/Acme.Router.Domain/Acme.Router.Domain.csproj': '<Project/>',
-			'tests/Acme.Router.ArchitectureTests/Acme.Router.ArchitectureTests.csproj': '<Project/>',
-			'docs/C01.md': '# C01',
+	it('reads only the declared verification in .CodeForge/oracle.json', () => {
+		expect(detectOracle('/ws', memFs({ '.CodeForge/oracle.json': '{"command":"make check"}' }))).toEqual({
+			commands: ['make check'],
 		});
-		expect(hasDotnetProjects('/ws', fsx)).toBe(true);
-		expect(missingRootBuildFile('/ws', fsx)).toEqual({ nestedSolutions: ['Acme.Router/Acme.Router.slnx'] });
-		const note = missingRootBuildFileNote(['Acme.Router/Acme.Router.slnx']);
-		expect(note).toContain('MSB1003');
-		expect(note).toContain('Acme.Router/Acme.Router.slnx');
-	});
-
-	it('accepts a root solution or a root project, and an empty workspace', () => {
 		expect(
-			missingRootBuildFile('/ws', memFs({ 'Acme.slnx': '', 'src/A/A.csproj': '<Project/>' }))
-		).toBeUndefined();
-		expect(missingRootBuildFile('/ws', memFs({ 'App.csproj': '<Project/>' }))).toBeUndefined();
-		expect(missingRootBuildFile('/ws', memFs({ 'docs/C01.md': '# C01' }))).toBeUndefined();
-		expect(hasDotnetProjects('/ws', memFs({ 'docs/C01.md': '# C01' }))).toBe(false);
+			detectOracle('/ws', memFs({ '.CodeForge/oracle.json': '{"commands":["cargo build"," cargo test ",""]}' }))
+		).toEqual({ commands: ['cargo build', 'cargo test'] });
+		expect(detectOracle('/ws', memFs({ '.CodeForge/oracle.json': '{"none":"static site, no build"}' }))).toEqual({
+			commands: [],
+			none: 'static site, no build',
+		});
+		expect(detectOracle('/ws', memFs({ '.CodeForge/oracle.json': '{"commands":[]}' }))).toBeUndefined();
+		expect(detectOracle('/ws', memFs({ '.CodeForge/oracle.json': 'not json' }))).toBeUndefined();
 	});
 
-	it('parses dotnet errors and failed tests', () => {
+	it('does not guess a verification from build files of any stack', () => {
+		const stacks: Array<Record<string, string>> = [
+			{ 'Acme.slnx': '', 'src/Lib/Lib.csproj': '<Project/>' },
+			{ 'package.json': JSON.stringify({ scripts: { build: 'tsc', test: 'node --test' } }) },
+			{ 'pyproject.toml': '[project]\nname = "x"', 'tests/test_x.py': '' },
+			{ 'go.mod': 'module x', 'x_test.go': '' },
+			{ 'Cargo.toml': '[package]\nname = "x"' },
+		];
+		for (const files of stacks) {
+			expect(detectOracle('/ws', memFs(files))).toBeUndefined();
+		}
+	});
+
+	it('round-trips the recorded config', () => {
+		expect(parseOracleConfig(JSON.parse(serializeOracleConfig({ commands: ['go build ./...', 'go test ./...'] })))).toEqual({
+			commands: ['go build ./...', 'go test ./...'],
+		});
+		expect(parseOracleConfig(JSON.parse(serializeOracleConfig({ commands: [], none: 'docs only' })))).toEqual({
+			commands: [],
+			none: 'docs only',
+		});
+	});
+
+	it('tells a missing program from a failing one', () => {
+		expect(commandNotFound("exit 9009\n'pytest' is not recognized as an internal or external command,")).toBe(true);
+		expect(commandNotFound('exit 127\nbash: cargo: command not found')).toBe(true);
+		expect(commandNotFound('exit 1\nFAILED tests/test_cart.py::test_total - assert 3 == 4')).toBe(false);
+		expect(commandNotFound('exit 0\nok')).toBe(false);
+	});
+
+	it('parses compiler errors and failed tests from several toolchains', () => {
 		const out = [
 			'C:\\ws\\src\\Foo.cs(12,5): error CS0246: Type Bar not found [C:\\ws\\src\\Lib.csproj]',
 			'C:\\ws\\src\\Foo.cs(12,5): error CS0246: Type Bar not found [C:\\ws\\src\\Lib.csproj]',
+			'src/app.ts(3,7): error TS2304: Cannot find name \'x\'.',
+			'src/main.c:10:5: error: expected \';\' before \'}\' token',
+			'src/lib.rs:4:9: error[E0425]: cannot find value `y` in this scope',
 			'error NU1101: Unable to find package Foo.Bar',
 			'  Failed Acme.Tests.CartTests.Total_IncludesTax [12 ms]',
 			'not ok 3 - totals round half up',
+			'FAILED tests/test_cart.py::test_total - assert 3 == 4',
+			'--- FAIL: TestTotal (0.00s)',
 		].join('\n');
-		const errors = parseDotnetErrors(out);
-		expect(errors).toHaveLength(2);
-		expect(errors[0]).toEqual({ file: 'C:/ws/src/Foo.cs', line: 12, code: 'CS0246', msg: 'Type Bar not found' });
-		expect(errors[1].code).toBe('NU1101');
-		expect(parseFailedTests(out)).toEqual(['Acme.Tests.CartTests.Total_IncludesTax', 'totals round half up']);
+		const errors = parseCompilerErrors(out);
+		expect(errors.map(e => `${e.file}:${e.line}:${e.code}`)).toEqual([
+			'C:/ws/src/Foo.cs:12:CS0246',
+			'src/app.ts:3:TS2304',
+			'src/main.c:10:',
+			'src/lib.rs:4:E0425',
+			':0:NU1101',
+		]);
+		expect(parseFailedTests(out)).toEqual([
+			'Acme.Tests.CartTests.Total_IncludesTax',
+			'totals round half up',
+			'tests/test_cart.py::test_total',
+			'TestTotal',
+		]);
 	});
 
 	it('runOracle stops at the first failing command', async () => {
 		const ran: string[] = [];
-		const r = await runOracle({ source: 'dotnet', commands: ['build', 'test'] }, async c => {
+		const r = await runOracle({ commands: ['build', 'test'] }, async c => {
 			ran.push(c);
 			return 'exit 1\nsrc/A.cs(3,1): error CS1002: ; expected';
 		});
@@ -351,7 +351,7 @@ describe('oracle', () => {
 		const text = formatOracleResult(r, 'finish');
 		expect(text).toContain('RED');
 		expect(text).toContain('src/A.cs:3 CS1002');
-		const green = await runOracle({ source: 'dotnet', commands: ['build'] }, async () => 'exit 0\nok');
+		const green = await runOracle({ commands: ['build'] }, async () => 'exit 0\nok');
 		expect(formatOracleResult(green, 'finish')).toContain('GREEN');
 	});
 });
@@ -414,20 +414,24 @@ describe('toolsets', () => {
 		expect(buildDotnetCommand({ action: 'test', project: 'Acme.slnx', filter: 'Cart' })).toEqual({
 			command: 'dotnet test Acme.slnx -nologo -v q --filter Cart',
 		});
+		expect(buildDotnetCommand({ action: 'new', template: 'solution', output: 'Acme.Router.sln' })).toEqual({
+			command: 'dotnet new solution --format sln -n Acme.Router',
+		});
+		expect(buildDotnetCommand({ action: 'new', template: 'sln', name: 'Acme.Router.slnx' })).toEqual({
+			command: 'dotnet new sln --format slnx -n Acme.Router',
+		});
+		expect(buildDotnetCommand({ action: 'new', template: 'sln', output: 'build/Acme.slnx' })).toEqual({
+			command: 'dotnet new sln --format slnx -n Acme -o build',
+		});
+		expect(buildDotnetCommand({ action: 'new', template: 'sln', name: 'Acme' })).toEqual({
+			command: 'dotnet new sln -n Acme',
+		});
 		expect('error' in buildDotnetCommand({ action: 'new' })).toBe(true);
 		expect('error' in buildDotnetCommand({ action: 'publish' })).toBe(true);
 	});
 });
 
 describe('nudges', () => {
-	it('detects green claims in PT and EN, but not negations', () => {
-		expect(claimsBuildOrTestGreen('Build succeeded, all tests pass.')).toBe(true);
-		expect(claimsBuildOrTestGreen('Tudo verde, compila sem erros.')).toBe(true);
-		expect(claimsBuildOrTestGreen('Ainda não compila: 3 errors.')).toBe(false);
-		expect(claimsBuildOrTestGreen('Tests failed in CartTests.')).toBe(false);
-		expect(claimsBuildOrTestGreen('Criei o ficheiro Cart.cs.')).toBe(false);
-	});
-
 	it('parses blocked claims', () => {
 		expect(parseBlockedClaim('Resumo...\nblocked: falta o SDK .NET 9')).toBe('falta o SDK .NET 9');
 		expect(parseBlockedClaim('bloqueado: sem acesso à rede')).toBe('sem acesso à rede');

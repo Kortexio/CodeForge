@@ -31,6 +31,6 @@ All amounts are rounded to 2 decimals.
 - Codes are case-insensitive (`welcome10` is the same as `WELCOME10`).
 - `percent` coupons: `subtotal × value / 100`.
 - `fixed` coupons: `value`, but never more than the subtotal.
-- A coupon is valid up to and including its `expires` date. After that, throw `new Error('EXPIRED_COUPON')`.
+- `expires` is a calendar date (`YYYY-MM-DD`), not a timestamp. The coupon is valid at every time on that day. `new Date(expires)` is midnight at the start of the day, so a later time on the same day is still valid. After that calendar date, throw `new Error('EXPIRED_COUPON')`.
 - Unknown codes throw `new Error('INVALID_COUPON')`.
 - The result is rounded to 2 decimals.

@@ -3,24 +3,6 @@
  * Pure (no vscode) so they are unit-testable.
  */
 
-/** The model's final text claims build/tests are green (PT + EN phrasing in matchers only). */
-export function claimsBuildOrTestGreen(text: string): boolean {
-	const t = String(text || '');
-	const negated =
-		/\bn[ãa]o\s+(compila|passa|est[áa]\s+verde)|\b(tests?|build)\s+(failed|failing)\b|\b[1-9]\d*\s+(errors?|erros?|failures?|falhas?|failed)\b/i.test(
-			t
-		);
-	if (negated) return false;
-	return (
-		/\b(all\s+)?(passing|passed|green|verde|0\s+errors?|0\s+erros?|0\s+failures?|0\s+falhas?|build\s+succeeded|build\s+ok|tests?\s+pass)/i.test(t) ||
-		/\ball\s+green\b|\btudo\s+verde\b/i.test(t) ||
-		/\b(compila|compilou|compilando)\b/i.test(t) ||
-		/\bsem\s+(erros?|falhas?)\b/i.test(t) ||
-		/\btestes?\s+(passa|passam|passaram|ok|verdes?)\b/i.test(t) ||
-		/\b(build|compila[çc][ãa]o)\s+(com\s+sucesso|bem[-\s]sucedid[ao]|ok)\b/i.test(t)
-	);
-}
-
 /** Completion hit max_tokens before a tool call was complete (a technical event). */
 export const LENGTH_CAP_NOTE = [
 	'Your last reply hit the output token limit (stop reason: length).',
@@ -184,17 +166,27 @@ export function runtimeVerifyNote(opts?: { sourcePaths?: string[] }): string {
 	return [
 		'RUNTIME VERIFY (one-shot)',
 		`Source files changed: ${sources}`,
-		'Build/test green is not enough. Launch the app (or open it in the browser), then observe the result.',
-		'Do one of:',
-		'- Web / UI: browser_navigate (or click through the flow) then browser_snapshot or browser_screenshot; use the After-state as ground truth.',
-		'- Desktop / local: shell with the project run/start script (or the existing launch command), then check process output or reopen and confirm the feature works.',
-		'Do not treat `npm test` / `dotnet test` / oracle build as this check — those already ran.',
-		'Do not create or edit files under test directories for this check. Prefer existing start/dev/run scripts.',
-		'If the app opens but the feature still fails, call edit and fix, then re-verify.',
-		'If you cannot launch (missing runtime, no display), reply `blocked: <reason>`.',
-		'Only after a successful launch+observe, reply with a short summary.',
+		'The verification command passing is not enough: it only checks what the existing tests cover. Run the changed code once and observe the result.',
+		'- If the project is an app (web, desktop, CLI, service): start it with its own run/start command, or open it in the browser, and observe the changed behavior (browser snapshot/screenshot, process output).',
+		'- If the change is library code: call the changed functions directly from a one-off script or REPL session in the OS temp dir, using the project\'s own language and runtime, with the examples and boundary values from the request or spec. Compare the output with the expected values.',
+		'Do not count the recorded verification command as this check — it already ran.',
+		'Keep temporary files outside the workspace and delete them afterwards. Do not create or edit test files for this check.',
+		'If the run throws or shows a wrong value, fix the source and run it again.',
+		'If nothing can be run here (missing runtime, no display), say so in the summary.',
+		'Then reply with a short summary.',
 	].join('\n');
 }
+
+/**
+ * Finish refused: files changed and the workspace has no recorded verification command.
+ * The agent finds it — the harness knows no language or build tool.
+ */
+export const NO_VERIFICATION_NOTE = [
+	'Not finished: files changed, and this workspace has no recorded verification command, so nothing has checked the change.',
+	'Find how this project is built and tested: look at the README, CI configuration, build or manifest files, task runners and existing test folders.',
+	'Then call set_verify_command with the commands, run in order from the workspace root, that build and test it. The harness runs them now and after later changes; exit code 0 is green.',
+	'If the project really has no build or test, call set_verify_command with `none` and the reason.',
+].join('\n');
 
 /** Finish refused: the oracle is red. `oracleText` is the formatted oracle result. */
 export function oracleRejectNote(oracleText: string): string {
@@ -206,10 +198,10 @@ export function oracleRejectNote(oracleText: string): string {
 }
 
 /** Appended to the user-facing reply (not sent to the model). */
-export function finalReplyNote(kind: 'still-red' | 'unverified', command?: string): string {
-	return kind === 'still-red'
-		? `\n\n---\nOracle: build/test is still red (${command ?? 'build/test'}).`
-		: '\n\n---\nNote: no build/test was verified after the last changes.';
+export function finalReplyNote(kind: 'still-red' | 'unverified' | 'none', detail?: string): string {
+	if (kind === 'still-red') return `\n\n---\nOracle: build/test is still red (${detail ?? 'build/test'}).`;
+	if (kind === 'none') return `\n\n---\nNote: this workspace has no automated verification (${detail ?? 'no reason recorded'}).`;
+	return '\n\n---\nNote: no build/test was verified after the last changes.';
 }
 
 /** Empty / placeholder blocked reasons the model invents — not real blockers. */

@@ -154,8 +154,19 @@ export function buildDotnetCommand(args: Record<string, unknown>): { command: st
 			const template = String(args.template ?? '').trim();
 			if (!template) return { error: 'dotnet new needs template (e.g. classlib, xunit, console, webapi, sln).' };
 			const parts = ['dotnet new', template];
-			if (args.name) parts.push('-n', q(args.name));
-			if (args.output) parts.push('-o', q(args.output));
+			let name = args.name ? String(args.name) : '';
+			let output = args.output ? String(args.output).replace(/\\/g, '/') : '';
+			// `-o` is a directory; `-o X.sln` would create a folder named X.sln.
+			const slnFile = /^(?:sln|solution)$/i.test(template)
+				? /^(?:(.*)\/)?([^/]+)\.(slnx?)$/i.exec(output || name)
+				: null;
+			if (slnFile) {
+				name = slnFile[2];
+				output = slnFile[1] ?? '';
+				parts.push('--format', slnFile[3].toLowerCase());
+			}
+			if (name) parts.push('-n', q(name));
+			if (output) parts.push('-o', q(output));
 			if (args.framework) parts.push('-f', q(args.framework));
 			return { command: parts.join(' ') };
 		}

@@ -2,8 +2,9 @@
  * Structural mutation gates. Path and file-diff only — not user-text intent.
  *
  * - During the spec edge-case check, no test-dir changes and no new workspace files.
- * - A test file that was on disk when the turn started is the spec: not edited, rewritten or deleted.
- * - An edit/write of a test file that already existed must keep every assertion line.
+ * - A test file that was on disk when the turn started is the spec: not deleted or renamed.
+ * - An edit/write of a test file that already existed must keep every assertion line
+ *   (adding tests is fine; so is following a rename the turn made in the source).
  */
 
 import * as fs from 'fs';
@@ -30,12 +31,11 @@ export function existingTestMutationRefusal(input: {
 	/** The file was on disk before this turn started (not created by this turn). */
 	existedAtTurnStart: boolean;
 }): string | undefined {
-	if (!input.enabled || !MUTATING.has(input.tool)) return undefined;
+	if (!input.enabled || (input.tool !== 'delete' && input.tool !== 'rename')) return undefined;
 	if (!input.isTestPath || !input.existedAtTurnStart) return undefined;
 	return [
-		`Not applied: ${input.path} is a test file that existed before this turn. Existing tests are the spec and stay unchanged.`,
-		'Make the change in the source files so these tests pass.',
-		'Add a new test file only when the user asked for tests.',
+		`Not applied: ${input.path} is a test file that existed before this turn, and its tests are part of the spec.`,
+		'Keep the file. Fix the source so its tests pass; you may add tests to it or follow a rename you made in the source.',
 	].join(' ');
 }
 
@@ -80,9 +80,36 @@ export function applyEditPreview(
 	return replaceAll ? before.split(oldString).join(newString) : before.replace(oldString, newString);
 }
 
+/**
+ * Assertion calls across test frameworks: assert*(…)/assert.x/Assert.X, assert!/assert_eq!,
+ * expect(…), `assert x == y`, t.Error/t.Fatal, should/must chains.
+ */
 function isAssertionLine(trimmed: string): boolean {
-	if (!trimmed || /^(\/\/|#|\*|<!--)/.test(trimmed)) return false;
-	return /\bAssert\./.test(trimmed) || /\b(assert|expect)\s*\(/.test(trimmed) || /\bassert\./i.test(trimmed);
+	if (!trimmed || /^(\/\/|#(?!\[)|\*|<!--|--|;)/.test(trimmed)) return false;
+	return (
+		/\bassert\w*!?\s*[(.]/i.test(trimmed) ||
+		/^assert\s+\S/.test(trimmed) ||
+		/\bexpect\s*\(/.test(trimmed) ||
+		/\bt\.(?:Error|Errorf|Fatal|Fatalf)\s*\(/.test(trimmed) ||
+		/\.\s*(?:should|must)\w*\b/i.test(trimmed)
+	);
+}
+
+export type ChangedFile = { path: string; before: string; after: string };
+
+/**
+ * Identifiers that were in a changed non-test file before this turn and are gone from it now
+ * (renamed or removed). Plain tokens, so it works for any language.
+ */
+export function removedIdentifiers(changed: ChangedFile[], isTestPath: (p: string) => boolean): string[] {
+	const tokens = (text: string) => new Set(text.match(/[A-Za-z_$][\w$]{2,}/g) ?? []);
+	const out = new Set<string>();
+	for (const c of changed) {
+		if (isTestPath(c.path)) continue;
+		const now = tokens(c.after);
+		for (const t of tokens(c.before)) if (!now.has(t)) out.add(t);
+	}
+	return [...out];
 }
 
 function assertionCounts(text: string): Map<string, number> {
@@ -95,8 +122,16 @@ function assertionCounts(text: string): Map<string, number> {
 	return counts;
 }
 
-/** Assertion lines present in `before` that are missing or altered in `after`. */
-export function missingAssertions(before: string, after: string): string[] {
+function escapeRegExp(s: string): string {
+	return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Assertion lines present in `before` that are missing or altered in `after`.
+ * A line rewritten only by replacing names in `renamed` (removed from the source this turn)
+ * with other identifiers counts as kept.
+ */
+export function missingAssertions(before: string, after: string, renamed: readonly string[] = []): string[] {
 	const prior = assertionCounts(before);
 	const next = assertionCounts(after);
 	const missing: string[] = [];
@@ -104,7 +139,30 @@ export function missingAssertions(before: string, after: string): string[] {
 		const gone = count - (next.get(line) ?? 0);
 		for (let i = 0; i < gone; i++) missing.push(line);
 	}
-	return missing;
+	if (!missing.length || !renamed.length) return missing;
+	const added: string[] = [];
+	for (const [line, count] of next) {
+		const extra = count - (prior.get(line) ?? 0);
+		for (let i = 0; i < extra; i++) added.push(line);
+	}
+	const namePattern = new RegExp(
+		`(?<![\\w$])(?:${renamed.map(escapeRegExp).join('|')})(?![\\w$])`,
+		'g'
+	);
+	return missing.filter(line => {
+		if (!namePattern.test(line)) return true;
+		namePattern.lastIndex = 0;
+		const shape = new RegExp(
+			`^${line
+				.split(namePattern)
+				.map(escapeRegExp)
+				.join('[A-Za-z_$][\\w$]*')}$`
+		);
+		const i = added.findIndex(a => shape.test(a));
+		if (i < 0) return true;
+		added.splice(i, 1);
+		return false;
+	});
 }
 
 export function assertionEditRefusal(path: string, missing: string[]): string | undefined {

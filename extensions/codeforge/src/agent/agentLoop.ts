@@ -119,7 +119,7 @@ import { AgentStateMachine } from './stateMachine';
 import { DEFAULT_BUDGET } from '../context/engine';
 import * as browser from '../browser/agent';
 import {
-	claimsBuildOrTestGreen,
+	NO_VERIFICATION_NOTE,
 	DIAG_ONLY_FINISH_NOTE,
 	EMPTY_TURN_NOTE,
 	finalReplyNote,
@@ -151,7 +151,9 @@ import {
 	existedBeforeTurn,
 	existingTestMutationRefusal,
 	missingAssertions,
+	removedIdentifiers,
 	specCheckMutationRefusal,
+	type ChangedFile,
 } from './mutationGuard';
 import { isTestFilePath } from '../governance/guardrailEngine';
 import {
@@ -185,14 +187,15 @@ import {
 	decideWriteReadGate,
 } from './readGate';
 import {
+	commandNotFound,
 	detectOracle,
 	exitCodeOf,
 	formatOracleResult,
-	hasDotnetProjects,
-	missingRootBuildFile,
-	missingRootBuildFileNote,
 	nodeOracleFs,
+	ORACLE_FILE,
+	parseOracleConfig,
 	runOracle,
+	serializeOracleConfig,
 	type OracleResult,
 } from './oracle';
 import {
@@ -573,6 +576,27 @@ export const AGENT_TOOLS = [
 		},
 	},
 	DOTNET_TOOL,
+	{
+		type: 'function' as const,
+		function: {
+			name: 'set_verify_command',
+			description: toolDescription('set_verify_command'),
+			parameters: {
+				type: 'object',
+				properties: {
+					commands: {
+						type: 'array',
+						items: { type: 'string' },
+						description: 'Shell commands run in order from the workspace root (e.g. build, then test).',
+					},
+					none: {
+						type: 'string',
+						description: 'Instead of commands: why this project has no automated build or test.',
+					},
+				},
+			},
+		},
+	},
 	{
 		type: 'function' as const,
 		function: {
@@ -1288,7 +1312,7 @@ function riskForAgentTool(name: string): ToolRisk {
 	const ext = getToolRegistry().get(name);
 	if (ext && !AGENT_TOOL_NAMES.has(name)) return ext.risk;
 	if (READONLY_TOOLS.has(name) || name === 'update_status') return 'read';
-	if (name === 'shell' || name === 'dotnet') return 'shell';
+	if (name === 'shell' || name === 'dotnet' || name === 'set_verify_command') return 'shell';
 	if (name === 'mcp_call') return 'remote-write';
 	if (MUTATING.has(name)) return 'local-write';
 	return 'read';
@@ -1639,7 +1663,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 		seedActiveTools.has('delegate_task')
 			? 'For broad “where is X across the repo” questions, call delegate_task with mode explore (read-only). Prefer retrieve for focused lookups.'
 			: '',
-		'The IDE runs build/test (oracle) after writes and when you finish; done when green. If blocked, reply `blocked: <reason>`.',
+		`Verification: this workspace's build/test commands live in ${ORACLE_FILE}. If none are recorded, find how the project builds and tests (README, CI config, build files) and record them with set_verify_command. The IDE runs them after writes and when you finish; done when green. If blocked, reply \`blocked: <reason>\`.`,
 		opts.planMode
 			? 'In plan mode you may reason carefully before exploring (/think).'
 			: modelProfile.thinking.toolRounds
@@ -1769,6 +1793,16 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 		vscode.workspace.getConfiguration('codeforge.ai').get<boolean>('protectExistingTests') !== false;
 	/** Test paths already classified as pre-existing (true) or new this turn (false). */
 	const testExistedAtStart = new Map<string, boolean>();
+	/** Content of each file before its first mutation this turn ('' when it did not exist). */
+	const turnOriginals = new Map<string, { path: string; body: string }>();
+	const changedFilesThisTurn = async (): Promise<ChangedFile[]> => {
+		const out: ChangedFile[] = [];
+		for (const { path: p, body } of turnOriginals.values()) {
+			const now = (await opts.bridge.readRaw(p)) ?? '';
+			if (now !== body) out.push({ path: p, before: body, after: now });
+		}
+		return out;
+	};
 	/** Disk body + step for identical-read markers: (unchanged since step N). */
 	const readWindowBodies = new Map<string, { body: string; step: number }>();
 	const emitProtocol = (label: string, detail?: string) => {
@@ -1840,9 +1874,8 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 	let gateFinishRejections = 0;
 	const MAX_GATE_FINISH_REJECTIONS = 2;
 	let oracleCfg = opts.planMode || opts.askMode ? undefined : detectOracle(opts.workspaceRoot, nodeOracleFs);
-	const dotnetProjectsAtStart = hasDotnetProjects(opts.workspaceRoot, nodeOracleFs);
-	let rootBuildFileNudges = 0;
-	const MAX_ROOT_BUILD_FILE_NUDGES = 2;
+	let noVerificationNudges = 0;
+	const MAX_NO_VERIFICATION_NUDGES = 2;
 	let lastProgressMarker = '';
 	const progressMarker = () =>
 		`${successfulWriteCount}|${uiChangeCount}|${gates.buildRed ? 'red' : 'ok'}|${gates.lastBuildErrors.length}`;
@@ -1879,6 +1912,50 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 				: [...result.errors.slice(0, 3).map(e => `${e.code} ${e.file}:${e.line}`), ...result.failedTests.slice(0, 3)].join(' | '),
 		});
 		return result;
+	};
+	const hasVerifyCommands = () => !!oracleCfg?.commands.length;
+	const recordVerification = async (args: Record<string, unknown>): Promise<string> => {
+		if (!opts.workspaceRoot) {
+			return 'Error: no workspace folder is open, so there is nowhere to record the verification.';
+		}
+		const commands = Array.isArray(args.commands)
+			? args.commands
+			: typeof args.commands === 'string'
+				? [args.commands]
+				: [];
+		const candidate = parseOracleConfig({ commands, none: args.none });
+		if (!candidate) {
+			return 'Error: pass `commands` (shell commands that build and test the project) or `none` (why it has no build or test).';
+		}
+		if (!candidate.commands.length) {
+			await opts.bridge.writeRaw(ORACLE_FILE, serializeOracleConfig(candidate));
+			oracleCfg = candidate;
+			opts.onActivity?.({ kind: 'checkpoint', label: 'Verification recorded', detail: `none: ${candidate.none}` });
+			return `Recorded in ${ORACLE_FILE}: no automated verification (${candidate.none}). The final reply will say the change is unverified.`;
+		}
+		const previous = oracleCfg;
+		oracleCfg = candidate;
+		const result = await runOracleNow('recorded verification');
+		const failed = result.commands[result.commands.length - 1] ?? '';
+		if (!result.ok && commandNotFound(result.output)) {
+			oracleCfg = previous;
+			return [
+				`Not recorded: the shell could not find the program in \`${failed}\`.`,
+				clipToolOutput('shell', result.output, 600),
+				'Use a command that exists in this environment (check the project docs and the installed tools), then call set_verify_command again.',
+			].join('\n');
+		}
+		await opts.bridge.writeRaw(ORACLE_FILE, serializeOracleConfig(candidate));
+		opts.onActivity?.({ kind: 'checkpoint', label: 'Verification recorded', detail: candidate.commands.join(' → ') });
+		return [
+			`Recorded in ${ORACLE_FILE}: ${candidate.commands.join(' → ')}`,
+			formatOracleResult(result, 'recorded verification'),
+			result.ok
+				? ''
+				: 'The commands run but are red. If the failure is part of the task, fix it; if the commands are wrong for this project, call set_verify_command again with the right ones.',
+		]
+			.filter(Boolean)
+			.join('\n');
 	};
 
 	// Remember what this session already explored (survives "continua") — soft memory, not bans.
@@ -2845,32 +2922,6 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					continue;
 				}
 				const changedFiles = successfulWriteCount > 0;
-				const effectThisTurn = changedFiles || effectfulCount > 0;
-				const rootGap =
-					!blocked &&
-					effectThisTurn &&
-					!dotnetProjectsAtStart &&
-					!opts.planMode &&
-					!opts.askMode &&
-					!opts.coachMode &&
-					rootBuildFileNudges < MAX_ROOT_BUILD_FILE_NUDGES &&
-					step + 1 < stepBudget
-						? missingRootBuildFile(opts.workspaceRoot, nodeOracleFs)
-						: undefined;
-				if (rootGap) {
-					rootBuildFileNudges += 1;
-					const note = missingRootBuildFileNote(rootGap.nestedSolutions);
-					trace?.info('harness', String(note.length));
-					messages.push({ role: 'assistant', content: summary });
-					messages.push({ role: 'user', content: note });
-					opts.onActivity?.({
-						kind: 'checkpoint',
-						label: 'Finish refused — no solution in the workspace root',
-						detail: rootGap.nestedSolutions.join(', ') || 'no solution file',
-					});
-					opts.onStatus?.('Continue: put the solution in the workspace root…');
-					continue;
-				}
 				let doneNote = '';
 				let loggedExperimentRound = false;
 				if (!oracleCfg && changedFiles && !opts.planMode && !opts.askMode && !opts.coachMode) {
@@ -2879,9 +2930,32 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 				if (
 					!blocked &&
 					changedFiles &&
+					!oracleCfg &&
+					opts.workspaceRoot &&
+					!opts.planMode &&
+					!opts.askMode &&
+					!opts.coachMode &&
+					noVerificationNudges < MAX_NO_VERIFICATION_NUDGES &&
+					step + 1 < stepBudget
+				) {
+					noVerificationNudges += 1;
+					trace?.info('harness', String(NO_VERIFICATION_NOTE.length));
+					messages.push({ role: 'assistant', content: summary });
+					messages.push({ role: 'user', content: NO_VERIFICATION_NOTE });
+					opts.onActivity?.({
+						kind: 'checkpoint',
+						label: 'Finish refused — no verification recorded',
+						detail: `${successfulWriteCount} write(s), no ${ORACLE_FILE}`,
+					});
+					opts.onStatus?.('Continue: find and record how this project is verified…');
+					continue;
+				}
+				if (
+					!blocked &&
+					changedFiles &&
 					!opts.planMode &&
 					!opts.coachMode &&
-					oracleCfg &&
+					hasVerifyCommands() &&
 					(writesSinceOracle > 0 || !gates.hasVerifiedGreen())
 				) {
 					const result = await runOracleNow('finish check');
@@ -2948,7 +3022,9 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					} else {
 						await logRound(true);
 					}
-				} else if (!blocked && changedFiles && !oracleCfg && claimsBuildOrTestGreen(summary) && !gates.hasVerifiedGreen()) {
+				} else if (!blocked && changedFiles && oracleCfg?.none) {
+					doneNote = finalReplyNote('none', oracleCfg.none);
+				} else if (!blocked && changedFiles && !oracleCfg && !gates.hasVerifiedGreen()) {
 					doneNote = finalReplyNote('unverified');
 				}
 
@@ -2997,7 +3073,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 						coachMode: opts.coachMode,
 						statusQuestion,
 						blocked: !!blocked,
-						verifiedGreen: !oracleCfg || gates.hasVerifiedGreen(),
+						verifiedGreen: !hasVerifyCommands() || gates.hasVerifiedGreen(),
 						writtenSourceCount: writtenSourcePaths.size,
 						runtimeObserveCount,
 						runtimeVerifyNudges,
@@ -3005,9 +3081,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					step + 1 < stepBudget
 				) {
 					runtimeVerifyNudges += 1;
-					const note = runtimeVerifyNote({
-						sourcePaths: [...writtenSourcePaths],
-					});
+					const note = runtimeVerifyNote({ sourcePaths: [...writtenSourcePaths] });
 					trace?.info('harness', String(note.length));
 					messages.push({ role: 'assistant', content: summary });
 					messages.push({ role: 'user', content: note });
@@ -3016,7 +3090,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 						label: 'Runtime verify',
 						detail: `${writtenSourcePaths.size} source, ${runtimeObserveCount} runtime observes`,
 					});
-					opts.onStatus?.('Runtime verify: launch and observe the app…');
+					opts.onStatus?.('Runtime verify: run the changed code and observe…');
 					continue;
 				}
 
@@ -3224,7 +3298,10 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 			): Promise<{ output: string; durationMs: number; threw: boolean }> => {
 				const toolStart = Date.now();
 				try {
-					const output = await executeTool(opts, job.name, job.args, job.call.id, depth, { gitAvailable });
+					const output =
+						job.name === 'set_verify_command'
+							? await recordVerification(job.args)
+							: await executeTool(opts, job.name, job.args, job.call.id, depth, { gitAvailable });
 					return { output, durationMs: Date.now() - toolStart, threw: false };
 				} catch (toolErr) {
 					return {
@@ -3842,6 +3919,10 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					const mutateKey = canonicalizePathKey(mutatePath);
 					const existingBody = name === 'delete' ? '' : await opts.bridge.readRaw(mutatePath);
 					const fileExists = name === 'delete' ? true : existingBody !== undefined;
+					if (!turnOriginals.has(mutateKey)) {
+						const original = name === 'delete' ? await opts.bridge.readRaw(mutatePath) : existingBody;
+						turnOriginals.set(mutateKey, { path: mutatePath, body: original ?? '' });
+					}
 					const specRefusal = specCheckMutationRefusal({
 						active: specCheckActive,
 						tool: name,
@@ -3872,6 +3953,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 						continue;
 					}
 					if (
+						protectExistingTests &&
 						(name === 'edit' || name === 'write') &&
 						isTestFilePath(mutatePath) &&
 						typeof existingBody === 'string' &&
@@ -3887,10 +3969,14 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 										Boolean(args.replace_all)
 									);
 						if (after !== undefined) {
-							const assertionRefusal = assertionEditRefusal(
-								mutatePath,
-								missingAssertions(existingBody, after)
-							);
+							let missing = missingAssertions(existingBody, after);
+							if (missing.length) {
+								const renamed = removedIdentifiers(await changedFilesThisTurn(), p =>
+									isTestFilePath(`/${p}`)
+								);
+								missing = missingAssertions(existingBody, after, renamed);
+							}
+							const assertionRefusal = assertionEditRefusal(mutatePath, missing);
 							if (assertionRefusal) {
 								await refuse(assertionRefusal, 'test assertion');
 								continue;
@@ -4386,7 +4472,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 
 			// Oracle after a batch of writes: the project's build/test speaks instead of advice text.
 			if (
-				oracleCfg &&
+				hasVerifyCommands() &&
 				!opts.planMode &&
 				writesSinceOracle >= gates.cfg.maxWritesWithoutBuild &&
 				gates.writesSinceBuild > 0

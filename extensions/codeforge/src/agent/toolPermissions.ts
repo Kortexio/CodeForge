@@ -156,6 +156,7 @@ export const CORE = [
 	'shell',
 	'await_shell',
 	'dotnet',
+	'set_verify_command',
 	'diagnostics',
 	'todo_write',
 	'delegate_task',

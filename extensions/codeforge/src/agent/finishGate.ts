@@ -136,8 +136,8 @@ export function isRuntimeObserveTool(name: string): boolean {
 }
 
 /**
- * True when a shell/dotnet command is an oracle-style build/test (does not count
- * as runtime launch/observe). Matches known patterns + optional oracle command list.
+ * True when a shell/dotnet command is the recorded verification (does not count
+ * as runtime launch/observe).
  */
 export function isOracleBuildOrTestCommand(
 	command: string,
@@ -156,9 +156,6 @@ export function isOracleBuildOrTestCommand(
 			}
 		}
 	}
-	// npm / yarn / pnpm / dotnet as the command itself (not mentioned in an echo/string).
-	if (/(?:^|[;&|]\s*)(?:npm|yarn|pnpm)\s+(?:test|run\s+(?:test|build))\b/i.test(norm)) return true;
-	if (/(?:^|[;&|]\s*)dotnet\s+(?:test|build)\b/i.test(norm)) return true;
 	return false;
 }
 

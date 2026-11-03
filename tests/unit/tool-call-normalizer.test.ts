@@ -398,6 +398,38 @@ describe('toolCallNormalizer', () => {
 			expect(r.notes.join(' ')).toMatch(/ran past <\/function>/);
 		});
 
+		it('keeps this call\'s values when the server merged two edit calls (CS3 live run)', () => {
+			const r = normalizeToolCall({
+				name: 'edit',
+				args: {
+					path: 'src/Acme.Billing/PricingRules.cs',
+					old_string:
+						'\tprivate const decimal VipRate = 0.1m;\n</old_string>\n<parameter=new_string>\n\tprivate const decimal VipRate = 0.15m;\n</new_string>\n</function>\n</tool_call>\n<tool_call>\n<function=edit>\n<parameter=path>\ndocs/pricing.md',
+					new_string: '| vip      | 15%      |\n</old_string>\n<parameter=old_string>\n| vip      | 10%      |',
+				},
+				activeToolNames: CORE,
+				toolSchemas: SCHEMAS,
+			});
+			expect(r.error).toBeUndefined();
+			expect(r.args.path).toBe('src/Acme.Billing/PricingRules.cs');
+			expect(r.args.old_string).toBe('\tprivate const decimal VipRate = 0.1m;');
+			expect(r.args.new_string).toBe('\tprivate const decimal VipRate = 0.15m;');
+		});
+
+		it('still refuses when the separate value is clean and differs from the leaked one', () => {
+			const r = normalizeToolCall({
+				name: 'edit',
+				args: {
+					path: 'a.cs',
+					old_string: 'A\n</old_string>\n<parameter=new_string>\nB\n</new_string>\n</function>\n<tool_call>',
+					new_string: 'C',
+				},
+				activeToolNames: CORE,
+				toolSchemas: SCHEMAS,
+			});
+			expect(r.error).toMatch(/new_string was also sent separately with a different value/);
+		});
+
 		it('accepts the unquoted <arg_key=new_string> form', () => {
 			const r = normalizeToolCall({
 				name: 'edit',

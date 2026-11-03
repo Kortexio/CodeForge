@@ -14,8 +14,12 @@ function messagesText(body: ScriptedRequestBody): string {
 }
 
 describe('harness score gates', () => {
-	it('refuses to append tests to a test file that existed before the turn (CS2)', async () => {
-		const original = 'public class CartTests\n{\n\t[Fact]\n\tpublic void A() { Assert.True(true); }\n}\n';
+	it('lets an existing test file gain tests, but refuses changing its assertions', async () => {
+		const original = 'public class CartTests\n{\n\t[Fact]\n\tpublic void A() { Assert.Equal(30m, Totals.Subtotal()); }\n}\n';
+		const appended = original.replace(
+			'}\n}\n',
+			'}\n\t[Fact]\n\tpublic void Coupon() { Assert.Equal(3m, Coupons.ApplyCoupon()); }\n}\n'
+		);
 		const result = await runLoop({
 			files: {
 				'src/Coupons.cs': 'public static class Coupons { }\n',
@@ -24,47 +28,37 @@ describe('harness score gates', () => {
 			task: 'Implement Coupons.ApplyCoupon.',
 			script: [
 				callTool('read', { path: 'tests/Acme.Tests/CartTests.cs' }),
+				callTool('write', { path: 'tests/Acme.Tests/CartTests.cs', content: appended }),
 				callTool('edit', {
 					path: 'tests/Acme.Tests/CartTests.cs',
-					old_string: '\tpublic void A() { Assert.True(true); }',
-					new_string:
-						'\tpublic void A() { Assert.True(true); }\n\t[Fact]\n\tpublic void Coupon() { Assert.Equal(1, 1); }',
+					old_string: 'Assert.Equal(30m, Totals.Subtotal());',
+					new_string: 'Assert.Equal(20m, Totals.Subtotal());',
 				}),
-				reply({ content: 'Added a coupon test.' }),
-			],
-			maxSteps: 10,
-		});
-		expect(result.files.get('tests/Acme.Tests/CartTests.cs')).toBe(original);
-		const toolResults = result.requests.map(r => messagesText(r.body)).join('\n');
-		expect(toolResults).toMatch(/existed before this turn/);
-	}, 60_000);
-
-	it('refuses to finish while new .NET projects have no solution in the workspace root (CS4)', async () => {
-		const result = await runLoop({
-			files: {
-				'docs/C01.md': '# C01\nCreate the solution.\n',
-				'.CodeForge/oracle.json': '{"command":"node -e 0"}',
-			},
-			task: 'Read docs/C01.md and create the .NET solution it describes.',
-			script: [
-				callTool('write', { path: 'Acme.Router/Acme.Router.slnx', content: '<Solution />\n' }),
-				callTool('write', {
-					path: 'src/Acme.Router.Domain/Acme.Router.Domain.csproj',
-					content: '<Project Sdk="Microsoft.NET.Sdk" />\n',
-				}),
-				reply({ content: 'The solution is ready.' }),
-				callTool('write', { path: 'Acme.Router.slnx', content: '<Solution />\n' }),
-				callTool('delete', { path: 'Acme.Router/Acme.Router.slnx' }),
-				reply({ content: 'Moved the solution to the workspace root.' }),
+				...Array.from({ length: 6 }, () => reply({ content: 'Added a coupon test.' })),
 			],
 			maxSteps: 14,
 		});
-		const refused = result.activities.filter(a => a.label === 'Finish refused — no solution in the workspace root');
-		expect(refused).toHaveLength(1);
-		expect(refused[0].detail).toBe('Acme.Router/Acme.Router.slnx');
-		expect(result.files.has('Acme.Router.slnx')).toBe(true);
-		const afterRefusal = result.requests.map(r => messagesText(r.body)).find(t => t.includes('MSB1003'));
-		expect(afterRefusal).toBeDefined();
+		expect(result.files.get('tests/Acme.Tests/CartTests.cs')).toBe(appended);
+		const toolResults = result.requests.map(r => messagesText(r.body)).join('\n');
+		expect(toolResults).toMatch(/an assertion changed or disappeared/);
+	}, 60_000);
+
+	it('lets existing tests follow a rename the turn made in the source', async () => {
+		const tax = 'function calcTax(n) { return n * 0.23; }\nmodule.exports = { calcTax };\n';
+		const testBody = "const { calcTax } = require('../src/tax');\nassert.strictEqual(calcTax(100), 23);\n";
+		const result = await runLoop({
+			files: { 'src/tax.js': tax, 'test/tax.test.js': testBody, 'package.json': '{"name":"x"}' },
+			task: 'Rename calcTax to computeTax.',
+			script: [
+				callTool('read', { path: 'src/tax.js' }),
+				callTool('write', { path: 'src/tax.js', content: tax.replace(/calcTax/g, 'computeTax') }),
+				callTool('read', { path: 'test/tax.test.js' }),
+				callTool('write', { path: 'test/tax.test.js', content: testBody.replace(/calcTax/g, 'computeTax') }),
+				...Array.from({ length: 6 }, () => reply({ content: 'Renamed calcTax to computeTax.' })),
+			],
+			maxSteps: 14,
+		});
+		expect(result.files.get('test/tax.test.js')).toContain('assert.strictEqual(computeTax(100), 23);');
 	}, 60_000);
 
 	it('an update_status-only step does not end a work turn before the finish gates (T2)', async () => {
@@ -109,6 +103,80 @@ describe('harness score gates', () => {
 			maxSteps: 8,
 		});
 		expect(result.reply).toBe('hello.txt contains Hello, World!');
+	}, 60_000);
+
+	it('without a recorded verification, the agent finds and records it before finishing (any stack)', async () => {
+		const verify = 'node -e "process.exit(0)"';
+		const result = await runLoop({
+			files: {
+				'pyproject.toml': '[project]\nname = "cart"\n',
+				'README.md': `# Cart\n\nCheck everything with \`${verify}\`.\n`,
+				'src/cart.py': 'def total(items):\n    return 0\n',
+			},
+			task: 'Make total return the sum of the item prices.',
+			script: [
+				callTool('read', { path: 'src/cart.py' }),
+				callTool('write', { path: 'src/cart.py', content: 'def total(items):\n    return sum(i.price for i in items)\n' }),
+				reply({ content: 'total now sums the prices.' }),
+				callTool('read', { path: 'README.md' }),
+				callTool('set_verify_command', { commands: [verify] }),
+				...Array.from({ length: 6 }, () => reply({ content: 'total now sums the prices.' })),
+			],
+			maxSteps: 16,
+		});
+		expect(result.activities.filter(a => a.label === 'Finish refused — no verification recorded')).toHaveLength(1);
+		expect(JSON.parse(result.files.get('.CodeForge/oracle.json') ?? '{}')).toEqual({ commands: [verify] });
+		const recorded = result.requests.map(r => messagesText(r.body)).find(t => t.includes('Recorded in .CodeForge/oracle.json'));
+		expect(recorded).toContain('GREEN');
+		expect(result.reply).not.toMatch(/no build\/test was verified/);
+	}, 60_000);
+
+	it('does not record a program the shell cannot find; records `none` with its reason', async () => {
+		const result = await runLoop({
+			files: { 'notes/plan.md': '# Plan\n- one\n' },
+			task: 'Add a second item to notes/plan.md.',
+			script: [
+				callTool('read', { path: 'notes/plan.md' }),
+				callTool('write', { path: 'notes/plan.md', content: '# Plan\n- one\n- two\n' }),
+				reply({ content: 'Added the item.' }),
+				callTool('set_verify_command', { commands: ['cf-no-such-program-xyz --check'] }),
+				callTool('set_verify_command', { none: 'notes only, nothing to build or test' }),
+				...Array.from({ length: 6 }, () => reply({ content: 'Added the second item.' })),
+			],
+			maxSteps: 16,
+		});
+		const text = result.requests.map(r => messagesText(r.body)).join('\n');
+		expect(text).toMatch(/Not recorded: the shell could not find the program/);
+		expect(JSON.parse(result.files.get('.CodeForge/oracle.json') ?? '{}')).toEqual({
+			none: 'notes only, nothing to build or test',
+		});
+		expect(result.reply).toMatch(/no automated verification \(notes only, nothing to build or test\)/);
+	}, 60_000);
+
+	it('after a green verification, asks to run the changed code once, without naming a language', async () => {
+		const result = await runLoop({
+			files: {
+				'.CodeForge/oracle.json': '{"command":"node -e 0"}',
+				'src/coupons.js': 'module.exports = {};\n',
+			},
+			task: 'Implement applyCoupon in src/coupons.js.',
+			script: [
+				callTool('read', { path: 'src/coupons.js' }),
+				callTool('write', {
+					path: 'src/coupons.js',
+					content: 'function applyCoupon(cart) { return cart.total * 0.1; }\nmodule.exports = { applyCoupon };\n',
+				}),
+				...Array.from({ length: 6 }, () => reply({ content: 'applyCoupon is implemented.' })),
+			],
+			maxSteps: 14,
+		});
+		const asked = result.requests
+			.flatMap(r => (r.body.messages ?? []) as Array<{ content?: unknown }>)
+			.map(m => (typeof m.content === 'string' ? m.content : ''))
+			.find(c => c.startsWith('RUNTIME VERIFY'));
+		expect(asked).toBeDefined();
+		expect(asked).toContain("using the project's own language and runtime");
+		expect(asked).not.toMatch(/dotnet|npm|node -e/);
 	}, 60_000);
 
 	it('does not mark a card done when its sub-run used no tool (CS6 C05)', async () => {

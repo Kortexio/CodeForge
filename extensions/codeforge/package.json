@@ -349,7 +349,7 @@
         "codeforge.ai.protectExistingTests": {
           "type": "boolean",
           "default": true,
-          "description": "The agent does not edit, rewrite or delete test files that existed before the turn started (new test files are still allowed). Turn off when you want the agent to change existing tests."
+          "description": "Test files that existed before the turn are the spec: the agent may add tests to them and follow its own renames, but does not change or remove existing assertions and does not delete the files. Turn off when you want the agent to rewrite existing tests."
         },
         "codeforge.ai.shellSandbox": {
           "type": "string",

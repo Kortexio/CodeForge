@@ -77,12 +77,29 @@ const cs2Append = {
 	existedAtTurnStart: true,
 };
 assert(
-	/existed before this turn/.test(existingTestMutationRefusal(cs2Append) ?? ''),
-	'appending tests to a pre-existing test file is refused (CS2 live run)'
+	existingTestMutationRefusal(cs2Append) === undefined && existingTestMutationRefusal({ ...cs2Append, tool: 'write' }) === undefined,
+	'editing a pre-existing test file is left to the assertion check'
 );
 assert(
-	existingTestMutationRefusal({ ...cs2Append, tool: 'delete' }) !== undefined,
+	/existed before this turn/.test(existingTestMutationRefusal({ ...cs2Append, tool: 'delete' }) ?? ''),
 	'deleting a pre-existing test file is refused'
+);
+assert(
+	existingTestMutationRefusal({ ...cs2Append, tool: 'rename' }) !== undefined,
+	'renaming a pre-existing test file is refused'
+);
+
+const renamedBefore = 'assert.strictEqual(calcTax(100), 23);\nexpect(calcTax(0)).toBe(0);';
+const renamedAfter = 'assert.strictEqual(computeTax(100), 23);\nexpect(computeTax(0)).toBe(0);';
+assert(missingAssertions(renamedBefore, renamedAfter).length === 2, 'without the rename list both lines are missing');
+assert(missingAssertions(renamedBefore, renamedAfter, ['calcTax']).length === 0, 'following a source rename keeps the assertions');
+assert(
+	missingAssertions(renamedBefore, 'assert.strictEqual(computeTax(100), 25);\nexpect(computeTax(0)).toBe(0);', ['calcTax']).length === 1,
+	'a rename does not excuse a changed expected value'
+);
+assert(
+	missingAssertions(renamedBefore, renamedAfter.replace(/computeTax/g, 'otherFn'), ['unrelated']).length === 2,
+	'only names removed from the source count as renames'
 );
 assert(
 	existingTestMutationRefusal({ ...cs2Append, existedAtTurnStart: false }) === undefined,

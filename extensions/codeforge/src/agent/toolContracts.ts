@@ -133,6 +133,11 @@ export const TOOL_DESCRIPTIONS = {
 		'Apply a *** Begin Patch *** … *** End Patch *** block (exposed only for gpt-* non-OSS models). Prefer for multi-hunk updates; keep patches focused. Requires patch (or patchText); optional path if the body omits Update File.',
 	dotnet:
 		'.NET CLI structured actions: new | sln_add | add_reference | add_package | build | test. Prefer this over raw shell for dotnet commands. Requires action; other fields depend on action.',
+	set_verify_command: [
+		'Record how this workspace is verified: the shell commands that build and test it, run in order from the workspace root (saved to .CodeForge/oracle.json).',
+		'Find them in the project first (README, CI config, build/manifest files, task runners). The harness runs them right away and returns the result, then reruns them after changes and before you finish; exit code 0 is green.',
+		'A command the shell cannot find is not recorded. If the project has no build or test at all, pass `none` with the reason instead of commands.',
+	].join(' '),
 	list: 'List one directory (non-recursive by default). path required. Set recursive true only for shallow trees; prefer a subfolder over the workspace root.',
 	search:
 		'Regex/text search across workspace files. pattern required; optional path to scope. Prefer search/retrieve before reading many files blindly.',

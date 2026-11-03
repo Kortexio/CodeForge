@@ -92,14 +92,9 @@ export async function runReviewPipeline(opts: AgentLoopOptions, o: ReviewOptions
 	if (oracle) {
 		for (const command of oracle.commands) {
 			if (opts.cancelled()) return undefined;
-			const out = await shell(command.replace(/\s-v\s+q\b/, ' -v m'));
+			const out = await shell(command);
 			addSignals(parseCompilerSignals(out, root, /\btest\b/.test(command) ? 'test' : 'build'));
 			failedTests.push(...parseFailedTests(out));
-		}
-		const target = /dotnet build (\S+)/.exec(oracle.commands[0] ?? '')?.[1];
-		if (oracle.source === 'dotnet' && target) {
-			const fmt = await shell(`dotnet format ${target} --verify-no-changes --no-restore -v q`);
-			addSignals(parseCompilerSignals(fmt, root, 'format'));
 		}
 	}
 	const diag = await opts.bridge.execute({ id: 'review-diag', name: 'diagnostics', arguments: {} });
