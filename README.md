@@ -57,11 +57,15 @@ Not another chat sidebar. A **tool + system contract** that refuses to paper ove
 
 | Capability | Why it matters |
 |---|---|
-| **Agentic loop that finishes** | Unlimited exploration within the turn budget (Cursor/Claude Code style). Continue button when the step budget ends. No soft “explore cap” that refuses new reads. |
-| **Adaptive harness** | Per-model profiles (`~/.codeforge/ai/model-profiles/`) — sampling, write gates, finish limits, optional `toolTransport` for XML-leaky locals. Calibrate once; hysteresis adjusts online. |
-| **Honest outcomes** | Stuck / truncated / oracle-red are **failed**, not “done”. Spec self-check and oracle before finish with writes. |
+| **Agentic loop that finishes** | Unlimited exploration within the turn budget (Cursor/Claude Code style). Parallel reads, mid-turn steering, Continue when the step budget ends. No soft “explore cap” that refuses new reads. |
+| **Adaptive harness** | Per-model profiles (`~/.CodeForge/ai/model-profiles/`) — sampling, write gates, finish limits, optional `toolTransport` for XML-leaky locals. Calibrate once; hysteresis adjusts online. Keep a learned revision only when paired scores improve. |
+| **Universal tool recovery** | Family-aware repair for Qwen, DeepSeek, Llama, Gemma, Mistral, Harmony, and friends — schema repair, phantom tool-use retry, thinking-field handling — so weak locals stay in the loop instead of dying on bad JSON/XML. |
+| **Language-agnostic oracle** | The agent records build/test via `set_verify_command` (or `none` + reason). The IDE re-runs those commands after writes; green is exit 0, not a guessed `dotnet`/`npm` recipe. |
+| **Honest outcomes** | Stuck / truncated / oracle-red are **failed**, not “done”. Spec self-check, effect gates, and finish gates refuse prose victory without verification. |
+| **Vision in chat** | Paste or drag images into the panel; CodeForge auto-routes the turn to a reachable vision-capable model (or drops the image, not the turn, when none is up). |
+| **Agents window** | The Code-OSS Agents / sessions UI runs the same harness: models, Ask/Plan/Agent, permissions, slash commands, and discovery — not a second, thinner agent. |
 | **You own the freedoms** | Sandbox level, Allow all, outside-workspace writes, MCP, Full agent freedom — all user settings, revocable. The model cannot grant itself permissions. |
-| **Measurable learning** | Harness revise proposes changes; keep only when paired bootstrap shows a real gain. No quiet contamination of `harness.json`. |
+| **Measurable learning** | Harness revise proposes changes; keep only when stratified bootstrap shows a real gain. No quiet contamination of `harness.json`. |
 | **Same IDE for weak and strong** | Compensations are per model. A clean 32B does not pay the IQ2_S tax. |
 
 ---
@@ -69,14 +73,14 @@ Not another chat sidebar. A **tool + system contract** that refuses to paper ove
 ## Where we’re going
 
 **Near term**
-- Ship releases that treat the adaptive harness + agent loop as the core product story
-- Keep the calibrate suite (T2/T4/CS2/CS3) as the release gate for local models
 - Harden permissions, sandbox, and secrets for daily use without babysitting
+- Packaging and onboarding so “install → pick local model → agent works” is a five-minute path
+- Keep the calibrate suite (T2/T4/CS2/CS3) as the release gate for local models
 
 **Next**
 - Broader task suites (navigation, long multi-card, review) with the same failure taxonomy: harness / protocol / semantic
-- Profile knobs proven by A/B (thinking off on tool turns, one mutating call per step) — only when the bench says so
-- Packaging and onboarding so “install → pick local model → agent works” is a five-minute path
+- Profile knobs proven by A/B — only when the bench says so
+- Richer Agents-window parity with the side chat (attachments, journal, restore)
 
 **Not the roadmap**
 - Hardcoded intent crutches (“the user said fix, so nudge edit”)
@@ -90,12 +94,17 @@ Not another chat sidebar. A **tool + system contract** that refuses to paper ove
 | | CodeForge |
 |---|---|
 | Models | OpenAI, Anthropic, Gemini, xAI, OpenRouter, Ollama, vLLM, LM Studio, [SuperLLaMA](https://github.com/vitorcastro78/superllama) / llama.cpp / any OpenAI-compatible API |
-| Adaptive harness | Per-model profiles + calibrate + hysteresis |
-| Agent | Multi-file loop with approvals; Ask / Plan / Agent + permission chip |
-| Chat | Cursor-like sidebar: composer, context ring, tool rows, Undo/Review, Restore, Continue |
+| Adaptive harness | Per-model profiles + calibrate + hysteresis + scored revise |
+| Tool protocol | Universal family recovery + schema repair across local/cloud formats |
+| Agent | Multi-file loop with approvals; Ask / Plan / Agent + permission chip; steering mid-turn |
+| Surfaces | Side chat **and** Agents window — same harness, settings, slash commands |
+| Chat | Cursor-like sidebar: composer, context ring, tool rows, image paste/DnD, Undo/Review, Restore, Continue |
+| Vision | Auto-route image turns to a vision-capable model when configured |
+| Verify | Project build/test via `set_verify_command` — stack-agnostic oracle |
 | Sandbox | User-configured shell sandbox + optional Full agent freedom |
 | Memory | Session wiki, project wiki, stable facts |
 | Governance | Skills, rules, policies, hard guardrails |
+| Bench | Headless suite + optional external baselines (Aider, OpenHands) on the same tasks |
 | MCP | Inbound tools + outbound wiki + Plugins catalog |
 
 Also discoverable as: *open source Cursor alternative*, *Ollama coding agent*, *llama.cpp coding IDE*, *local LLM agent IDE*.
@@ -155,6 +164,10 @@ T1–T4 × 3 reps, learned harness off for isolation. Score 0–100.
 
 T2 · T4 · CS2 · CS3 × 3 reps × 2 models. Protocol quality decides weak vs strong profile knobs — not the model name. Details: [`benchmarks/results/CALIBRATE-2026-10-20.md`](benchmarks/results/CALIBRATE-2026-10-20.md).
 
+### External baselines
+
+Same tasks, model, and server can be driven by Aider or OpenHands instead of CodeForge (`benchmarks/externalAgents.mjs`). Scoring stays in `bench.mjs` so the comparison is the agent loop, not a different grader.
+
 Harness design notes: [`extensions/codeforge/HEURISTICS.md`](extensions/codeforge/HEURISTICS.md).
 
 ---
@@ -164,22 +177,24 @@ Harness design notes: [`extensions/codeforge/HEURISTICS.md`](extensions/codeforg
 ```
 CodeForge/
 ├── extensions/codeforge/          # Shipped AI platform (source of truth)
-│   ├── src/agent/                 # Loop, profiles, telemetry, revise, tools
+│   ├── src/agent/                 # Loop, profiles, oracle, revise, tools
+│   │   └── universal/             # Multi-family tool recovery + schema repair
+│   ├── src/agents/                # Agents-window bridge + LM provider
 │   ├── resources/calibrate-bench/ # Packaged calibrate suite
-│   ├── src/views/                 # Chat host + Cursor-like UI
+│   ├── src/views/                 # Chat host + Cursor-like UI + attachments
 │   ├── src/memory/                # Session + project wiki
 │   ├── src/sandbox/               # Shell isolation
 │   ├── src/intelligence/          # Index, LSP, git, embeddings
 │   ├── src/mcp/                   # Inbound + outbound MCP
 │   └── src/governance/            # Skills, rules, guardrails
-├── benchmarks/                    # Full harness suite + CLI
+├── benchmarks/                    # Full harness suite + CLI + external baselines
 ├── docs/
 └── scripts/                       # Code-OSS setup / package / sync
 ```
 
 ## Configuration
 
-Prefer **CodeForge Settings** in the app (Models / Permissions / MCP / Guardrails / Agent).
+Prefer **CodeForge Settings** in the app (Models / Permissions / MCP / Guardrails / Agent / Benchmark). Image turns need at least one vision-capable model in Settings (Refresh from API fills `visionModels` when the server exposes multimodal capabilities).
 
 ```json
 {
