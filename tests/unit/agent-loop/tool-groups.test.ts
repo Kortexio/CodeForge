@@ -1,5 +1,5 @@
 /**
- * Phase 4: CORE-only build surface by default; toolGroups enable extras.
+ * Agent CORE includes git/web/browser/files/glob/wiki/media/notebook.
  */
 jest.mock('vscode', () => require('../../support/vscodeFsMock'));
 
@@ -8,7 +8,7 @@ import { runLoop } from './support/runLoop';
 import { CORE } from '../../../extensions/codeforge/src/agent/toolPermissions';
 
 describe('tool groups (phase 4)', () => {
-	it('build requests expose only CORE tools by default', async () => {
+	it('build requests expose CORE including git/web/browser/files/glob/wiki/media/notebook', async () => {
 		const result = await runLoop({
 			files: { 'a.ts': 'const x = 1;\n' },
 			task: 'Read a.ts and summarize.',
@@ -23,27 +23,39 @@ describe('tool groups (phase 4)', () => {
 		for (const n of names) {
 			expect([...CORE, 'mcp_call']).toContain(n);
 		}
-		expect(names).not.toContain('git_status');
-		expect(names).not.toContain('web_search');
-		expect(names).not.toContain('browser_navigate');
-		expect(names).not.toContain('delete');
+		expect(names).toContain('git_status');
+		expect(names).toContain('web_search');
+		expect(names).toContain('browser_navigate');
+		expect(names).toContain('delete');
+		expect(names).toContain('glob');
+		expect(names).toContain('wiki_read');
+		expect(names).toContain('wiki_write');
+		expect(names).toContain('generate_image');
+		expect(names).toContain('canvas_write');
+		expect(names).toContain('edit_notebook');
+		expect(names).not.toContain('mcp_call');
 	}, 60_000);
 
-	it('enabling git toolGroup adds git tools', async () => {
+	it('glob returns matching files from findFiles, not a stub', async () => {
 		const result = await runLoop({
-			files: { 'a.ts': 'const x = 1;\n' },
-			task: 'Read a.ts.',
-			script: [callTool('read', { path: 'a.ts' }), reply({ content: 'ok' })],
+			files: {
+				'src/A.ts': 'export const a = 1;\n',
+				'src/B.cs': 'class B {}\n',
+				'README.md': '# hi\n',
+			},
+			task: 'Find TypeScript files.',
+			script: [callTool('glob', { pattern: '**/*.ts' }), reply({ content: 'found A.ts' })],
 			maxSteps: 6,
-			config: { 'codeforge.ai.toolGroups': ['git'] },
 		});
-		const tools = (result.requests[0]?.body.tools ?? []) as Array<{
-			function?: { name?: string };
-		}>;
-		const names = tools.map(t => t.function?.name).filter(Boolean) as string[];
-		expect(names).toContain('git_status');
-		expect(names).toContain('git_commit');
-		expect(names).not.toContain('web_search');
+		const toolMsgs = result.requests
+			.flatMap(r => (r.body.messages ?? []) as Array<{ role?: string; content?: string }>)
+			.filter(m => m.role === 'tool')
+			.map(m => m.content ?? '')
+			.join('\n');
+		expect(toolMsgs).toMatch(/src\/A\.ts/);
+		expect(toolMsgs).not.toMatch(/src\/B\.cs/);
+		expect(toolMsgs).not.toMatch(/^ok$/m);
+		expect(toolMsgs).not.toMatch(/coming soon|not implemented|would run here/i);
 	}, 60_000);
 });
 

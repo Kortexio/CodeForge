@@ -353,6 +353,61 @@ function sniffImageMime(buf: Buffer): string | undefined {
 	return undefined;
 }
 
+function asUri(value: unknown): vscode.Uri | undefined {
+	if (!value || typeof value !== 'object') return undefined;
+	const v = value as { scheme?: string; fsPath?: string; uri?: vscode.Uri };
+	if (typeof v.scheme === 'string' && typeof v.fsPath === 'string') {
+		return value as vscode.Uri;
+	}
+	if (v.uri && typeof v.uri.scheme === 'string' && typeof v.uri.fsPath === 'string') {
+		return v.uri;
+	}
+	return undefined;
+}
+
+async function attachmentFromBinaryData(
+	value: { mimeType?: string; data?: () => Thenable<Uint8Array> },
+	label: string,
+	canAttachImages: boolean
+): Promise<PendingAttachment | undefined> {
+	if (typeof value.data !== 'function') return undefined;
+	const buf = Buffer.from(await value.data());
+	const mime = value.mimeType || sniffImageMime(buf) || 'application/octet-stream';
+	return attachmentFromBlob({ name: label || 'attachment', mime, base64: buf.toString('base64') }, canAttachImages);
+}
+
+/**
+ * Agents-window ChatRequest.references → pending attachments (files, images, URIs).
+ * Binary image parts (ChatReferenceBinaryData) are included; unknown values are skipped.
+ */
+export async function attachmentsFromChatRequest(
+	request: { references?: readonly { value?: unknown; name?: string }[] },
+	canAttachImages = true
+): Promise<PendingAttachment[]> {
+	const refs = request.references ?? [];
+	const uris: vscode.Uri[] = [];
+	const extras: PendingAttachment[] = [];
+	for (const ref of refs) {
+		const value = ref.value;
+		if (value === undefined || value === null) continue;
+		const uri = asUri(value);
+		if (uri) {
+			uris.push(uri);
+			continue;
+		}
+		if (typeof value === 'object' && 'data' in (value as object)) {
+			const att = await attachmentFromBinaryData(
+				value as { mimeType?: string; data?: () => Thenable<Uint8Array> },
+				ref.name || 'image',
+				canAttachImages
+			);
+			if (att) extras.push(att);
+		}
+	}
+	const fromUris = uris.length ? await attachmentsFromUris(uris, canAttachImages) : [];
+	return mergeAttachments(fromUris, extras);
+}
+
 export function parseDroppedUriList(raw: string): vscode.Uri[] {
 	const lines = raw
 		.split(/\r?\n/)

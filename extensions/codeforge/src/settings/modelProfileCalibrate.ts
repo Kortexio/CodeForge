@@ -136,7 +136,7 @@ export function runModelProfileCalibration(opts: CalibrateOpts): Promise<Calibra
 						.join(path.delimiter),
 				},
 				windowsHide: true,
-			}) as ChildProcessWithoutNullStreams;
+			});
 		} catch (err) {
 			resolve({
 				ok: false,
@@ -368,7 +368,7 @@ export function runHarnessRevision(opts: CalibrateOpts): Promise<CalibrateResult
 						.join(path.delimiter),
 				},
 				windowsHide: true,
-			}) as ChildProcessWithoutNullStreams;
+			});
 		} catch (err) {
 			resolve({
 				ok: false,

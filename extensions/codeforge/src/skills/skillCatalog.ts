@@ -95,8 +95,7 @@ export function resolveSkillBody(name: string): { title: string; body: string } 
 				(s: SkillDoc) =>
 					norm(s.id) === q ||
 					norm(s.title) === q ||
-					norm(s.id).endsWith(':' + q) ||
-					norm(s.id).includes(q)
+					norm(s.id).endsWith(':' + q)
 			);
 		if (disk) {
 			return { title: disk.title, body: disk.content.trim() };

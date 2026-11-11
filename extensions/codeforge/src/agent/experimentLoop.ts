@@ -354,7 +354,7 @@ export function parseHabitsFile(text: string): HabitsFile {
 		const raw = JSON.parse(text) as Partial<HabitsFile>;
 		return {
 			version: 1,
-			habits: Array.isArray(raw.habits) ? (raw.habits as Habit[]) : [],
+			habits: Array.isArray(raw.habits) ? (raw.habits) : [],
 			coachedFeatures: Array.isArray(raw.coachedFeatures)
 				? raw.coachedFeatures.map(String)
 				: [],

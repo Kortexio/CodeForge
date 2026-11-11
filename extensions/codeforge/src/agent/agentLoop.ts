@@ -132,6 +132,12 @@ import {
 	TRUNCATED_TOOL_JSON_FINAL_NOTE,
 	TRUNCATED_TOOL_JSON_NOTE,
 	IDENTICAL_STALL_RECOVERY,
+	LIST_FAMILY_STALL_RECOVERY,
+	GLOB_FAMILY_STALL_RECOVERY,
+	SEARCH_FAMILY_STALL_RECOVERY,
+	READ_FAMILY_STALL_RECOVERY,
+	WEB_SEARCH_FAMILY_STALL_RECOVERY,
+	DIAGNOSTICS_FAMILY_STALL_RECOVERY,
 	repeatedExploreRefusal,
 	LENGTH_EXHAUSTED_PROMPT,
 	MAX_STEPS_PROMPT,
@@ -205,7 +211,6 @@ import {
 	DOTNET_TOOL,
 	isPartialRewrite,
 	isStatusQuestion,
-	LARGE_FILE_LINES,
 	PLAN_ALLOWED_TOOLS,
 	profileForTurn,
 	toolNamesFor,
@@ -213,8 +218,14 @@ import {
 } from './toolsets';
 import {
 	createLoopDetector,
+	DIAGNOSTICS_WORKSPACE_FAMILY,
+	globFamilyKey,
 	hashResult,
 	isExploreToolName,
+	listFamilyKey,
+	readFamilyKey,
+	searchFamilyKey,
+	webSearchFamilyKey,
 } from './loopDetector';
 import {
 	applyCoachReply,
@@ -291,7 +302,7 @@ function agentToolNeedsUserApproval(name: string): boolean {
 	if (reg && toolNeedsApproval(reg)) return true;
 	if (name === 'mcp_call') {
 		const pseudo: Pick<ToolDefinition, 'risk' | 'requiresApproval'> = {
-			risk: riskForAgentTool(name) as ToolRisk,
+			risk: riskForAgentTool(name),
 		};
 		return toolNeedsApproval(pseudo);
 	}
@@ -314,6 +325,7 @@ const READONLY_TOOLS = new Set([
 	'git_blame',
 	'git_conflicts',
 	'open',
+	'glob',
 	'wiki_read',
 	'wiki_search',
 	'wiki_facts',
@@ -613,6 +625,27 @@ export const AGENT_TOOLS = [
 					},
 				},
 				required: ['path'],
+			},
+		},
+	},
+	{
+		type: 'function' as const,
+		function: {
+			name: 'glob',
+			description: toolDescription('glob'),
+			parameters: {
+				type: 'object',
+				properties: {
+					pattern: {
+						type: 'string',
+						description: 'Glob pattern (e.g. **/*.csproj, src/**/*.ts)',
+					},
+					path: {
+						type: 'string',
+						description: 'Optional folder to scope the search',
+					},
+				},
+				required: ['pattern'],
 			},
 		},
 	},
@@ -1735,12 +1768,12 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 		trace?.setSession?.(opts.sessionId);
 	}
 
-	// First round: lean bootstrap (OpenCode-style). Full packet comes on later refresh.
+	// First round: lean env in system (frozen). Retrieve + IDE tabs/diagnostics go in the
+	// first user message — never rewrite messages[0] later for a packet.
 	const lean = await buildLeanContextPacket({
 		workspaceRoot: opts.workspaceRoot,
 		model: opts.model,
 	});
-	opts.onContextBadge?.(lean.badge);
 	opts.onActivity?.({
 		kind: 'context',
 		label: 'Lean context (step 1)',
@@ -1749,10 +1782,42 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 
 	const system = `${systemBase}\n\n${lean.markdown}`;
 
+	// One-shot retrieve+IDE only on the root run (subagents inherit findings via their task text).
+	let startUserText = opts.task;
+	if (depth === 0) {
+		const startPacket = await buildContextPacket({
+			task: opts.task,
+			facts,
+			workspaceRoot: opts.workspaceRoot,
+			includeRetrieve: true,
+			includePrefetch: false,
+			retrieveK: 4,
+			sessionId: opts.sessionId ?? undefined,
+			rerankFn: makeRerankFn(opts),
+			budget: {
+				...DEFAULT_BUDGET,
+				total: contextPacketTokenBudget(getContextBudget(opts.numCtx)),
+			},
+		});
+		opts.onContextBadge?.(startPacket.badge);
+		opts.onActivity?.({
+			kind: 'context',
+			label: 'Start retrieve + IDE',
+			detail: startPacket.markdown.slice(0, 400),
+		});
+		startUserText = [
+			'### Start context (retrieve + IDE)',
+			startPacket.markdown,
+			'',
+			'### Task',
+			opts.task,
+		].join('\n');
+	}
+
 	let messages: ChatMessage[] = [
 		{ role: 'system', content: system },
 		...history,
-		{ role: 'user', content: buildUserContent(opts.task, opts.images) },
+		{ role: 'user', content: buildUserContent(startUserText, opts.images) },
 	];
 
 	sm.transition('executing');
@@ -2239,7 +2304,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 
 			// Compact only when the window is actually filling up.
 			// Do NOT hard-compact on a step timer — that wastes a 32k context (Cursor fills the window).
-			// Context packet is assembled only inside hard compact (into the summary user message).
+			// Start-of-run already injected retrieve+IDE; hard compact refreshes the packet in the summary user message.
 			if (tokEst > compactAt) {
 				sm.transition('compacting');
 				opts.onActivity?.({
@@ -3286,11 +3351,83 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 			}
 			const lane: ParallelIoJob[] = [];
 
-			const noteIdenticalCall = (fingerprint: string, content: string, toolName = ''): string => {
-				const { note } = loopDetector.recordCall(fingerprint, hashResult(content));
+			const noteIdenticalCall = (
+				fingerprint: string,
+				content: string,
+				toolName = '',
+				exploreFamily?: string
+			): string => {
+				const { note } = loopDetector.recordCall(
+					fingerprint,
+					hashResult(content),
+					exploreFamily ? { family: exploreFamily } : undefined
+				);
 				if (note) thinkingEscalation.note('loop_note');
 				if (note && isExploreToolName(toolName)) return repeatedExploreRefusal(note);
 				return note ? `${note}\n${content}` : content;
+			};
+
+			const windowsOverlap = (
+				a: { start: number; end: number },
+				b: { start: number; end: number }
+			): boolean => a.start <= b.end && b.start <= a.end;
+
+			const exploreFamilyForCall = (
+				toolName: string,
+				toolArgs: Record<string, unknown>,
+				toolOutput: string,
+				success: boolean,
+				pathForList: string,
+				readStartLine: number,
+				readLimitLines: number
+			): string | undefined => {
+				if (toolName === 'list') {
+					return listFamilyKey(pathForList || String(toolArgs.path ?? '.'), !success);
+				}
+				if (toolName === 'glob') {
+					return globFamilyKey(
+						String(toolArgs.pattern ?? ''),
+						toolArgs.path ? String(toolArgs.path) : undefined
+					);
+				}
+				if (toolName === 'search') {
+					return searchFamilyKey(
+						String(toolArgs.pattern ?? ''),
+						toolArgs.path ? String(toolArgs.path) : undefined
+					);
+				}
+				if (toolName === 'web_search') {
+					const zero =
+						!success ||
+						/\b0 hits\b/i.test(toolOutput) ||
+						/\bno (results|matches)\b/i.test(toolOutput) ||
+						/^Error:/i.test(toolOutput.trim());
+					if (!zero) return undefined;
+					return webSearchFamilyKey(String(toolArgs.query ?? ''));
+				}
+				if (toolName === 'diagnostics') {
+					const scoped = String(toolArgs.path ?? '').trim();
+					if (scoped) return undefined;
+					return DIAGNOSTICS_WORKSPACE_FAMILY;
+				}
+				if (toolName === 'read' && pathForList) {
+					const start = Math.max(1, readStartLine || 1);
+					const end = start + Math.max(1, readLimitLines || 120) - 1;
+					const unchanged = /^\(unchanged since step \d+\)/.test(toolOutput);
+					const prior = readWindows.get(pathForList) ?? [];
+					// commitExecuted may already have pushed this window — ignore a trailing self-match.
+					const earlier =
+						prior.length > 0 &&
+						prior[prior.length - 1].start === start &&
+						prior[prior.length - 1].end === end
+							? prior.slice(0, -1)
+							: prior;
+					const overlaps = earlier.some(w => windowsOverlap(w, { start, end }));
+					if (unchanged || overlaps) {
+						return readFamilyKey(pathForList);
+					}
+				}
+				return undefined;
 			};
 
 			const runIoJob = async (
@@ -3337,7 +3474,20 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 				if (ran.threw) {
 					success = false;
 					failedFingerprints.set(fingerprint, priorFails + 1);
-					const threwContent = noteIdenticalCall(fingerprint, output.slice(0, toolCap));
+					const threwContent = noteIdenticalCall(
+						fingerprint,
+						output.slice(0, toolCap),
+						name,
+						exploreFamilyForCall(
+							name,
+							args,
+							output,
+							false,
+							pathKey || String(args.path ?? '.'),
+							readStart,
+							readLimit
+						)
+					);
 					messages.push({
 						role: 'tool',
 						tool_call_id: call.id,
@@ -3670,7 +3820,20 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 				if (name === 'read' && pathKey && success) {
 					const unchangedMarker = /^\(unchanged since step \d+\)\n/.exec(output)?.[0];
 					const diskBody = unchangedMarker ? output.slice(unchangedMarker.length) : output;
-					const { note } = loopDetector.recordCall(fingerprint, hashResult(diskBody));
+					const family = exploreFamilyForCall(
+						name,
+						args,
+						output,
+						success,
+						pathKey,
+						readStart,
+						readLimit
+					);
+					const { note } = loopDetector.recordCall(
+						fingerprint,
+						hashResult(diskBody),
+						family ? { family } : undefined
+					);
 					if (note) {
 						thinkingEscalation.note('loop_note');
 						output = isExploreToolName(name)
@@ -3678,7 +3841,20 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 							: `${note}\n${output}`;
 					}
 				} else {
-					output = noteIdenticalCall(fingerprint, output, name);
+					output = noteIdenticalCall(
+						fingerprint,
+						output,
+						name,
+						exploreFamilyForCall(
+							name,
+							args,
+							output,
+							success,
+							pathKey || String(args.path ?? '.'),
+							readStart,
+							readLimit
+						)
+					);
 				}
 
 				messages.push({
@@ -4446,16 +4622,58 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 			loopDetector.endStep();
 			loopDetector.setUnchangedStreak(unchangedStreak);
 
-			// Identical re-reads end the repeat loop and the turn continues.
+			// Identical / explore-family stalls end the repeat loop and the turn continues.
 			// A browser UI that stays unchanged still ends the turn.
 			if (loopDetector.shouldStop() && step >= 2) {
-				if (loopDetector.stallKind() === 'identical') {
+				const stall = loopDetector.stallKind();
+				const familyRecovery: Record<string, { content: string; label: string; detail: string }> = {
+					identical: {
+						content: IDENTICAL_STALL_RECOVERY,
+						label: 'Repeated calls stopped',
+						detail: 'continue verifying without repeating those calls',
+					},
+					'list-family': {
+						content: LIST_FAMILY_STALL_RECOVERY,
+						label: 'Repeated lists stopped',
+						detail: 'read a named path or search/retrieve — do not list that folder again',
+					},
+					'search-family': {
+						content: SEARCH_FAMILY_STALL_RECOVERY,
+						label: 'Repeated searches stopped',
+						detail: 'retrieve or read a named path — do not repeat that needle',
+					},
+					'glob-family': {
+						content: GLOB_FAMILY_STALL_RECOVERY,
+						label: 'Repeated globs stopped',
+						detail: 'retrieve or search — do not repeat that glob pattern',
+					},
+					'read-family': {
+						content: READ_FAMILY_STALL_RECOVERY,
+						label: 'Repeated re-reads stopped',
+						detail: 'read a different file or call search/retrieve/edit',
+					},
+					'web-search-family': {
+						content: WEB_SEARCH_FAMILY_STALL_RECOVERY,
+						label: 'Repeated web_search stopped',
+						detail: 'refine once or continue with repo tools',
+					},
+					'diagnostics-family': {
+						content: DIAGNOSTICS_FAMILY_STALL_RECOVERY,
+						label: 'Repeated diagnostics stopped',
+						detail: 'pass a path or edit the reported files',
+					},
+				};
+				const recovery = stall ? familyRecovery[stall] : undefined;
+				if (recovery) {
 					loopDetector.resetIdenticalStreak();
-					messages.push({ role: 'user', content: IDENTICAL_STALL_RECOVERY });
+					messages.push({
+						role: 'user',
+						content: recovery.content,
+					});
 					opts.onActivity?.({
 						kind: 'checkpoint',
-						label: 'Repeated reads stopped',
-						detail: 'continue verifying without repeating those calls',
+						label: recovery.label,
+						detail: recovery.detail,
 					});
 					continue;
 				}
@@ -4929,8 +5147,25 @@ async function executeTool(
 				});
 			case 'voice_status':
 				return voiceStatus();
+			case 'open': {
+				const result = await opts.bridge.execute({
+					id: callId,
+					name: 'open',
+					arguments: args,
+					abortSignal: opts.abortSignal,
+				});
+				if (!result.success) {
+					return `Error: ${result.error ?? 'failed'}`;
+				}
+				const opened = (result.output || `Opened ${String(args.path ?? '')}`).trim();
+				return `${opened}\n(open reveals the file in the editor — it does not replace read. Call read for file contents.)`;
+			}
 			case 'shell': {
 				const command = String(args.command ?? '');
+				const exploreRedirect = shellExploreRedirect(command);
+				if (exploreRedirect) {
+					return exploreRedirect;
+				}
 				const wantBg =
 					args.background === true ||
 					(typeof args.block_until_ms === 'number' && Number(args.block_until_ms) === 0);
@@ -4996,7 +5231,18 @@ async function executeTool(
 				if (!mcp) {
 					return 'Error: MCP not initialized';
 				}
-				const toolName = String(args.tool);
+				const toolName = String(args.tool ?? '').trim();
+				const catalog = mcp.listTools();
+				const catalogLines = catalog.length
+					? catalog.map(t => `- ${t.fullName}`).join('\n')
+					: '(no MCP tools loaded — Refresh MCP Servers)';
+				if (!toolName) {
+					return `Error: mcp_call tool name required. Catalog:\n${catalogLines}`;
+				}
+				const known = catalog.some(t => t.fullName === toolName || t.name === toolName);
+				if (!known) {
+					return `Error: unknown MCP tool "${toolName}". Catalog:\n${catalogLines}`;
+				}
 				const toolArgs = (args.arguments as Record<string, unknown>) ?? {};
 				return await mcp.callTool(toolName, toolArgs);
 			}
@@ -5264,7 +5510,7 @@ async function compactWithLlm(
 		task: opts.task,
 		facts,
 		workspaceRoot: opts.workspaceRoot,
-		includeRetrieve: false,
+		includeRetrieve: true,
 		includePrefetch: false,
 		retrieveK: 4,
 		rerankFn: makeRerankFn(opts),
@@ -7110,6 +7356,8 @@ function formatToolActivityLabel(name: string, args: Record<string, unknown>): s
 			return clipped ? `Reading ${clipped}` : 'Reading…';
 		case 'list':
 			return clipped ? `Listing ${clipped}` : 'Listing…';
+		case 'glob':
+			return clipped ? `Finding ${clipped}` : 'Finding…';
 		case 'search':
 			return clipped ? `Grepping ${clipped}` : 'Grepping…';
 		case 'retrieve':
@@ -7214,6 +7462,29 @@ function enrichShellFailure(command: string, output: string, workspaceRoot?: str
 		`command: ${command}`,
 		'(empty output usually means the program was not found or was killed)',
 	].join('\n');
+}
+
+/**
+ * Refuse shell used as a stand-in for list/read/search (dir/type/findstr/tree).
+ * Builds, tests, and starts are unaffected.
+ */
+function shellExploreRedirect(command: string): string | null {
+	const raw = String(command || '').trim();
+	if (!raw) return null;
+	// Last segment after && / || / ;
+	const parts = raw.split(/(?:&&|\|\||;)/);
+	const last = (parts[parts.length - 1] || raw).trim();
+	const bare = last.replace(/^\s*\(?\s*/, '');
+	if (/^(dir|tree)(\s|$|\/)/i.test(bare)) {
+		return 'Error: use the list tool for directories (or glob for filename patterns) instead of shell dir/tree. Prefer list { path: "..." } or glob { pattern: "**/*" }.';
+	}
+	if (/^type(\s|$)/i.test(bare)) {
+		return 'Error: use the read tool for file contents instead of shell type. Prefer read { path: "..." }.';
+	}
+	if (/^findstr(\s|$)/i.test(bare)) {
+		return 'Error: use the search tool instead of shell findstr. Prefer search { pattern: "..." }.';
+	}
+	return null;
 }
 
 function defaultBase(provider: string): string {

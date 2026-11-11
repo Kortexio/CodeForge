@@ -266,7 +266,7 @@ describe('harness contradictions', () => {
 		const bodies = lastMsgs.filter(m => m.role === 'tool' && /lines 1-2\/2/.test(m.content ?? ''));
 		expect(bodies.length).toBe(1);
 		const labels = result.activities.map(a => a.label ?? '');
-		expect(labels).toContain('Repeated reads stopped');
+		expect(labels.some(l => /^Repeated (calls|re-reads) stopped$/.test(l))).toBe(true);
 		expect(labels).not.toContain('Stopped tool loop');
 		expect(result.reply).not.toMatch(/tools were repeating without new progress/i);
 	}, 90_000);

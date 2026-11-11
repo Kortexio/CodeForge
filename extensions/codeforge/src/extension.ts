@@ -43,6 +43,7 @@ import {
 import { setEmbeddingsSettingsStore } from './intelligence/embeddings';
 import { startOutboundMcp, stopOutboundMcp } from './mcp/outbound';
 import type { McpServerConfig } from './settings/aiSettingsStore';
+import { ensureOutboundMcpToken } from './settings/aiSecrets';
 import { indexEmbeddings } from './intelligence/workspaceIndex';
 import { startWorkspaceIndexWatcher } from './intelligence/indexWatcher';
 import { createCodeForgeApi, setApiHost, setOpenWithPromptHandler, type CodeForgeApi } from './api';
@@ -393,6 +394,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<CodeFo
     );
 
     context.subscriptions.push(
+        vscode.commands.registerCommand('codeforge.reviewBugs', async () => {
+            await chatViewProvider.focus();
+            await chatViewProvider.runSlash('review');
+        }),
+        vscode.commands.registerCommand('codeforge.restoreCheckpoint', async () => {
+            await chatViewProvider.focus();
+            await chatViewProvider.runSlash('restore');
+        })
+    );
+
+    context.subscriptions.push(
         vscode.commands.registerCommand('codeforge.cancelTask', () => chatViewProvider.cancelTask())
     );
 
@@ -509,16 +521,28 @@ export async function activate(context: vscode.ExtensionContext): Promise<CodeFo
         dispose: () => setOpenWithPromptHandler(undefined),
     });
 
-    // Outbound MCP after views/commands — never block activate / EH handshake.
-    void startOutboundMcp(3847)
-        .then(status => {
-            outputChannel.appendLine(`MCP outbound: ${status.url ?? 'failed'}`);
-        })
-        .catch(err => {
-            outputChannel.appendLine(
-                `MCP outbound not started: ${err instanceof Error ? err.message : String(err)}`
-            );
-        });
+    // Outbound MCP is opt-in (default off) and requires a bearer token.
+    const outboundEnabled =
+        vscode.workspace.getConfiguration('codeforge.ai').get<boolean>('outboundMcp.enabled') ===
+        true;
+    if (outboundEnabled) {
+        void ensureOutboundMcpToken(context)
+            .then(token => startOutboundMcp({ port: 3847, bearerToken: token }))
+            .then(status => {
+                outputChannel.appendLine(
+                    `MCP outbound: ${status.url ?? 'failed'} (Bearer auth required)`
+                );
+            })
+            .catch(err => {
+                outputChannel.appendLine(
+                    `MCP outbound not started: ${err instanceof Error ? err.message : String(err)}`
+                );
+            });
+    } else {
+        outputChannel.appendLine(
+            'MCP outbound: disabled (enable codeforge.ai.outboundMcp.enabled to expose wiki on loopback)'
+        );
+    }
 
     const api = createCodeForgeApi();
     void getContextProviderRegistry();

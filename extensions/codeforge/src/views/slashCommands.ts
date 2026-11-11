@@ -25,6 +25,8 @@ const BUILTIN: SlashCommand[] = [
 	{ name: 'cards', description: 'Implement docs/C*.md cards one by one (optional: C01-C05)' },
 	{ name: 'plan-run', description: 'Plan the request in steps and run each step with a clean context' },
 	{ name: 'review', description: 'Find bugs: build/test signals, per-file review, BUGS.md' },
+	{ name: 'bugbot', description: 'Same as /review — find bugs and write BUGS.md' },
+	{ name: 'restore', description: 'Restore the last checkpoint (revert later file edits and chat)' },
 ];
 
 const extra = new Map<string, SlashCommand>();

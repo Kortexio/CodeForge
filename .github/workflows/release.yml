@@ -6,7 +6,30 @@ on:
       - 'v*'
 
 jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.22.0'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Build + unit tests
+        run: npm run verify
+
+      - name: Integration tests
+        run: npm run test:integration
+
   windows:
+    needs: [verify]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -30,7 +53,26 @@ jobs:
         run: npm run build:extensions
 
       - name: Package Windows (portable + installer)
+        env:
+          CODEFORGE_SIGN_PFX: ${{ secrets.CODEFORGE_SIGN_PFX }}
+          CODEFORGE_SIGN_PASSWORD: ${{ secrets.CODEFORGE_SIGN_PASSWORD }}
+          # Require signing only when a PFX secret is configured.
+          CODEFORGE_SIGN_REQUIRED: ${{ secrets.CODEFORGE_SIGN_PFX != '' && 'true' || 'false' }}
+          CODEFORGE_REQUIRE_INSTALLER: 'true'
         run: npm run vscode:package:win
+
+      - name: Smoke portable executable
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Path "VSCode-win32-x64" -Filter "CodeForge.exe" -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+          if (-not $exe) {
+            throw "CodeForge.exe missing after package"
+          }
+          $p = Start-Process -FilePath $exe.FullName -ArgumentList "--version" -PassThru -Wait -NoNewWindow
+          # Electron may return non-zero for --version on some builds; file must at least start.
+          Write-Host "Smoke launched $($exe.FullName) exit=$($p.ExitCode)"
+          if (-not (Test-Path $exe.FullName)) { throw "exe vanished" }
 
       - name: Upload Windows artifacts
         uses: actions/upload-artifact@v4

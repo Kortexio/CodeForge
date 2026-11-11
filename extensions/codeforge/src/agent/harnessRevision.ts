@@ -213,10 +213,10 @@ export function artifactFixtureHit(
 function sanitizeKnobs(raw: HarnessKnobs): HarnessKnobs {
 	const out: HarnessKnobs = {};
 	if (inRange(raw.writeMaxContentLines, KNOB_LIMITS.writeMaxContentLines)) {
-		out.writeMaxContentLines = Math.round(raw.writeMaxContentLines as number);
+		out.writeMaxContentLines = Math.round(raw.writeMaxContentLines);
 	}
 	if (inRange(raw.mutatingMaxTokens, KNOB_LIMITS.mutatingMaxTokens)) {
-		out.mutatingMaxTokens = Math.round(raw.mutatingMaxTokens as number);
+		out.mutatingMaxTokens = Math.round(raw.mutatingMaxTokens);
 	}
 	if (raw.enforceMassRewriteGate === true) {
 		out.enforceMassRewriteGate = true;
@@ -649,7 +649,7 @@ export function parseProposerEdit(
 	const knobs = sanitizeKnobs((obj.knobs ?? {}) as HarnessKnobs);
 	const rawKnobs = obj.knobs;
 	if (rawKnobs && typeof rawKnobs === 'object' && !Array.isArray(rawKnobs)) {
-		for (const key of Object.keys(rawKnobs as object)) {
+		for (const key of Object.keys(rawKnobs)) {
 			if (!(key in KNOB_LIMITS) && key !== 'enforceMassRewriteGate') {
 				return { ok: false, error: `unknown knob ${key}` };
 			}
@@ -731,7 +731,7 @@ function forbiddenSnippet(text: string): string | undefined {
 export function applyHarnessEdit(parent: HarnessArtifact, edit: HarnessEdit): HarnessArtifact {
 	const sections = { ...parent.sections };
 	for (const key of HARNESS_SECTIONS) {
-		if (edit.sections[key] !== undefined) sections[key] = edit.sections[key] as string;
+		if (edit.sections[key] !== undefined) sections[key] = edit.sections[key];
 	}
 	return {
 		version: 1,

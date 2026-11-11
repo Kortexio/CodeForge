@@ -92,7 +92,26 @@ export class NativeWikiMemoryProvider implements IMemoryProvider {
 		await getProjectWikiStore().addFact(fact.key, fact.value, fact.reason);
 	}
 
-	async forget(_scope: string, _key: string, _page?: string): Promise<void> {
-		// Project wiki has no delete API yet — no-op to satisfy IMemoryProvider.
+	async forget(scope: string, key: string, page?: string): Promise<void> {
+		if (this.workspaceRoot) {
+			await ensureProjectWiki(this.workspaceRoot);
+		}
+		const wiki = getProjectWikiStore();
+		if (!wiki.isReady()) {
+			throw new Error('Project wiki is not initialized; cannot forget');
+		}
+		const docId = page || key;
+		if (scope === PROJECT_SCOPE || scope.startsWith('codeforge.')) {
+			const deletedDoc = docId ? await wiki.deleteDocument(docId) : false;
+			const invalidated = key ? await wiki.invalidateFact(key, 'forget') : 0;
+			if (!deletedDoc && invalidated === 0) {
+				// Also try key as document id when page omitted
+				if (key && key !== docId) {
+					await wiki.deleteDocument(key);
+				}
+			}
+			return;
+		}
+		throw new Error(`forget is not supported for scope: ${scope}`);
 	}
 }

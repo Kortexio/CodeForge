@@ -55,12 +55,13 @@ product.configurationDefaults = {
 	'workbench.secondarySideBar.defaultVisibility': 'visible',
 	'chat.commandCenter.enabled': false,
 	'chat.disableAIFeatures': true,
-	// Code-OSS lacks Microsoft's extension signing infrastructure.
+	// Code-OSS lacks Microsoft's extension signing infrastructure until we ship
+	// signed VS Code Marketplace artifacts. Keep false and document in README.
 	'extensions.verifySignature': false,
-	// CodeForge is a local agent IDE. Do not put every folder in Restricted Mode.
-	'security.workspace.trust.enabled': false,
-	'security.workspace.trust.banner': 'never',
-	'security.workspace.trust.startupPrompt': 'never',
+	// Production posture: Workspace Trust prompts for untrusted folders.
+	'security.workspace.trust.enabled': true,
+	'security.workspace.trust.banner': 'always',
+	'security.workspace.trust.startupPrompt': 'once',
 };
 
 // Do not keep GitHub Copilot Chat as a built-in to auto-update or as a trusted

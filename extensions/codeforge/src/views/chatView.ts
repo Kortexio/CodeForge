@@ -64,6 +64,7 @@ import { getChatViewHtml } from './chatViewHtml';
 import type { ExternalChatHandle, ExternalChatSession } from '../api';
 import {
 	CONTINUE_TURN_PROMPT,
+	type AgentsTurnExtras,
 	type AgentsTurnResult,
 	type LoopExit,
 	type TurnObserver,
@@ -623,7 +624,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		task: string,
 		sessionId: string | undefined,
 		observer: TurnObserver,
-		token: vscode.CancellationToken
+		token: vscode.CancellationToken,
+		extras?: AgentsTurnExtras
 	): Promise<AgentsTurnResult> {
 		if (this._running) {
 			return { kind: 'busy' };
@@ -634,6 +636,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			}
 		} else if (this._currentSessionId) {
 			this.newChat();
+		}
+
+		if (extras?.attachments?.length) {
+			this.addPendingAttachments(extras.attachments);
 		}
 
 		const settled = new Promise<TurnOutcome>(resolve => {
@@ -652,10 +658,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 					sessionId: this._currentSessionId,
 					reply: last?.role === 'assistant' ? last.content : '',
 					loopExit: 'done',
+					canRestore: this.hasRestoreCheckpoint(),
 				};
 			});
 			const outcome = await Promise.race([settled, handled]);
-			return { kind: 'finished', ...outcome };
+			return {
+				kind: 'finished',
+				...outcome,
+				canRestore: outcome.canRestore ?? this.hasRestoreCheckpoint(),
+			};
 		} finally {
 			cancel.dispose();
 			if (this._turnObserver === observer) {
@@ -663,6 +674,23 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 				this._turnSettled = undefined;
 			}
 		}
+	}
+
+	/** Last user turn still has journaled file edits that /restore can revert. */
+	hasRestoreCheckpoint(): boolean {
+		return this.lastUserMessageIndex() >= 0 && getEditJournal().listFromTurn(0).length > 0;
+	}
+
+	/** Dispatch a slash command the same way the side-chat composer does. */
+	async runSlash(command: string, args = ''): Promise<boolean> {
+		return this.dispatchSlash(command, args);
+	}
+
+	private lastUserMessageIndex(): number {
+		for (let i = this._messages.length - 1; i >= 0; i--) {
+			if (this._messages[i].role === 'user') return i;
+		}
+		return -1;
 	}
 
 	private settleTurn(outcome: TurnOutcome): void {
@@ -865,7 +893,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			this.pushConfig();
 			this.pushQueue();
 			this.updateView();
-			this.settleTurn({ sessionId: this._currentSessionId, reply: finalReply, loopExit });
+			this.settleTurn({
+				sessionId: this._currentSessionId,
+				reply: finalReply,
+				loopExit,
+				canRestore: this.hasRestoreCheckpoint(),
+			});
 			await this.drainQueue();
 		}
 	}
@@ -1801,7 +1834,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		switch (command) {
 			case 'cards':
 			case 'plan-run':
-			case 'review': {
+			case 'review':
+			case 'bugbot': {
 				if (this._running) {
 					this.enqueueMessage(`/${command}${args ? ` ${args}` : ''}`);
 					return true;
@@ -1809,7 +1843,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 				const fallback =
 					command === 'cards'
 						? 'Implement the cards in docs/ in dependency order.'
-						: command === 'review'
+						: command === 'review' || command === 'bugbot'
 							? 'Review the code in this workspace and find bugs.'
 							: '';
 				const task = args || fallback;
@@ -1818,8 +1852,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 					this.addMessage('assistant', 'Usage: /plan-run <what to build>');
 					return true;
 				}
-				this._runKind = command;
+				this._runKind = command === 'bugbot' ? 'review' : command;
 				await this.runTask(task, this._mode === 'ask' || this._mode === 'plan' ? 'agent' : undefined);
+				return true;
+			}
+			case 'restore': {
+				if (this._running) {
+					this.enqueueMessage('/restore');
+					return true;
+				}
+				const idx = this.lastUserMessageIndex();
+				await this.restoreCheckpoint(idx);
 				return true;
 			}
 			case 'help':
@@ -1981,7 +2024,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
 	/** Last sentence / trailing clause of streamed model text for the live status line. */
 	private static liveNarrationSnippet(text: string): string {
-		let t = String(text || '')
+		const t = String(text || '')
 			.replace(/\s+/g, ' ')
 			.trim();
 		if (!t) return 'Planning next moves';
@@ -1990,7 +2033,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			return 'Planning next moves';
 		}
 		const sentences = t.split(/(?<=[.!?…])\s+/).filter(Boolean);
-		let pick = sentences.length ? sentences[sentences.length - 1]! : t;
+		let pick = sentences.length ? sentences[sentences.length - 1] : t;
 		if (pick.length < 16 && sentences.length > 1) {
 			pick = sentences.slice(-2).join(' ');
 		}

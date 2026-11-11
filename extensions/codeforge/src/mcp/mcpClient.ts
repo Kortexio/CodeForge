@@ -12,6 +12,7 @@ import { accessSync, constants } from 'fs';
 import { McpServerConfig } from '../settings/aiSettingsStore';
 import { parseEnvFile } from './mcpJsonFile';
 import { formatMcpResult } from './mcpResultFormat';
+import { buildMcpSpawnEnv, mcpArgsUseLatest } from './mcpSpawnEnv';
 
 const MCP_HTTP_TIMEOUT_MS = 12_000;
 
@@ -343,6 +344,11 @@ export class McpClientManager {
 	private async connectStdio(server: McpServerConfig): Promise<void> {
 		const framing = detectStdioFraming(server);
 		const { command, args } = resolveStdioSpawn(server);
+		if (mcpArgsUseLatest(args) || mcpArgsUseLatest(server.args)) {
+			throw new Error(
+				`MCP server "${server.name}" uses a floating @latest package tag. Pin a version (e.g. mcp-remote@0.16.5) and restart.`
+			);
+		}
 		this.output.appendLine(
 			`[mcp] starting ${server.name} (${framing}): ${command} ${args.join(' ')}`
 		);
@@ -352,7 +358,7 @@ export class McpClientManager {
 
 		const fileEnv = loadStdioEnvFile(server);
 		const proc = spawn(command, args, {
-			env: { ...process.env, ...fileEnv, ...(server.env ?? {}) },
+			env: buildMcpSpawnEnv(fileEnv, server.env),
 			shell: false,
 			windowsHide: true,
 			stdio: ['pipe', 'pipe', 'pipe'],

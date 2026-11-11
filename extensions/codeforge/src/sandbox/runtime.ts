@@ -3,8 +3,8 @@
  */
 
 import { spawn, SpawnOptionsWithoutStdio } from 'child_process';
-import * as path from 'path';
 import { killProcessTree } from './processKill';
+import { isWinJobAvailable, spawnInWinJob } from './winJob';
 
 export type SandboxLevel =
 	| 'safe-local'
@@ -93,12 +93,23 @@ const BLOCKED_PATTERNS = [
 	/\breg\s+delete\b/i,
 	/\bcurl\s+.*\|\s*(sh|bash|powershell)/i,
 	/\bwget\s+.*\|\s*(sh|bash)/i,
+	/\biex\b/i,
+	/\binvoke-expression\b/i,
+	/\binvoke-webrequest\b[^\n\r;|&]*\|\s*/i,
+	/\biwr\b[^\n\r;|&]*\|\s*/i,
+	/\bdownloadstring\b/i,
+	/\bdownloadfile\b/i,
+	/\bfrombase64string\b/i,
+	/\bstart-process\b[^\n\r;|&]*-verb\s+runas\b/i,
+	/\bcertutil\b[^\n\r;|&]*-decode\b/i,
+	/\bbscript\b/i,
+	/\bcscript\b/i,
+	/\bpowershell\b[^\n\r;|&]*-enc(?:odedcommand)?\b/i,
+	/\bpowershell\b[^\n\r;|&]*-e\s+[A-Za-z0-9+/=]{20,}/i,
 ];
 
-const SHELL_CHAIN_RE = /(?:&&|\|\||\||;)/;
-
 export function hasShellChaining(command: string): boolean {
-	return SHELL_CHAIN_RE.test(command);
+	return /(?:&&|\|\||\||;)/.test(command);
 }
 
 const SECRET_ENV_KEYS = [
@@ -112,6 +123,9 @@ const SECRET_ENV_KEYS = [
 	/^OPENAI_/i,
 	/^ANTHROPIC_/i,
 	/^GITHUB_TOKEN$/i,
+	/^GH_TOKEN$/i,
+	/^NPM_TOKEN$/i,
+	/^CODEFORGE_/i,
 ];
 
 export function scrubEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
@@ -122,7 +136,19 @@ export function scrubEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEn
 		out[k] = v;
 	}
 	// Keep PATH / system essentials
-	for (const keep of ['PATH', 'Path', 'SystemRoot', 'USERPROFILE', 'HOME', 'TEMP', 'TMP', 'LANG']) {
+	for (const keep of [
+		'PATH',
+		'Path',
+		'PATHEXT',
+		'SystemRoot',
+		'USERPROFILE',
+		'HOME',
+		'TEMP',
+		'TMP',
+		'LANG',
+		'ComSpec',
+		'COMSPEC',
+	]) {
 		if (env[keep] !== undefined) out[keep] = env[keep];
 	}
 	return out;
@@ -197,7 +223,8 @@ export async function runSandboxed(opts: SandboxOptions): Promise<SandboxResult>
 	const isWin = process.platform === 'win32';
 	const shell = opts.shell ?? (isWin ? 'cmd.exe' : '/bin/bash');
 	const cmdDefault = isWin && !opts.shell && !opts.args ? cmdExeSpawn(opts.command) : undefined;
-	const args = opts.args ?? cmdDefault?.args ?? (isWin ? ['/d', '/s', '/c', opts.command] : ['-lc', opts.command]);
+	const args =
+		opts.args ?? cmdDefault?.args ?? (isWin ? ['/d', '/s', '/c', opts.command] : ['-lc', opts.command]);
 	const env =
 		level === 'unrestricted'
 			? { ...process.env, ...(opts.env ?? {}) }
@@ -210,26 +237,56 @@ export async function runSandboxed(opts: SandboxOptions): Promise<SandboxResult>
 		...(cmdDefault ? { windowsVerbatimArguments: true } : {}),
 	};
 
-	// isolated: attempt platform helpers; fall back to restricted semantics
 	if (level === 'isolated') {
-		const helper = await tryIsolatedHelper(opts, env);
-		if (helper) return helper;
+		return runIsolated(opts, shell, args, spawnOpts);
 	}
 
 	return spawnOnce(shell, args, spawnOpts, level, opts);
 }
 
-function tryIsolatedHelper(
+async function runIsolated(
 	opts: SandboxOptions,
-	env: NodeJS.ProcessEnv
-): Promise<SandboxResult | null> {
-	// Soft isolation without external binaries: restricted env + cwd jail already applied.
-	// Job Objects / sandbox-exec / bwrap can be wired via resources/binaries when present.
-	const binariesRoot = path.join(__dirname, '..', '..', '..', '..', 'resources', 'binaries');
-	void binariesRoot;
-	void env;
-	void opts;
-	return Promise.resolve(null);
+	shell: string,
+	args: string[],
+	spawnOpts: SpawnOptionsWithoutStdio
+): Promise<SandboxResult> {
+	if (process.platform !== 'win32') {
+		return {
+			exitCode: 126,
+			stdout: '',
+			stderr:
+				'isolated sandbox is Windows-only (Job Object). Use restricted, safe-local, or container on this OS.',
+			level: 'isolated',
+		};
+	}
+	if (!isWinJobAvailable()) {
+		return {
+			exitCode: 126,
+			stdout: '',
+			stderr:
+				'isolated sandbox requires the koffi native module for Windows Job Objects. Install extension dependencies or use restricted.',
+			level: 'isolated',
+		};
+	}
+	try {
+		const result = await spawnInWinJob({
+			shell,
+			args,
+			spawnOpts,
+			timeoutMs: opts.timeoutMs ?? 120_000,
+			abortSignal: opts.abortSignal,
+			onStdout: opts.onStdout,
+			onStderr: opts.onStderr,
+		});
+		return { ...result, level: 'isolated' };
+	} catch (err) {
+		return {
+			exitCode: 126,
+			stdout: '',
+			stderr: `isolated Job Object failed: ${err instanceof Error ? err.message : String(err)}`,
+			level: 'isolated',
+		};
+	}
 }
 
 async function runDocker(opts: SandboxOptions): Promise<SandboxResult> {
@@ -237,6 +294,9 @@ async function runDocker(opts: SandboxOptions): Promise<SandboxResult> {
 	const args = [
 		'run',
 		'--rm',
+		'--network=none',
+		'--user',
+		'1000:1000',
 		'-v',
 		`${opts.cwd}:/work`,
 		'-w',

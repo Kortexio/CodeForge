@@ -1,7 +1,13 @@
 /**
  * Configurable stall threshold must actually gate shouldStop/cause — not a no-op knob.
  */
-import { createLoopDetector, hashResult } from './loopDetector';
+import {
+	createLoopDetector,
+	globFamilyKey,
+	hashResult,
+	listFamilyKey,
+	searchFamilyKey,
+} from './loopDetector';
 
 function assert(cond: boolean, msg: string): void {
 	if (!cond) throw new Error(msg);
@@ -63,6 +69,85 @@ function repeatStep(det: ReturnType<typeof createLoopDetector>, fp: string, resu
 	det.resetIdenticalStreak();
 	assert(!det.shouldStop(), 'reset clears the identical stall');
 	assert(det.stallKind() === null, 'no stall kind after reset');
+}
+
+assert(listFamilyKey('.vscode', false) === 'list:.vscode', 'ok list of a dir is itself');
+assert(
+	listFamilyKey('.vscode/launch.json', true) === 'list:.vscode',
+	'failed child lists under the parent'
+);
+assert(
+	listFamilyKey('.vscode/launch', true) === 'list:.vscode',
+	'failed extensionless child lists under the parent'
+);
+assert(
+	listFamilyKey('src/pricing', false) === 'list:src/pricing',
+	'ok list of a subfolder is not the parent'
+);
+assert(
+	globFamilyKey('**/*.csproj', 'src') === 'glob:src|**/*.csproj',
+	'glob family is scope + exact pattern'
+);
+assert(
+	searchFamilyKey('launch') === searchFamilyKey('launch.json'),
+	'search family groups launch variants'
+);
+assert(
+	searchFamilyKey('applyCoupon') !== searchFamilyKey('WELCOME10'),
+	'search family keeps unrelated needles apart'
+);
+
+{
+	const det = createLoopDetector();
+	const fam = searchFamilyKey('launch');
+	det.recordCall('search:a', hashResult('0'), { family: fam });
+	det.endStep();
+	det.recordCall('search:b', hashResult('0b'), { family: searchFamilyKey('launch.json') });
+	det.endStep();
+	assert(!det.shouldStop(), 'two search-family steps do not trip yet');
+	det.recordCall('search:c', hashResult('0c'), { family: searchFamilyKey('\\blaunch') });
+	det.endStep();
+	assert(det.shouldStop(), 'three search-family steps trip');
+	assert(det.stallKind() === 'search-family', 'search-family stall kind');
+}
+
+{
+	const det = createLoopDetector();
+	det.recordCall('list:.vscode', hashResult('settings.json'), { listFamily: '.vscode' });
+	det.endStep();
+	det.recordCall('list:.vscode/launch', hashResult('ENOENT launch'), { listFamily: '.vscode' });
+	det.endStep();
+	assert(!det.shouldStop(), 'two list-family steps do not trip yet');
+	det.recordCall('list:.vscode/launch.json', hashResult('ENOENT json'), { listFamily: '.vscode' });
+	det.endStep();
+	assert(det.shouldStop(), 'three list-family steps on the same folder trip');
+	assert(det.stallKind() === 'list-family', 'list-family stall kind');
+	assert(/same folder/.test(det.cause()), 'list-family cause names the folder');
+	det.resetIdenticalStreak();
+	assert(!det.shouldStop(), 'reset clears list-family stall');
+}
+
+{
+	const det = createLoopDetector();
+	det.recordCall('list:src', hashResult('src kids'), { listFamily: 'src' });
+	det.endStep();
+	det.recordCall('list:src/pricing', hashResult('pricing kids'), { listFamily: 'src/pricing' });
+	det.endStep();
+	det.recordCall('list:src/cart', hashResult('cart kids'), { listFamily: 'src/cart' });
+	det.endStep();
+	assert(!det.shouldStop(), 'listing distinct subfolders is not a list-family stall');
+}
+
+{
+	const det = createLoopDetector();
+	det.recordCall('list:.vscode', hashResult('a'), { listFamily: '.vscode' });
+	det.endStep();
+	det.recordCall('read:settings', hashResult('json'));
+	det.endStep();
+	det.recordCall('list:.vscode', hashResult('a'), { listFamily: '.vscode' });
+	det.endStep();
+	assert(det.getConsecutiveListFamilySteps() === 1, 'a non-list step resets the list-family streak');
+	assert(!det.shouldStop(), 'reset list-family streak does not stop');
 }
 
 console.log('loopDetector.selftest: ok');

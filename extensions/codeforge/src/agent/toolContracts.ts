@@ -22,7 +22,8 @@ export function buildToolSystemContract(
 	const active = activeNames ? new Set(activeNames) : undefined;
 	const has = (...names: string[]) => !active || names.some(n => active.has(n));
 	const renameRule = prompt?.renameSearchRule !== false;
-	const shellHints = prompt?.shellCmdExeHints !== false;
+	const _shellHints = prompt?.shellCmdExeHints !== false;
+	void _shellHints;
 
 	const lines: string[] = [
 		'### Tool contract',
@@ -48,16 +49,21 @@ export function buildToolSystemContract(
 	}
 
 	const explore: string[] = [];
-	if (has('list')) explore.push('list');
-	if (has('search')) explore.push('search');
+	// Order is intentional: retrieve → glob → search/read → LSP → list last.
 	if (has('retrieve')) explore.push('retrieve');
+	if (has('glob')) explore.push('glob');
+	if (has('search')) explore.push('search');
 	if (has('read')) explore.push('read');
 	if (has('symbols') || has('definition') || has('references')) {
 		explore.push('symbols/definition/references');
 	}
+	if (has('list')) explore.push('list');
 	if (has('diagnostics')) explore.push('diagnostics');
 	if (explore.length) {
 		lines.push(`Exploration: ${explore.join(', ')}.`);
+		lines.push(
+			'Prefer retrieve for “where is X?”, glob for filename patterns (**/*.csproj), then search or read a known path; use symbols/definition/references to jump to a symbol. list is last — it does not replace a file name.'
+		);
 	}
 
 	const commands: string[] = [];
@@ -138,26 +144,48 @@ export const TOOL_DESCRIPTIONS = {
 		'Find them in the project first (README, CI config, build/manifest files, task runners). The harness runs them right away and returns the result, then reruns them after changes and before you finish; exit code 0 is green.',
 		'A command the shell cannot find is not recorded. If the project has no build or test at all, pass `none` with the reason instead of commands.',
 	].join(' '),
-	list: 'List one directory (non-recursive by default). path required. Set recursive true only for shallow trees; prefer a subfolder over the workspace root.',
-	search:
-		'Regex/text search across workspace files. pattern required; optional path to scope. Prefer search/retrieve before reading many files blindly.',
-	retrieve:
-		'Semantic/lexical top-k code snippets for a natural-language query. Prefer for “where is X?” over dumping whole files. query required; optional k (default 6).',
+	list: [
+		'List one directory (non-recursive by default). path required and must be a directory — do not list a file.',
+		'After a listing or ENOENT for that folder, do not list it or its missing children again; read a named path, or search/retrieve/glob.',
+		'Set recursive true only for shallow trees; prefer a subfolder over the workspace root. For filename patterns use glob, not a deep list.',
+	].join(' '),
+	glob: [
+		'Find files by glob pattern (vscode findFiles). pattern required (e.g. **/*.csproj); optional path to scope under a folder.',
+		'Returns matching workspace-relative paths (capped). Prefer glob over list/recursive or shell dir when you need files by name/extension.',
+		'After 0 hits, do not repeat the same pattern in the same scope — call retrieve or search.',
+	].join(' '),
+	search: [
+		'Regex/text search across workspace files. pattern required; optional path to scope.',
+		'Prefer search/retrieve before reading many files blindly.',
+		'After 0 hits, do not repeat the same needle (or regex/extension variants) in the same scope — call retrieve or read a path from a listing.',
+	].join(' '),
+	retrieve: [
+		'Semantic/lexical top-k code snippets for a natural-language query.',
+		'Prefer for “where is X?” / “how do I run this” over dumping whole files; do not re-run the same query.',
+		'query required; optional k (default 6).',
+	].join(' '),
 	delete: 'Delete a file at path. Irreversible in the workspace — use only when the task requires removal.',
 	rename:
 		'Rename or move a file (oldPath → newPath). Both paths required. Files only — to rename a symbol, edit each occurrence, then search the old name until no hits remain.',
-	open: 'Reveal/open a file in the editor UI. Does not modify contents. path required.',
+	open: [
+		'Reveal/open a file in the editor UI. Does not modify contents and does not replace read — call read for file text.',
+		'path required.',
+	].join(' '),
 	shell: [
 		'Run a cmd.exe command in the workspace (&& chaining OK; no PowerShell/Unix pipes).',
 		'Use for builds/tests/dev servers. Prefer web_search/web_fetch for HTTP and dedicated tools for file/git ops.',
+		'Do not use dir/type/findstr to explore files — call list/read/search/glob instead.',
 		'Long jobs: background=true then await_shell. command required.',
 	].join(' '),
 	shellUnixHints:
-		'cmd.exe has no Unix tools or heredocs: use del (not rm), type (not cat), findstr (not grep/tail/head), %TEMP% (not /tmp); create files with write, not `cat > file << EOF`; PowerShell cmdlets (Set-Content, Out-File) do not run here.',
+		'cmd.exe has no Unix tools or heredocs: use del (not rm), type (not cat), findstr (not grep/tail/head), %TEMP% (not /tmp); create files with write, not `cat > file << EOF`; PowerShell cmdlets (Set-Content, Out-File) do not run here. For exploring the repo prefer list/read/search/glob over dir/type/findstr.',
 	await_shell:
 		'Wait/poll a background shell job. id required (from shell background). Optional pattern regex on output; optional block_until_ms.',
-	web_search:
-		'Search the public web (no API key). Prefer over shell curl for discovery. query required; optional max_results.',
+	web_search: [
+		'Search the public web (no API key). Prefer over shell curl for discovery.',
+		'After 0 hits, do not repeat the same query needle — refine or stop.',
+		'query required; optional max_results.',
+	].join(' '),
 	web_fetch:
 		'Fetch a URL over HTTPS and return text/markdown-ish content. url required; optional max_chars.',
 	todo_write:
@@ -177,12 +205,14 @@ export const TOOL_DESCRIPTIONS = {
 	voice_status: 'Report whether voice input is available (status only; does not record audio).',
 	diagnostics:
 		'Language-server errors/warnings for a file or the workspace. Optional path; omit for workspace-wide.',
-	symbols:
-		'List document symbols (path) or search workspace symbols (query). Provide path and/or query.',
+	symbols: [
+		'List document symbols (path) or search workspace symbols (query).',
+		'Prefer over list when jumping to a named symbol. Provide path and/or query.',
+	].join(' '),
 	references:
-		'Find references at a 1-based line (and character) in a file. path and line required.',
+		'Find references at a 1-based line (and character) in a file. path and line required. Prefer over search when the symbol position is known.',
 	definition:
-		'Go to definition at a 1-based line (and character) in a file. path and line required.',
+		'Go to definition at a 1-based line (and character) in a file. path and line required. Prefer over list/search when jumping to a symbol.',
 	git_status: 'Show working-tree status (git status). No arguments.',
 	git_diff: 'Show git diff. Optional path to scope to one file.',
 	git_log: 'Show recent commits. Optional limit.',
@@ -223,10 +253,14 @@ export const TOOL_DESCRIPTIONS = {
 		'Run a focused subagent and return its result.',
 		'mode: explore (read-only), general (full tools), or plan. task required; optional context.',
 	].join(' '),
-	mcp_call:
+	mcp_call: [
 		'Call an MCP tool by full name (server__tool). tool required; optional arguments object.',
-	skill:
-		'Load a playbook/skill by id or title when you need domain conventions or a workflow. name required. Catalog is injected at runtime.',
+		'Only names from the injected MCP catalog are valid — unknown tools are refused with the catalog list.',
+	].join(' '),
+	skill: [
+		'Load a playbook/skill by id or title when you need domain conventions or a workflow. name required.',
+		'Only ids/titles from the injected catalog are valid — unknown names are refused with the catalog list.',
+	].join(' '),
 } as const;
 
 export type ToolDescriptionName = Exclude<keyof typeof TOOL_DESCRIPTIONS, 'shellUnixHints'>;

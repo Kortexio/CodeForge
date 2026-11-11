@@ -63,9 +63,38 @@ function allow(...names: string[]): PermissionRuleset {
 	return names.map(permission => ({ permission, pattern: '*', action: 'allow' as const }));
 }
 
+export const TOOL_GROUPS = {
+	git: [
+		'git_status',
+		'git_diff',
+		'git_log',
+		'git_blame',
+		'git_conflicts',
+		'git_commit_msg',
+		'git_add',
+		'git_commit',
+		'git_push',
+		'gh_pr_create',
+	],
+	wiki: ['wiki_read', 'wiki_search', 'wiki_write', 'wiki_fact', 'wiki_facts'],
+	browser: [
+		'browser_navigate',
+		'browser_snapshot',
+		'browser_click',
+		'browser_type',
+		'browser_screenshot',
+	],
+	web: ['web_search', 'web_fetch'],
+	media: ['generate_image', 'canvas_write', 'voice_status'],
+	notebook: ['edit_notebook'],
+	navigation: ['symbols', 'references', 'definition'],
+	files: ['delete', 'rename', 'open'],
+} as const;
+
 /** Ask mode: read the repo + web (no writes / shell mutators). */
 export const ASK_ALLOWED_TOOLS = [
 	'list',
+	'glob',
 	'read',
 	'search',
 	'retrieve',
@@ -91,6 +120,7 @@ export const ASK_ALLOWED_TOOLS = [
 /** Plan-mode allow-list (same surface as legacy PLAN_MODE_TOOLS). */
 export const PLAN_ALLOWED_TOOLS = [
 	'list',
+	'glob',
 	'read',
 	'search',
 	'retrieve',
@@ -125,6 +155,7 @@ export const COACH_ALLOWED_TOOLS = ['think', 'update_status'] as const;
 const EXPLORE_ALLOWED = [
 	'read',
 	'list',
+	'glob',
 	'search',
 	'retrieve',
 	'diagnostics',
@@ -139,11 +170,14 @@ const EXPLORE_ALLOWED = [
 	'git_log',
 	'web_search',
 	'web_fetch',
+	'wiki_read',
+	'wiki_search',
+	'wiki_facts',
 ] as const;
 
 /**
- * Default Agent surface: CORE only. Optional groups come from
- * `codeforge.ai.toolGroups` and `AgentModeDefinition.toolGroups`.
+ * Default Agent surface: all built-in groups except MCP extras.
+ * `codeforge.ai.toolGroups` still merges named groups (now overlapping CORE).
  */
 export const CORE = [
 	'read',
@@ -151,8 +185,12 @@ export const CORE = [
 	'write',
 	'apply_patch',
 	'list',
+	'glob',
 	'search',
 	'retrieve',
+	'symbols',
+	'definition',
+	'references',
 	'shell',
 	'await_shell',
 	'dotnet',
@@ -163,35 +201,14 @@ export const CORE = [
 	'think',
 	'update_status',
 	'skill',
+	...TOOL_GROUPS.files,
+	...TOOL_GROUPS.git,
+	...TOOL_GROUPS.web,
+	...TOOL_GROUPS.browser,
+	...TOOL_GROUPS.wiki,
+	...TOOL_GROUPS.media,
+	...TOOL_GROUPS.notebook,
 ] as const;
-
-export const TOOL_GROUPS = {
-	git: [
-		'git_status',
-		'git_diff',
-		'git_log',
-		'git_blame',
-		'git_conflicts',
-		'git_commit_msg',
-		'git_add',
-		'git_commit',
-		'git_push',
-		'gh_pr_create',
-	],
-	wiki: ['wiki_read', 'wiki_search', 'wiki_write', 'wiki_fact', 'wiki_facts'],
-	browser: [
-		'browser_navigate',
-		'browser_snapshot',
-		'browser_click',
-		'browser_type',
-		'browser_screenshot',
-	],
-	web: ['web_search', 'web_fetch'],
-	media: ['generate_image', 'canvas_write', 'voice_status'],
-	notebook: ['edit_notebook'],
-	navigation: ['symbols', 'references', 'definition'],
-	files: ['delete', 'rename', 'open'],
-} as const;
 
 export type ToolGroupName = keyof typeof TOOL_GROUPS;
 

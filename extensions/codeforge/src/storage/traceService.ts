@@ -6,6 +6,7 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { ensureDir, tracesDir } from './paths';
+import { redactSecrets } from './redactSecrets';
 
 export type TraceLevel = 'none' | 'basic' | 'detailed';
 
@@ -56,6 +57,8 @@ export class TraceService {
 
 		const event: TraceEvent = {
 			...partial,
+			detail: partial.detail !== undefined ? redactSecrets(partial.detail) : undefined,
+			label: redactSecrets(partial.label),
 			id: `t${++this.sequence}`,
 			timestamp: new Date().toISOString(),
 			sessionId: partial.sessionId ?? this.sessionId,

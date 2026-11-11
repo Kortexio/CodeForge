@@ -63,8 +63,9 @@ module.exports = {
 		getDiagnostics: () => [],
 		registerInlineCompletionItemProvider: () => ({ dispose() {} }),
 	},
+	FileType: { Unknown: 0, File: 1, Directory: 2, SymbolicLink: 64 },
 	Uri: {
-		file: (p) => ({ fsPath: p, toString: () => p }),
+		file: (p) => ({ fsPath: p, scheme: 'file', toString: () => `file:///${p}` }),
 		joinPath: (base, ...parts) => ({
 			fsPath: [base.fsPath || base, ...parts].join('/'),
 		}),

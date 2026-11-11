@@ -50,6 +50,50 @@ export const IDENTICAL_STALL_RECOVERY = [
 	'Edit only when that check shows a change to make.',
 ].join('\n');
 
+/** Restart after listing the same folder (or missing children of it) with no new listing. */
+export const LIST_FAMILY_STALL_RECOVERY = [
+	'Listing this folder has stopped. The listing and any missing-child errors are already in this conversation.',
+	'Do not list that folder or paths under it again.',
+	'Read a named file, or call search/retrieve.',
+	'Then edit or run a command if the task still needs an effect.',
+].join('\n');
+
+/** Restart after globbing the same pattern/scope repeatedly. */
+export const GLOB_FAMILY_STALL_RECOVERY = [
+	'This glob pattern has stopped. Those matching paths are already in this conversation.',
+	'Do not repeat the same glob in the same scope.',
+	'Call retrieve or search, or read a named path from the glob result.',
+	'Then edit or run a command if the task still needs an effect.',
+].join('\n');
+
+/** Restart after searching the same needle/scope repeatedly. */
+export const SEARCH_FAMILY_STALL_RECOVERY = [
+	'Searching this needle has stopped. Those search results are already in this conversation.',
+	'Do not repeat the same pattern (or regex/extension variants) in the same scope.',
+	'Call retrieve, or read a named path from a listing.',
+	'Then edit or run a command if the task still needs an effect.',
+].join('\n');
+
+/** Restart after re-reading the same file window. */
+export const READ_FAMILY_STALL_RECOVERY = [
+	'Re-reading this file has stopped. Those contents are already in this conversation.',
+	'Do not re-read the same path with overlapping windows.',
+	'Read a different file, or call search/retrieve/edit/shell.',
+].join('\n');
+
+/** Restart after repeating a zero-hit web_search needle. */
+export const WEB_SEARCH_FAMILY_STALL_RECOVERY = [
+	'Repeating this web_search query has stopped. Those results are already in this conversation.',
+	'Do not repeat the same query needle.',
+	'Refine the query once, use web_fetch on a known URL, or continue with repo tools.',
+].join('\n');
+
+/** Restart after repeating workspace-wide diagnostics. */
+export const DIAGNOSTICS_FAMILY_STALL_RECOVERY = [
+	'Workspace diagnostics were already fetched. Do not call diagnostics without a path again.',
+	'Pass a file path to diagnostics, or read/edit the reported files.',
+].join('\n');
+
 /** Tool result when an explore call repeats. The previous body is not sent again. */
 export function repeatedExploreRefusal(note: string): string {
 	return [

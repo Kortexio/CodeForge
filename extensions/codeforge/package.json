@@ -33,17 +33,58 @@
         "description": "CodeForge agent harness (models, guardrails, loops, approvals)",
         "isDefault": true,
         "commands": [
-          { "name": "help", "description": "List available slash commands" },
-          { "name": "clear", "description": "Start a new chat" },
-          { "name": "ask", "description": "Switch to Ask mode (read/search/web)" },
-          { "name": "plan", "description": "Switch to Plan mode (explore + wiki plan only)" },
-          { "name": "agent", "description": "Switch to Agent mode" },
-          { "name": "auto", "description": "Allow all edits + shell this session (Agent mode)" },
-          { "name": "permissions", "description": "Cycle Default → Assisted → Allow all" },
-          { "name": "instructions", "description": "Generate AGENTS.md for this workspace" },
-          { "name": "cards", "description": "Implement docs/C*.md cards one by one (optional: C01-C05)" },
-          { "name": "plan-run", "description": "Plan the request in steps and run each step with a clean context" },
-          { "name": "review", "description": "Find bugs: build/test signals, per-file review, BUGS.md" }
+          {
+            "name": "help",
+            "description": "List available slash commands"
+          },
+          {
+            "name": "clear",
+            "description": "Start a new chat"
+          },
+          {
+            "name": "ask",
+            "description": "Switch to Ask mode (read/search/web)"
+          },
+          {
+            "name": "plan",
+            "description": "Switch to Plan mode (explore + wiki plan only)"
+          },
+          {
+            "name": "agent",
+            "description": "Switch to Agent mode"
+          },
+          {
+            "name": "auto",
+            "description": "Allow all edits + shell this session (Agent mode)"
+          },
+          {
+            "name": "permissions",
+            "description": "Cycle Default → Assisted → Allow all"
+          },
+          {
+            "name": "instructions",
+            "description": "Generate AGENTS.md for this workspace"
+          },
+          {
+            "name": "cards",
+            "description": "Implement docs/C*.md cards one by one (optional: C01-C05)"
+          },
+          {
+            "name": "plan-run",
+            "description": "Plan the request in steps and run each step with a clean context"
+          },
+          {
+            "name": "review",
+            "description": "Find bugs: build/test signals, per-file review, BUGS.md"
+          },
+          {
+            "name": "bugbot",
+            "description": "Same as /review — find bugs and write BUGS.md"
+          },
+          {
+            "name": "restore",
+            "description": "Restore the last checkpoint (revert later file edits and chat)"
+          }
         ],
         "modes": [
           "ask",
@@ -106,6 +147,17 @@
       {
         "command": "codeforge.runTask",
         "title": "Run AI Task",
+        "category": "CodeForge AI"
+      },
+      {
+        "command": "codeforge.reviewBugs",
+        "title": "Review workspace (Bugbot)",
+        "category": "CodeForge AI",
+        "icon": "$(bug)"
+      },
+      {
+        "command": "codeforge.restoreCheckpoint",
+        "title": "Restore last checkpoint",
         "category": "CodeForge AI"
       },
       {
@@ -328,8 +380,13 @@
         },
         "codeforge.ai.confirmRunPython": {
           "type": "boolean",
-          "default": false,
+          "default": true,
           "description": "Show a confirmation dialog before running Python snippets from the chat Run button"
+        },
+        "codeforge.ai.outboundMcp.enabled": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Expose project wiki tools on loopback HTTP for external MCP clients. Off by default. When enabled, CodeForge stores a bearer token in SecretStorage; clients must send `Authorization: Bearer <token>`."
         },
         "codeforge.ai.outsideWorkspaceWrites": {
           "type": "string",
@@ -361,7 +418,7 @@
             "unrestricted"
           ],
           "default": "restricted",
-          "markdownDescription": "Shell sandbox for agent commands (the model cannot override this). **restricted** (default): scrub secret env vars, block dangerous patterns, refuse chaining in safe-local. **unrestricted**: full env + no blocked patterns (still runs in the workspace folder). Overridden by **Full agent freedom**."
+          "markdownDescription": "Shell sandbox for agent commands (the model cannot override this). **restricted** (default): scrub secret env vars and block dangerous patterns (rm -rf, PowerShell download cradles, …). **safe-local**: allowlist of read/build commands only. **isolated** (Windows): Job Object with kill-on-close — fails visibly if unavailable (no silent downgrade). **container**: Docker with `--network=none`. **unrestricted**: full env + no blocked patterns (still workspace cwd). Overridden by **Full agent freedom**. There is no egress firewall outside container/`web_fetch` SSRF checks."
         },
         "codeforge.ai.fullAgentFreedom": {
           "type": "boolean",
@@ -424,8 +481,8 @@
         },
         "codeforge.ai.exploreSubagent": {
           "type": "boolean",
-          "default": false,
-          "description": "Allow delegating broad exploration questions to a read-only explore subagent."
+          "default": true,
+          "description": "Allow delegating broad exploration questions to a read-only explore subagent (delegate_task mode=explore). Start-of-run retrieve + family stalls still cover focused lookups."
         },
         "codeforge.ai.toolGroups": {
           "type": "array",
@@ -443,7 +500,7 @@
             ]
           },
           "default": [],
-          "description": "Optional tool groups enabled on top of the Agent CORE surface (git, wiki, browser, web, media, notebook, navigation, files). Empty = CORE only."
+          "description": "Named tool groups merged on top of CORE (all built-in groups are already CORE; this setting is redundant unless a mode lists extra names). Empty still includes CORE. MCP stays separate (mcp_call when servers are connected)."
         },
         "codeforge.ai.openModels": {
           "type": "boolean",
@@ -543,6 +600,10 @@
         {
           "command": "codeforge.runTask",
           "group": "CodeForge"
+        },
+        {
+          "command": "codeforge.reviewBugs",
+          "group": "CodeForge"
         }
       ],
       "commandPalette": [
@@ -621,8 +682,12 @@
     "dompurify": "^3.4.12",
     "highlight.js": "^11.12.0",
     "katex": "^0.19.0",
+    "koffi": "^2.16.3",
     "marked": "^18.0.14",
     "mermaid": "^12.0.0",
     "minimatch": "^10.2.6"
+  },
+  "allowScripts": {
+    "koffi@2.16.3": true
   }
 }

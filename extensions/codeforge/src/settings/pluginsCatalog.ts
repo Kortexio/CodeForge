@@ -177,7 +177,7 @@ export const PLUGIN_CATALOG: PluginCatalogItem[] = [
 			id: 'playwright-mcp',
 			name: 'Playwright',
 			command: 'npx',
-			args: ['-y', '@playwright/mcp@latest'],
+			args: ['-y', '@playwright/mcp@0.0.84'],
 			hint: 'Refresh MCP after install. First run may download browsers.',
 		},
 		featured: true,

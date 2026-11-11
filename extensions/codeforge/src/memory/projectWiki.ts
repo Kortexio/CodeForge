@@ -192,6 +192,36 @@ export class ProjectWikiStore {
 		return this.addFact(old.key, newValue, reason ?? `supersede ${factId}`);
 	}
 
+	/** End validity of current facts matching `key` (and optional page/id). */
+	async invalidateFact(key: string, reason?: string): Promise<number> {
+		this.ensureReady();
+		const now = new Date().toISOString();
+		let n = 0;
+		for (const f of this.facts.values()) {
+			if (f.key === key && !f.validTo) {
+				f.validTo = now;
+				f.reason = reason ?? f.reason ?? 'forget';
+				n++;
+			}
+		}
+		if (n) await this.save();
+		return n;
+	}
+
+	async deleteDocument(id: string): Promise<boolean> {
+		this.ensureReady();
+		if (!this.docs.has(id)) return false;
+		this.docs.delete(id);
+		await this.save();
+		const mdPath = path.join(this.root!, `${id.replace(/[^a-zA-Z0-9_-]/g, '_')}.md`);
+		try {
+			await fs.unlink(mdPath);
+		} catch {
+			/* optional sidecar */
+		}
+		return true;
+	}
+
 	currentFacts(asOf = new Date()): TemporalFact[] {
 		const t = asOf.toISOString();
 		return Array.from(this.facts.values()).filter(

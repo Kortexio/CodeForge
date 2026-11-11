@@ -46,7 +46,7 @@ Classes:
 |---|---|---|
 | Re-read refusal ("already read") | replace | done — `read`/`list` always hit disk; identical window prefixed `(unchanged since earlier read)`; `readThisTurn` set on every successful read |
 | Retrieve-repeat refusal | remove | done |
-| `list` quota / anti-explore / exploreBudget | remove | done — Agent build profile is CORE (+ optional `codeforge.ai.toolGroups`); status questions still limited to `update_status` |
+| `list` quota / anti-explore / exploreBudget | remove | done — Agent build profile is CORE (all built-in groups); status questions still limited to `update_status` |
 | VERIFY / CONTINUE nudges, `evaluateProgress`, replan | replace | done — the oracle decides when it is done (`oracle.ts`), `blocked:` is a legitimate exit |
 | "N writes without build" (text) | replace | done — the oracle runs automatically after the batch |
 | "mass rewrite" (text) | replace | done — gate: partial write on a file > 60 lines → `edit` (when small-model harness is **on**) |
@@ -81,9 +81,9 @@ Classes:
 | Index embeddings as fixed 800-char prefixes (manual command only) | replace | done — symbol/blank-line chunker, incremental hash, vectors.f32, auto watcher (`semanticIndex`) |
 | Retrieve without rerank / mid-text context truncation | replace | done — LLM rerank + `ContextSource.items` (drop whole hits/lessons); status `noTruncate` |
 | Compact erases what was already read | replace | done — `FILES ALREADY READ` ledger in mid/hard compact |
-| Explore via many serial list/read steps | replace | done — packet retrieve + optional explore subagent (`exploreSubagent`) |
-| Full tool surface thrash in Agent code turns | remove | done — stage machine and plan path gate removed; Agent defaults to CORE tools (groups via `toolGroups`); `delegate_task` explore uses `exploreOnly` profile |
-| Periodic context-packet rewrite of `messages[0]` | remove | done — system string frozen for the run; packet only in hard-compact user summary; plan advances as user message |
+| Explore via many serial list/read steps | replace | done — start-of-run retrieve k=4 + IDE tabs/diagnostics; hard compact `includeRetrieve: true`; list/search/read/web/diagnostics/glob family stalls; LSP in CORE; `exploreSubagent` default on (`delegate_task` mode=explore) |
+| Full tool surface thrash in Agent code turns | remove | done — stage machine and plan path gate removed; Agent CORE includes LSP + all built-in groups (git/web/browser/files/glob/wiki/media/notebook); `delegate_task` explore uses `exploreOnly` profile |
+| Periodic context-packet rewrite of `messages[0]` | remove | done — system string frozen for the run; start retrieve+IDE is a user block; hard compact refreshes the packet in the summary user message; plan advances as user message |
 | Floor-model tool protocol (aliases, bad JSON, XML) | replace | done — `toolCallNormalizer` + stronger content parsers; `AiServer.sampling` overrides; diagnostics appended after edit/write/apply_patch |
 | Brittle exact `edit` / truncated tool JSON | replace | done — tolerant `edit` (Unicode + LF view + indent-tolerant single match + `closestWindow` on miss); `apply_patch` only for gpt-* non-OSS |
 | Soft edit-miss nudges | remove | done — hard `readThisTurn` gate before edit/overwrite; refuse delivers numbered excerpt and marks path as read |
@@ -91,7 +91,7 @@ Classes:
 | Model retries `edit` whose `new_string` is already on disk (fake "missing brace") | replace | done — `applyEdit` returns `alreadyApplied` success so the 35B moves on |
 | Intent/continue enrich, thin-final/stuck soft nudges, write-count continue | remove | done — model works from system+tool contract; harness keeps protocol (length/JSON/budget) + tool gates only |
 | Stuck wrap used MAX_STEPS_PROMPT (wrong situation) / PT status labels | replace | done — `stuckWrapPrompt(cause)` vs `MAX_STEPS_PROMPT` vs `LENGTH_EXHAUSTED_PROMPT`; `loopExit` is `budget`/`stuck`/`length`; status/activity strings English |
-| Soft cache / noop-step stuck heuristics | replace | done — `loopDetector.ts` (identical call+result for 3 steps, UI unchanged ≥3); no explore-step soft/hard caps (Cursor/Claude Code style: unlimited reads within turn step budget) |
+| Soft cache / noop-step stuck heuristics | replace | done — `loopDetector.ts` (identical call+result for 3 steps; list/search/read/web/diagnostics explore-family stalls; UI unchanged ≥3); no explore-step soft/hard caps (Cursor/Claude Code style: unlimited reads within turn step budget) |
 | Soft explore-cap refused new reads and stalled T2 | remove | done — removed `EXPLORE_SOFT_CAP` / `EXPLORE_HARD_CAP`; budget exhaustion shows Continue button (`continueTurn`) instead of refusing reads |
 | Concrete tip after stuck still only re-reads | replace | done — stuck wrap says next turn must use edit/write/shell/browser; identical-repeat detector still stops loops |
 | Stale internal plan injection | replace | done — `internalPlans.ts` scoped to session/taskHash; archive on done/unrelated task |
@@ -122,7 +122,7 @@ Classes:
 | `toolOutputSpill.ts` | full clipped output under `.CodeForge/tool-output/` |
 | `readMemory.ts` | path canonicalization, read ledger helpers, invalidate on write |
 | `nudges.ts` | claims (green / blocked) and every text the loop injects |
-| `loopDetector.ts` | identical call+result streak and related stop causes |
+| `loopDetector.ts` | identical call+result streak; list/search/read/web/diagnostics explore-family stalls |
 | `editTool.ts` | tolerant `edit` with useful errors |
 | `applyPatch.ts` | `apply_patch` parser/applier (gpt-* only) |
 | `internalPlans.ts` | model-only scaffold slices under `.CodeForge/plans/` |

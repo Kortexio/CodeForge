@@ -63,7 +63,7 @@ export function profileForTurn(
 	if (opts.exploreOnly) return 'explore';
 	if (isStatusQuestion(task)) return 'status';
 	if (opts.planMode) return 'plan';
-	// Agent mode: CORE (+ optional toolGroups), including shell. Do not strip shell/write
+	// Agent mode: CORE (all built-in groups + LSP). Do not strip shell/write
 	// just because the prompt lacked coding verbs — that made "list /v1/models" explore-only.
 	return 'build';
 }

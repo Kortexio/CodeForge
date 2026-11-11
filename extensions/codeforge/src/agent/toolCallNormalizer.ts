@@ -54,11 +54,16 @@ const TOOL_NAME_ALIASES: Record<string, string> = {
 	ls: 'list',
 	listdir: 'list',
 	listfiles: 'list',
+	globfilesearch: 'glob',
+	globfiles: 'glob',
+	findfiles: 'glob',
+	fileglob: 'glob',
 };
 
 /** Canonical arg ← aliases (applied only when canonical is missing). */
 const ARG_ALIASES: Record<string, string[]> = {
 	path: ['file_path', 'filepath', 'file', 'filename', 'target_file'],
+	pattern: ['glob_pattern', 'file_pattern', 'glob'],
 	old_string: ['old_str', 'oldText', 'search'],
 	new_string: ['new_str', 'newText', 'replace', 'replacement'],
 	content: ['contents', 'text', 'file_text', 'code'],

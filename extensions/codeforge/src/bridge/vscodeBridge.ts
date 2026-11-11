@@ -7,7 +7,6 @@
 
 import * as vscode from 'vscode';
 import * as path from 'path';
-import * as fs from 'fs';
 import { resolveSandboxLevel, runSandboxed } from '../sandbox/runtime';
 import { killProcessTree } from '../sandbox/processKill';
 import { prepareWindowsCommand } from './shellPrep';
@@ -121,6 +120,8 @@ export class VSCodeAIBridge {
                 );
             case 'list':
                 return this.listDirectory(String(args.path ?? '.'), Boolean(args.recursive));
+            case 'glob':
+                return this.globFiles(String(args.pattern ?? ''), args.path ? String(args.path) : undefined);
             case 'search':
                 return this.search(String(args.pattern), args.path ? String(args.path) : undefined);
             case 'delete':
@@ -418,6 +419,38 @@ export class VSCodeAIBridge {
 		return `Success. Updated the following files:\n${applied.join('\n')}${diagBlock}`;
 	}
 
+    private globExclude(): string {
+        return '{**/node_modules/**,**/.git/**,**/bin/**,**/obj/**,**/.CodeForge/**}';
+    }
+
+    /** Filename glob via vscode.workspace.findFiles — not a directory walk stub. */
+    private async globFiles(pattern: string, globPath?: string): Promise<string> {
+        const root = this.getWorkspaceRoot();
+        if (!root) {
+            throw new Error('No workspace folder open');
+        }
+        const pat = String(pattern || '').trim().replace(/\\/g, '/');
+        if (!pat) {
+            throw new Error('glob requires pattern (e.g. **/*.csproj)');
+        }
+        const scope = String(globPath || '')
+            .trim()
+            .replace(/\\/g, '/')
+            .replace(/^\.\//, '')
+            .replace(/\/$/, '');
+        const include = scope ? `${scope}/${pat.replace(/^\//, '')}` : pat;
+        const MAX = 80;
+        const uris = await vscode.workspace.findFiles(include, this.globExclude(), MAX + 1);
+        if (!uris.length) {
+            return `0 files matching ${include}. Prefer retrieve or search if the name is uncertain — do not repeat the same glob.`;
+        }
+        const lines = uris
+            .slice(0, MAX)
+            .map(u => vscode.workspace.asRelativePath(u).replace(/\\/g, '/'));
+        const more = uris.length > MAX ? `\n…truncated (showing ${MAX})` : '';
+        return lines.join('\n') + more;
+    }
+
     private async listDirectory(dirPath: string, recursive: boolean): Promise<string> {
         const normalized = (dirPath || '.').replace(/\\/g, '/');
         const uri = this.resolveUri(normalized === '' ? '.' : normalized);
@@ -426,7 +459,9 @@ export class VSCodeAIBridge {
             entries = await vscode.workspace.fs.readDirectory(uri);
         } catch (err) {
             const message = err instanceof Error ? err.message : String(err);
-            throw new Error(`Cannot list "${normalized}": ${message}`);
+            throw new Error(
+                `Cannot list "${normalized}": ${message}. If this is a file, call read. If the parent was already listed, call search or retrieve — do not list missing children.`
+            );
         }
 
         // Cursor-like: never dump the whole tree. Cap entries; shallow recurse only.
@@ -648,7 +683,7 @@ export class VSCodeAIBridge {
         const uri = this.resolveUri(filePath);
         const doc = await vscode.workspace.openTextDocument(uri);
         await vscode.window.showTextDocument(doc);
-        return `Opened ${filePath}`;
+        return `Opened ${filePath} (UI reveal only — use read for contents)`;
     }
 
     private getDiagnostics(filePath?: string): string {

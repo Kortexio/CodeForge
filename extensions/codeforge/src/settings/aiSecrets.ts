@@ -2,10 +2,13 @@
  * SecretStorage for API keys and MCP sensitive fields (not in settings.json / webview).
  */
 
+import * as crypto from 'crypto';
 import * as vscode from 'vscode';
 import type { AiServer, McpServerConfig } from './aiSettingsStore';
 
 export const MASKED_SECRET = '••••••••';
+
+const OUTBOUND_MCP_TOKEN_KEY = 'codeforge.ai.outboundMcp.token';
 
 function serverKey(id: string): string {
 	return `codeforge.ai.server.${id}.apiKey`;
@@ -45,8 +48,50 @@ export async function persistServerSecret(
 ): Promise<void> {
 	const key = serverKey(serverId);
 	const trimmed = (apiKey ?? '').trim();
-	if (!trimmed || trimmed === MASKED_SECRET) return;
+	if (!trimmed || trimmed === MASKED_SECRET) {
+		if (!trimmed) await context.secrets.delete(key);
+		return;
+	}
 	await context.secrets.store(key, trimmed);
+}
+
+export async function deleteServerSecret(
+	context: vscode.ExtensionContext,
+	serverId: string
+): Promise<void> {
+	await context.secrets.delete(serverKey(serverId));
+}
+
+export async function loadOutboundMcpToken(
+	context: vscode.ExtensionContext
+): Promise<string | undefined> {
+	const stored = await context.secrets.get(OUTBOUND_MCP_TOKEN_KEY);
+	const trimmed = (stored ?? '').trim();
+	return trimmed || undefined;
+}
+
+/** Store or rotate the outbound MCP bearer token. Empty clears it. */
+export async function persistOutboundMcpToken(
+	context: vscode.ExtensionContext,
+	token: string | undefined
+): Promise<void> {
+	const trimmed = (token ?? '').trim();
+	if (!trimmed || trimmed === MASKED_SECRET) {
+		await context.secrets.delete(OUTBOUND_MCP_TOKEN_KEY);
+		return;
+	}
+	await context.secrets.store(OUTBOUND_MCP_TOKEN_KEY, trimmed);
+}
+
+/** Ensure a token exists when outbound MCP is enabled; generates one if missing. */
+export async function ensureOutboundMcpToken(
+	context: vscode.ExtensionContext
+): Promise<string> {
+	const existing = await loadOutboundMcpToken(context);
+	if (existing) return existing;
+	const generated = crypto.randomBytes(32).toString('hex');
+	await context.secrets.store(OUTBOUND_MCP_TOKEN_KEY, generated);
+	return generated;
 }
 
 export async function loadMcpSecrets(
@@ -89,13 +134,30 @@ export async function persistMcpSecrets(
 	const api = (server.apiKey ?? '').trim();
 	if (api && api !== MASKED_SECRET) {
 		await context.secrets.store(mcpApiKeyKey(server.id), api);
+	} else if (!api) {
+		await context.secrets.delete(mcpApiKeyKey(server.id));
 	}
 	if (server.env && Object.keys(server.env).length) {
 		await context.secrets.store(mcpEnvKey(server.id), JSON.stringify(server.env));
+	} else {
+		await context.secrets.delete(mcpEnvKey(server.id));
 	}
 	if (server.headers && Object.keys(server.headers).length) {
 		await context.secrets.store(mcpHeadersKey(server.id), JSON.stringify(server.headers));
+	} else {
+		await context.secrets.delete(mcpHeadersKey(server.id));
 	}
+}
+
+export async function deleteMcpSecrets(
+	context: vscode.ExtensionContext,
+	serverId: string
+): Promise<void> {
+	await Promise.all([
+		context.secrets.delete(mcpApiKeyKey(serverId)),
+		context.secrets.delete(mcpEnvKey(serverId)),
+		context.secrets.delete(mcpHeadersKey(serverId)),
+	]);
 }
 
 export function maskStateForWebview<T extends { apiKey?: string; env?: Record<string, string>; headers?: Record<string, string> }>(

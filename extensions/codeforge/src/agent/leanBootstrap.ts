@@ -1,6 +1,7 @@
 /**
  * Lean first-call context — env + status one-liner + open file (OpenCode-style).
- * Full CONTEXT PACKET is assembled later when the run needs it.
+ * Retrieve + IDE tabs/diagnostics are injected as a separate start user block
+ * (see agentLoop); hard compact refreshes the full CONTEXT PACKET.
  */
 
 import * as vscode from 'vscode';

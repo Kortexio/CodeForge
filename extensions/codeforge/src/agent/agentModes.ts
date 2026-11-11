@@ -13,8 +13,8 @@ export interface AgentModeDefinition {
 	/** Skill ids / trigger hints preferred in this mode. */
 	skillHints?: string[];
 	/**
-	 * Optional tool groups to enable on top of CORE in Agent (build) profile
-	 * (git | wiki | browser | web | media | notebook | navigation | files).
+	 * Named tool groups merged on top of CORE in Agent (build) profile.
+	 * Built-in groups (git, wiki, browser, web, media, notebook, files, navigation) are already CORE.
 	 */
 	toolGroups?: string[];
 }

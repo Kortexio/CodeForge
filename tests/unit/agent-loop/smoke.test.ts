@@ -39,10 +39,14 @@ describe('runLoop smoke', () => {
 			maxSteps: 8,
 			isolated: true,
 		});
-		const second = JSON.stringify(result.requests[1]?.body.messages ?? []);
-		expect(second).not.toMatch(/RelativePattern/);
-		expect(second).toMatch(/Errors\.cs/);
-		expect(second).not.toMatch(/notes\.md/);
+		const searchOut = result.requests
+			.flatMap(r => (r.body.messages ?? []) as Array<{ role?: string; name?: string; content?: string }>)
+			.filter(m => m.role === 'tool' && m.name === 'search')
+			.map(m => m.content ?? '')
+			.join('\n');
+		expect(searchOut).not.toMatch(/RelativePattern/);
+		expect(searchOut).toMatch(/Errors\.cs/);
+		expect(searchOut).not.toMatch(/notes\.md/);
 	}, 60_000);
 
 	it('an echoed /no_think reply is treated as empty, not as the final answer', async () => {

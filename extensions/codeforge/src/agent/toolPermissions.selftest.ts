@@ -32,6 +32,12 @@ const ALL = [
 	'delegate_task',
 	'update_status',
 	'wiki_fact',
+	'wiki_read',
+	'wiki_write',
+	'wiki_search',
+	'generate_image',
+	'edit_notebook',
+	'voice_status',
 	'git_blame',
 	'git_commit',
 	'gh_pr_create',
@@ -48,7 +54,10 @@ const ALL = [
 	'delete',
 	'rename',
 	'open',
+	'glob',
 	'symbols',
+	'definition',
+	'references',
 ];
 
 const denyWrite: PermissionRuleset = [
@@ -82,16 +91,32 @@ assert(buildCore.has('write') && buildCore.has('shell'), 'build keeps write/shel
 assert(buildCore.has('todo_write') && buildCore.has('await_shell'), 'build keeps todo/await');
 assert(buildCore.has('delegate_task'), 'delegate always in build');
 assert(!buildCore.has('mcp_call'), 'build omits mcp by default');
-assert(!buildCore.has('web_search'), 'build CORE omits web by default');
-assert(!buildCore.has('browser_navigate'), 'build CORE omits browser by default');
-assert(!buildCore.has('git_commit'), 'build CORE omits git by default');
+assert(buildCore.has('web_search'), 'build CORE includes web');
+assert(buildCore.has('browser_navigate'), 'build CORE includes browser');
+assert(buildCore.has('git_commit'), 'build CORE includes git');
+assert(buildCore.has('delete') && buildCore.has('glob'), 'build CORE includes files + glob');
+assert(buildCore.has('wiki_read') && buildCore.has('wiki_write'), 'build CORE includes wiki');
+assert(buildCore.has('generate_image') && buildCore.has('canvas_write'), 'build CORE includes media');
+assert(buildCore.has('edit_notebook'), 'build CORE includes notebook');
 for (const name of CORE) {
 	if (ALL.includes(name)) assert(buildCore.has(name), `CORE includes ${name}`);
 }
+assert(
+	buildCore.has('symbols') && buildCore.has('definition') && buildCore.has('references'),
+	'CORE includes LSP symbols/definition/references'
+);
+assert(
+	CORE.includes('symbols') && CORE.includes('definition') && CORE.includes('references'),
+	'CORE array lists LSP tools'
+);
+assert(
+	CORE.includes('wiki_write') && CORE.includes('generate_image') && CORE.includes('edit_notebook'),
+	'CORE array lists wiki/media/notebook'
+);
 
 const buildGit = filterToolsByProfile(ALL, 'build', { toolGroups: ['git'] });
 assert(buildGit.has('git_commit') && buildGit.has('gh_pr_create'), 'git group enables git tools');
-assert(!buildGit.has('web_search'), 'git group does not enable web');
+assert(buildGit.has('web_search'), 'web is CORE so git group still has web');
 
 const buildWeb = filterToolsByProfile(ALL, 'build', { toolGroups: ['web', 'browser'] });
 assert(buildWeb.has('web_search') && buildWeb.has('browser_navigate'), 'web+browser groups');

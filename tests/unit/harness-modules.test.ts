@@ -375,8 +375,8 @@ describe('toolsets', () => {
 		expect(coreOnly.has('write')).toBe(true);
 		expect(coreOnly.has('shell')).toBe(true);
 		expect(coreOnly.has('mcp_call')).toBe(true);
-		expect(coreOnly.has('git_status')).toBe(false);
-		expect(coreOnly.has('wiki_read')).toBe(false);
+		expect(coreOnly.has('git_status')).toBe(true);
+		expect(coreOnly.has('wiki_read')).toBe(true);
 		const withGit = toolNamesFor('implement', 'faz commit no git', {
 			weakProfile: true,
 			allNames: all,

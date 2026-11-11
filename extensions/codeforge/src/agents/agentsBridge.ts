@@ -14,6 +14,7 @@ import type { AgentActivityEvent } from '../agent/agentLoop';
 import type { AiSettingsStore } from '../settings/aiSettingsStore';
 import type { PermissionLevel } from '../policy/approvalPolicy';
 import type { ChatViewProvider } from '../views/chatView';
+import { attachmentsFromChatRequest } from '../views/attachments';
 import {
 	CONTINUE_TURN_PROMPT,
 	type AgentsTurnResult,
@@ -48,6 +49,7 @@ export interface AgentsHarnessState {
 export interface AgentsResultMetadata {
 	loopExit: LoopExit;
 	sessionId: string | null;
+	canRestore?: boolean;
 }
 
 /** Minimal stream surface the mapper needs; matches `vscode.ChatResponseStream`. */
@@ -148,7 +150,11 @@ export function resultForTurn(result: AgentsTurnResult): vscode.ChatResult {
 			},
 		};
 	}
-	const metadata: AgentsResultMetadata = { loopExit: result.loopExit, sessionId: result.sessionId };
+	const metadata: AgentsResultMetadata = {
+		loopExit: result.loopExit,
+		sessionId: result.sessionId,
+		canRestore: result.canRestore === true,
+	};
 	const failure = FAILURE_MESSAGES[result.loopExit];
 	if (failure) {
 		const detail = result.loopExit === 'error' && result.reply ? result.reply : failure;
@@ -157,11 +163,21 @@ export function resultForTurn(result: AgentsTurnResult): vscode.ChatResult {
 	return { metadata };
 }
 
-/** Continue is offered only when the step budget ended the turn. */
+/** Continue after a step-budget exit; Restore when the journal still has edits. */
 export function followupsForResult(result: vscode.ChatResult): vscode.ChatFollowup[] {
 	const metadata = result.metadata as Partial<AgentsResultMetadata> | undefined;
-	if (metadata?.loopExit !== 'budget') return [];
-	return [{ prompt: CONTINUE_TURN_PROMPT, label: 'Continue', participant: AGENTS_PARTICIPANT_ID }];
+	const out: vscode.ChatFollowup[] = [];
+	if (metadata?.loopExit === 'budget') {
+		out.push({ prompt: CONTINUE_TURN_PROMPT, label: 'Continue', participant: AGENTS_PARTICIPANT_ID });
+	}
+	if (metadata?.canRestore) {
+		out.push({
+			prompt: '/restore',
+			label: 'Restore last checkpoint',
+			participant: AGENTS_PARTICIPANT_ID,
+		});
+	}
+	return out;
 }
 
 type AgentsTurnRunner = Pick<ChatViewProvider, 'runAgentsTurn'>;
@@ -216,11 +232,13 @@ export function createAgentsRequestHandler(
 				if (status) stream.progress(status.slice(0, 120));
 			},
 		};
+		const attachments = await attachmentsFromChatRequest(request);
 		const result = await runner.runAgentsTurn(
 			agentsTurnText(request),
 			chatKey ? sessions.get(chatKey) : undefined,
 			observer,
-			token
+			token,
+			attachments.length ? { attachments } : undefined
 		);
 		if (result.kind === 'finished') {
 			if (chatKey && result.sessionId) {

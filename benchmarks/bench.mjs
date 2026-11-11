@@ -802,7 +802,7 @@ function cmdRun(taskKey, flags) {
 	const agent = spawnSync(process.execPath, args, {
 		cwd: LAYOUT.repoRoot,
 		encoding: 'utf8',
-		timeout: 3_600_000,
+		timeout: Math.max(60, Number(flags.timeoutMin || 60)) * 60_000,
 		env: agentEnv,
 	});
 	if (agent.status === 2) {

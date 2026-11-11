@@ -1,5 +1,6 @@
 /**
  * MCP outbound — expose project wiki + retrieve to external MCP clients (HTTP loopback).
+ * Off by default; when enabled, tools require Authorization: Bearer <token>.
  */
 
 import * as http from 'http';
@@ -9,23 +10,56 @@ export interface OutboundMcpStatus {
 	running: boolean;
 	port?: number;
 	url?: string;
+	authRequired?: boolean;
+}
+
+export interface OutboundMcpStartOptions {
+	port?: number;
+	/** Required bearer token; start refuses without it. */
+	bearerToken: string;
 }
 
 let server: http.Server | undefined;
 let listenPort: number | undefined;
+let requiredToken: string | undefined;
 
 export function getOutboundMcpStatus(): OutboundMcpStatus {
 	return {
 		running: !!server,
 		port: listenPort,
 		url: listenPort ? `http://127.0.0.1:${listenPort}/mcp` : undefined,
+		authRequired: !!requiredToken,
 	};
+}
+
+function unauthorized(res: http.ServerResponse): void {
+	res.writeHead(401, {
+		'Content-Type': 'application/json',
+		'WWW-Authenticate': 'Bearer realm="codeforge-mcp-outbound"',
+	});
+	res.end(JSON.stringify({ error: 'unauthorized' }));
+}
+
+function checkBearer(req: http.IncomingMessage): boolean {
+	const expected = requiredToken;
+	if (!expected) return false;
+	const header = req.headers.authorization ?? '';
+	const m = /^Bearer\s+(.+)$/i.exec(header.trim());
+	if (!m) return false;
+	const got = m[1].trim();
+	if (got.length !== expected.length) return false;
+	// Constant-time-ish compare
+	let diff = 0;
+	for (let i = 0; i < expected.length; i++) {
+		diff |= got.charCodeAt(i) ^ expected.charCodeAt(i);
+	}
+	return diff === 0;
 }
 
 function createOutboundHandler(fallbackPort: number): http.RequestListener {
 	const handle = async (req: http.IncomingMessage, res: http.ServerResponse): Promise<void> => {
-		res.setHeader('Access-Control-Allow-Origin', '*');
 		res.setHeader('Content-Type', 'application/json');
+		// No Access-Control-Allow-Origin: * — loopback MCP clients are not browsers.
 
 		if (req.method === 'OPTIONS') {
 			res.writeHead(204);
@@ -37,7 +71,12 @@ function createOutboundHandler(fallbackPort: number): http.RequestListener {
 
 		if (req.method === 'GET' && url.pathname === '/health') {
 			res.writeHead(200);
-			res.end(JSON.stringify({ ok: true, service: 'codeforge-mcp-outbound' }));
+			res.end(JSON.stringify({ ok: true, service: 'codeforge-mcp-outbound', auth: true }));
+			return;
+		}
+
+		if (!checkBearer(req)) {
+			unauthorized(res);
 			return;
 		}
 
@@ -121,9 +160,15 @@ async function listenOnPort(tryPort: number, preferredPort: number): Promise<voi
 }
 
 /** Prefer `port`, then port+1 … port+9 when EADDRINUSE (multi-instance / parallel IDEs). */
-export async function startOutboundMcp(port = 3847): Promise<OutboundMcpStatus> {
+export async function startOutboundMcp(opts: OutboundMcpStartOptions): Promise<OutboundMcpStatus> {
+	const token = (opts.bearerToken ?? '').trim();
+	if (!token) {
+		throw new Error('Outbound MCP requires a bearer token in SecretStorage');
+	}
 	if (server) return getOutboundMcpStatus();
 
+	requiredToken = token;
+	const port = opts.port ?? 3847;
 	const lastPort = port + 9;
 	let lastErr: unknown;
 	for (let tryPort = port; tryPort <= lastPort; tryPort++) {
@@ -149,9 +194,11 @@ export async function startOutboundMcp(port = 3847): Promise<OutboundMcpStatus> 
 			if (code === 'EADDRINUSE' && tryPort < lastPort) {
 				continue;
 			}
+			requiredToken = undefined;
 			throw err;
 		}
 	}
+	requiredToken = undefined;
 	throw lastErr instanceof Error ? lastErr : new Error(`No free port in ${port}-${lastPort}`);
 }
 
@@ -160,6 +207,7 @@ export async function stopOutboundMcp(): Promise<void> {
 	await new Promise<void>(resolve => server!.close(() => resolve()));
 	server = undefined;
 	listenPort = undefined;
+	requiredToken = undefined;
 }
 
 function handleTool(tool: string, args: Record<string, unknown>): unknown {

@@ -98,19 +98,20 @@ Security and permissions:
 
 ### MCP Runtime
 
-- **Inbound**: IDE consumes external MCP tools
-- **Outbound**: IDE exposes wiki + retrieve to external clients
+- **Inbound**: IDE consumes external MCP tools (stdio env is allowlisted — not full `process.env`; `@latest` package tags are refused)
+- **Outbound**: Opt-in (`codeforge.ai.outboundMcp.enabled`, default off). When enabled, loopback HTTP requires `Authorization: Bearer` from SecretStorage
 - Transport: HTTP and stdio
 
 ### Sandbox Runtime
 
-- Levels: `safe-local`, `restricted`, `isolated`, `container` (Docker optional)
-- Platform helpers: Windows Job Objects, Linux bwrap/seccomp, macOS sandbox-exec
-- Default: native isolation, no Docker required
+- Levels: `safe-local`, `restricted`, `isolated`, `container` (Docker optional), `unrestricted`
+- **isolated** (Windows): Job Object via `koffi` with `KILL_ON_JOB_CLOSE` — fails visibly if unavailable (no silent downgrade to restricted)
+- **container**: Docker with `--network=none` and non-root user when Docker is present
+- Default: `restricted` (env scrub + dangerous-command blocklist). No general egress firewall outside container / `web_fetch` SSRF checks
 
 ### Artifacts / Traces
 
-Large tool/LLM outputs and execution traces under `~/.CodeForge/ai/`.
+Large tool/LLM outputs and execution traces under `~/.CodeForge/ai/`. Trace details are redacted for common API-key / Bearer patterns before OutputChannel + JSONL.
 
 ## Data Flow
 
@@ -144,7 +145,9 @@ Large tool/LLM outputs and execution traces under `~/.CodeForge/ai/`.
 ## Security Model
 
 1. **Policy Evaluation**: Before each tool call
-2. **Approval Flow**: For dangerous operations
-3. **Sandbox Execution**: For shell commands
-4. **Secret Protection**: API keys not forwarded to shell env
-5. **Network Control**: Configurable egress hints at restricted+ levels
+2. **Approval Flow**: For dangerous operations (Python Run confirm defaults on)
+3. **Sandbox Execution**: For shell commands (Job Object on Windows `isolated`)
+4. **Secret Protection**: API keys in SecretStorage; scrubbed from shell/MCP host env; deleted on server remove
+5. **Fetch SSRF**: `web_fetch` blocks loopback / private / link-local / cloud-metadata hosts (including redirects)
+6. **Workspace Trust**: Enabled in branded product defaults (`security.workspace.trust.enabled`)
+7. **Extension signature verify**: Still off for Code-OSS (`extensions.verifySignature: false`) until Marketplace signing exists — documented, not claimed as verified

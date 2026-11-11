@@ -29,7 +29,12 @@ import {
 	isPluginInstalled,
 } from './pluginsCatalog';
 import { getApprovalPolicy } from '../policy/approvalPolicy';
-import { maskStateForWebview, MASKED_SECRET } from './aiSecrets';
+import {
+	maskStateForWebview,
+	MASKED_SECRET,
+	deleteServerSecret,
+	deleteMcpSecrets,
+} from './aiSecrets';
 import {
 	calibrateUnavailableMessage,
 	findBenchScript,
@@ -87,7 +92,7 @@ function readAgentPrefs(): AgentPrefs {
 				: 'restricted',
 		fullAgentFreedom: cfg.get<boolean>('fullAgentFreedom', false),
 		allowAll: cfg.get<boolean>('allowAll', false),
-		confirmRunPython: cfg.get<boolean>('confirmRunPython', false),
+		confirmRunPython: cfg.get<boolean>('confirmRunPython', true),
 		outsideWorkspaceWrites: cfg.get<string>('outsideWorkspaceWrites', 'ask'),
 		traceLevel: cfg.get<string>('traceLevel', 'basic'),
 		tabCompletion: cfg.get<boolean>('tabCompletion', true),
@@ -343,6 +348,7 @@ export class AiSettingsPanel {
 					state.activeServerId = state.servers[0]?.id ?? null;
 					state.activeModel = state.servers[0]?.models[0] ?? null;
 				}
+				await deleteServerSecret(this.extensionContext, id);
 				await this.store.save(state);
 				return;
 			}
@@ -539,6 +545,7 @@ export class AiSettingsPanel {
 				);
 				if (ok !== 'Remove') return;
 				state.mcpServers = state.mcpServers.filter(s => s.id !== id);
+				await deleteMcpSecrets(this.extensionContext, id);
 				await this.store.save(state);
 				return;
 			}
@@ -635,7 +642,7 @@ export class AiSettingsPanel {
 		const state = this.store.getState();
 		this.calibrateBusy = true;
 		this.postState();
-		this.panel.webview.postMessage({
+		void this.panel.webview.postMessage({
 			type: 'calibrateProgress',
 			message: 'Revising harness: proposer, then T2 and T4 × 3…',
 		});
@@ -660,7 +667,7 @@ export class AiSettingsPanel {
 								line
 							);
 						if (noteworthy) {
-							this.panel.webview.postMessage({ type: 'calibrateProgress', message: line });
+							void this.panel.webview.postMessage({ type: 'calibrateProgress', message: line });
 						}
 						if (line.startsWith('=== revise') || line.startsWith('KEPT') || line.startsWith('REVERTED')) {
 							progress.report({ message: line.replace(/^===\s*/, '').replace(/\s*===$/, '') });
@@ -671,7 +678,7 @@ export class AiSettingsPanel {
 		);
 		this.calibrateBusy = false;
 		this.postState();
-		this.panel.webview.postMessage({
+		void this.panel.webview.postMessage({
 			type: 'calibrateResult',
 			ok: result.ok,
 			summary: result.summary,
@@ -689,7 +696,7 @@ export class AiSettingsPanel {
 		}
 		if (!findBenchScript(this.extensionPath)) {
 			void vscode.window.showErrorMessage(calibrateUnavailableMessage());
-			this.panel.webview.postMessage({
+			void this.panel.webview.postMessage({
 				type: 'calibrateResult',
 				ok: false,
 				error: calibrateUnavailableMessage(),
@@ -699,7 +706,7 @@ export class AiSettingsPanel {
 		const state = this.store.getState();
 		this.calibrateBusy = true;
 		this.postState();
-		this.panel.webview.postMessage({
+		void this.panel.webview.postMessage({
 			type: 'calibrateProgress',
 			message: 'Starting suite (T2, T4, CS2, CS3)…',
 		});
@@ -725,7 +732,7 @@ export class AiSettingsPanel {
 							/^(PASS|FAIL|Merged|Wrote|# Calibration)/.test(line) ||
 							line.startsWith('| ');
 						if (noteworthy) {
-							this.panel.webview.postMessage({ type: 'calibrateProgress', message: line });
+							void this.panel.webview.postMessage({ type: 'calibrateProgress', message: line });
 						}
 						if (line.startsWith('=== calibrate')) {
 							progress.report({
@@ -739,7 +746,7 @@ export class AiSettingsPanel {
 
 		this.calibrateBusy = false;
 		this.postState();
-		this.panel.webview.postMessage({
+		void this.panel.webview.postMessage({
 			type: 'calibrateResult',
 			ok: result.ok,
 			summary: result.summary,

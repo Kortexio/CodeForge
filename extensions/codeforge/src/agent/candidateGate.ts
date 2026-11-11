@@ -45,13 +45,13 @@ export function bootstrapMeanLowerBound(
 	for (let b = 0; b < samples; b += 1) {
 		let sum = 0;
 		for (let i = 0; i < n; i += 1) {
-			sum += values[Math.floor(rand() * n)]!;
+			sum += values[Math.floor(rand() * n)];
 		}
 		means.push(sum / n);
 	}
 	means.sort((a, b) => a - b);
 	const idx = Math.min(means.length - 1, Math.max(0, Math.floor(quantile * means.length)));
-	return means[idx]!;
+	return means[idx];
 }
 
 /**
@@ -76,7 +76,7 @@ export function stratifiedBootstrapLowerBound(
 		let sum = 0;
 		let weight = 0;
 		for (const task of tasks) {
-			const pair = byTask[task]!;
+			const pair = byTask[task];
 			const base = pair.baseline.filter(n => Number.isFinite(n));
 			const cand = pair.candidate.filter(n => Number.isFinite(n));
 			if (!base.length || !cand.length) continue;
@@ -90,10 +90,10 @@ export function stratifiedBootstrapLowerBound(
 			let bSum = 0;
 			let cSum = 0;
 			for (let i = 0; i < base.length; i += 1) {
-				bSum += base[Math.floor(rand() * base.length)]!;
+				bSum += base[Math.floor(rand() * base.length)];
 			}
 			for (let i = 0; i < cand.length; i += 1) {
-				cSum += cand[Math.floor(rand() * cand.length)]!;
+				cSum += cand[Math.floor(rand() * cand.length)];
 			}
 			sum += cSum / cand.length - bSum / base.length;
 			weight += 1;
@@ -103,7 +103,7 @@ export function stratifiedBootstrapLowerBound(
 	if (!means.length) return Number.NaN;
 	means.sort((a, b) => a - b);
 	const idx = Math.min(means.length - 1, Math.max(0, Math.floor(0.1 * means.length)));
-	return means[idx]!;
+	return means[idx];
 }
 
 export function decideCandidate(input: {
@@ -127,7 +127,7 @@ export function decideCandidate(input: {
 		};
 	}
 	for (const task of tasks) {
-		const pair = input.byTask[task]!;
+		const pair = input.byTask[task];
 		const baseline = pair.baseline.filter(n => Number.isFinite(n));
 		const candidate = pair.candidate.filter(n => Number.isFinite(n));
 		if (baseline.length < minReps || candidate.length < minReps) {

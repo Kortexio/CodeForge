@@ -19,8 +19,8 @@ import { StreamBuffer } from './universal/streamBuffer';
 async function testQwenProfileResolvesAndMatchesLegacyThinkingFields(): Promise<void> {
 	const profile = resolveModelFamilyProfile({ modelId: 'qwen2.5-coder-32b-instruct' });
 	assert.ok(profile, 'qwen model id must resolve to a family profile');
-	assert.equal(profile!.id, 'qwen');
-	assert.ok(profile!.grammars.includes('qwen'), 'qwen profile must try the qwen grammar parser');
+	assert.equal(profile.id, 'qwen');
+	assert.ok(profile.grammars.includes('qwen'), 'qwen profile must try the qwen grammar parser');
 
 	// The whole point of unifying Qwen under `ModelFamilyProfile`: the new, format-aware
 	// `thinkingFields()` must produce the exact same wire shape `llmThinkingRequestFields`
@@ -38,7 +38,7 @@ async function testQwenProfileResolvesAndMatchesLegacyThinkingFields(): Promise<
 		for (const planMode of [true, false]) {
 			const input: ThinkingRoundInput = { ...base, toolRoundThinking, planMode };
 			assert.deepEqual(
-				thinkingFields(profile!.thinkingFormat, input),
+				thinkingFields(profile.thinkingFormat, input),
 				llmThinkingRequestFields(input),
 				`mismatch for toolRoundThinking=${toolRoundThinking} planMode=${planMode}`
 			);
@@ -74,8 +74,8 @@ async function testKimiGrammarRecoversALeakedToolCall(): Promise<void> {
 		text,
 		toolNames: new Set(['search']),
 		hasNativeToolCalls: false,
-		families: profile!.grammars,
-		mode: profile!.mode,
+		families: profile.grammars,
+		mode: profile.mode,
 	});
 	assert.equal(result.calls.length, 1, 'kimi sentinel markup must recover exactly one call');
 	assert.equal(result.calls[0].function.name, 'search');

@@ -12,6 +12,7 @@ const CORE = [
 	'shell',
 	'search',
 	'list',
+	'glob',
 	'retrieve',
 	'apply_patch',
 	'dotnet',
@@ -100,6 +101,8 @@ describe('toolCallNormalizer', () => {
 		['ls', 'list'],
 		['list_dir', 'list'],
 		['list_files', 'list'],
+		['glob_file_search', 'glob'],
+		['find_files', 'glob'],
 	] as const)('aliases %s → %s when active', (alias, canonical) => {
 		const r = resolveToolName(alias, CORE);
 		expect(r.name).toBe(canonical);

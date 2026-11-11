@@ -125,13 +125,31 @@ describe('agents bridge: turn outcomes', () => {
 
 	it('treats done and budget as completed turns', () => {
 		expect(resultForTurn(finished('done')).errorDetails).toBeUndefined();
-		expect(resultForTurn(finished('budget')).metadata).toEqual({ loopExit: 'budget', sessionId: 's1' });
+		expect(resultForTurn(finished('budget')).metadata).toEqual({
+			loopExit: 'budget',
+			sessionId: 's1',
+			canRestore: false,
+		});
 	});
 
 	it('offers Continue only when the step budget ended the turn', () => {
 		expect(followupsForResult(resultForTurn(finished('budget')))).toHaveLength(1);
 		expect(followupsForResult(resultForTurn(finished('done')))).toHaveLength(0);
 		expect(followupsForResult(resultForTurn(finished('stuck')))).toHaveLength(0);
+	});
+
+	it('offers Restore last checkpoint when the journal can revert', () => {
+		const withRestore: AgentsTurnResult = {
+			kind: 'finished',
+			sessionId: 's1',
+			reply: 'done',
+			loopExit: 'done',
+			canRestore: true,
+		};
+		const followups = followupsForResult(resultForTurn(withRestore));
+		expect(followups).toEqual([
+			expect.objectContaining({ prompt: '/restore', label: 'Restore last checkpoint' }),
+		]);
 	});
 
 	it('keeps finished tool calls in the transcript and running ones as progress', () => {
@@ -164,13 +182,17 @@ describe('agents bridge: turn outcomes', () => {
 
 describe('agents bridge: request handler', () => {
 	function handlerWith(result: AgentsTurnResult, events: (o: TurnObserver) => void = () => undefined) {
-		const calls: Array<{ task: string; sessionId: string | undefined }> = [];
+		const calls: Array<{
+			task: string;
+			sessionId: string | undefined;
+			attachmentCount: number;
+		}> = [];
 		const selected: string[] = [];
 		const map = new Map<string, string>([['chat-1', 'existing-session']]);
 		const handler = createAgentsRequestHandler(
 			{
-				runAgentsTurn: async (task, sessionId, observer) => {
-					calls.push({ task, sessionId });
+				runAgentsTurn: async (task, sessionId, observer, _token, extras) => {
+					calls.push({ task, sessionId, attachmentCount: extras?.attachments?.length ?? 0 });
 					events(observer);
 					return result;
 				},
@@ -189,7 +211,7 @@ describe('agents bridge: request handler', () => {
 		const { stream, markdown } = recordingStream();
 		const result = await handler(request({ vendor: CODEFORGE_LM_VENDOR, id: 'llama::gemma4-12b' }), {} as never, stream as never, {} as never);
 		expect(selected).toEqual(['llama::gemma4-12b']);
-		expect(calls).toEqual([{ task: 'fix the build', sessionId: 'existing-session' }]);
+		expect(calls).toEqual([{ task: 'fix the build', sessionId: 'existing-session', attachmentCount: 0 }]);
 		expect(markdown.join('')).toContain('Done.');
 		expect((result as vscode.ChatResult).errorDetails).toBeUndefined();
 		expect(map.get('chat-1')).toBe('existing-session');
@@ -200,9 +222,34 @@ describe('agents bridge: request handler', () => {
 		const { stream } = recordingStream();
 		const request = { prompt: 'foo', command: 'review', sessionId: 'chat-1', model: { vendor: 'other', id: 'x' } } as unknown as vscode.ChatRequest;
 		await handler(request, {} as never, stream as never, {} as never);
-		expect(calls).toEqual([{ task: '/review foo', sessionId: 'existing-session' }]);
+		expect(calls).toEqual([{ task: '/review foo', sessionId: 'existing-session', attachmentCount: 0 }]);
+		expect(agentsTurnText({ prompt: '', command: 'bugbot' })).toBe('/bugbot');
 		expect(agentsTurnText({ prompt: '', command: 'help' })).toBe('/help');
 		expect(agentsTurnText({ prompt: 'fix the build' })).toBe('fix the build');
+	});
+
+	it('forwards Agents-window image references into the side-chat turn', async () => {
+		const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+		const { handler, calls } = handlerWith({
+			kind: 'finished',
+			sessionId: 'existing-session',
+			reply: 'saw it',
+			loopExit: 'done',
+		});
+		const { stream } = recordingStream();
+		const request = {
+			prompt: 'what is in this screenshot',
+			sessionId: 'chat-1',
+			model: { vendor: 'other', id: 'x' },
+			references: [
+				{
+					name: 'shot.png',
+					value: { mimeType: 'image/png', data: async () => new Uint8Array(png) },
+				},
+			],
+		} as unknown as vscode.ChatRequest;
+		await handler(request, {} as never, stream as never, {} as never);
+		expect(calls[0].attachmentCount).toBe(1);
 	});
 
 	it('does not stream the reply as an answer when the turn errored', async () => {

@@ -44,7 +44,7 @@ export async function buildContextPacket(opts: {
 	task: string;
 	facts?: StableFacts;
 	workspaceRoot?: string;
-	/** Opt-in RETRIEVE snippets (default false — lean prefill). */
+	/** Include RETRIEVE snippets (start-of-run and hard compact pass true). */
 	includeRetrieve?: boolean;
 	/** Opt-in workspace prefetch listing (default false). */
 	includePrefetch?: boolean;

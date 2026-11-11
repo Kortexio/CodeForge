@@ -126,13 +126,7 @@ await run('node', ['scripts/apply-branding.mjs']);
 await run('node', ['scripts/apply-vscode-patches.mjs']);
 
 if (!setupOnly) {
-	try {
-		await run('npx', ['gulp', 'vscode-win32-x64'], { cwd: vscodeDir });
-	} catch (err) {
-		if (!findExe()) throw err;
-		console.warn('\n⚠ gulp reported an error, but CodeForge.exe exists — continuing.');
-		console.warn(String(err.message || err));
-	}
+	await run('npx', ['gulp', 'vscode-win32-x64'], { cwd: vscodeDir });
 }
 
 const exe = findExe();
@@ -226,16 +220,33 @@ if (!skipSetup) {
 	}
 }
 
-console.log('\n=== Done ===');
-console.log(`Portable:  ${portableOut}`);
-console.log(`ZIP:       ${zipPath}`);
-if (installerPath) console.log(`Installer: ${installerPath}`);
-else console.log(`Artifacts: ${distDir}`);
+// Authenticode: signs when CODEFORGE_SIGN_PFX is set; otherwise writes UNSIGNED.txt.
+const signTargets = [];
+if (finalExe) signTargets.push(finalExe);
+if (installerPath) signTargets.push(installerPath);
+await run('node', ['scripts/sign-windows.mjs', ...signTargets, '--dir', distDir]);
+
 if (!installerPath && !skipSetup) {
+	const requireInstaller =
+		process.env.CODEFORGE_REQUIRE_INSTALLER === '1' ||
+		process.env.CODEFORGE_REQUIRE_INSTALLER === 'true';
+	if (requireInstaller) {
+		console.error('Installer .exe missing — refusing release package.');
+		process.exit(1);
+	}
 	console.log(`
 To build the installer later (Inno Setup required):
   winget install JRSoftware.InnoSetup
   npm run installer:win
 `);
 	process.exitCode = 1;
+}
+
+console.log('\n=== Done ===');
+console.log(`Portable:  ${portableOut}`);
+console.log(`ZIP:       ${zipPath}`);
+if (installerPath) console.log(`Installer: ${installerPath}`);
+else console.log(`Artifacts: ${distDir}`);
+if (fs.existsSync(path.join(distDir, 'UNSIGNED.txt'))) {
+	console.log('Signing:   UNSIGNED (set CODEFORGE_SIGN_PFX to enable Authenticode)');
 }

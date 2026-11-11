@@ -26,9 +26,33 @@ assert(/After diagnosing|bug list/i.test(toolDescription('edit')), 'edit pushes 
 const coreOnly = buildToolSystemContract(CORE);
 assert(coreOnly.includes('### Tool contract'), 'core contract header');
 assert(/edit/i.test(coreOnly), 'core mentions edit');
-assert(!/Browser:/i.test(coreOnly), 'core omits browser when inactive');
-assert(!/web_search/i.test(coreOnly), 'core omits web when inactive');
-assert(!/symbols\/definition/i.test(coreOnly), 'core omits navigation when inactive');
+assert(/Browser:/i.test(coreOnly), 'core includes browser');
+assert(/web_search/i.test(coreOnly), 'core includes web');
+assert(/symbols\/definition\/references/i.test(coreOnly), 'core includes LSP tools');
+{
+	const exploreLine = coreOnly.split('\n').find(l => l.startsWith('Exploration:'));
+	assert(!!exploreLine, 'core has Exploration line');
+	const idxRetrieve = exploreLine!.indexOf('retrieve');
+	const idxGlob = exploreLine!.indexOf('glob');
+	const idxSearch = exploreLine!.indexOf('search');
+	const idxRead = exploreLine!.indexOf('read');
+	const idxList = exploreLine!.indexOf('list');
+	assert(
+		idxRetrieve >= 0 &&
+			idxGlob > idxRetrieve &&
+			idxSearch > idxGlob &&
+			idxRead > idxSearch &&
+			idxList > idxRead,
+		'Exploration order is retrieve → glob → search → read → list'
+	);
+}
+assert(/Prefer retrieve/i.test(coreOnly), 'core states retrieve-first preference');
+assert(/0 hits/i.test(toolDescription('search')), 'search mentions 0 hits');
+assert(/catalog/i.test(toolDescription('skill')), 'skill mentions catalog');
+assert(/catalog/i.test(toolDescription('mcp_call')), 'mcp_call mentions catalog');
+assert(/dir\/type\/findstr/i.test(toolDescription('shell')), 'shell points dir/type/findstr to dedicated tools');
+assert(/findFiles|\*\*\/\*\.csproj/i.test(toolDescription('glob')), 'glob contract names findFiles + pattern');
+assert(/does not replace read/i.test(toolDescription('open')), 'open is not a substitute for read');
 
 assert(
 	/Renaming or removing an identifier is done only when a search for the old name/.test(coreOnly),
@@ -65,6 +89,7 @@ const expected = [
 	'dotnet',
 	'set_verify_command',
 	'list',
+	'glob',
 	'search',
 	'retrieve',
 	'delete',
@@ -115,7 +140,7 @@ const keys = Object.keys(TOOL_DESCRIPTIONS)
 	.sort();
 assert(keys.length === expected.length, `description count ${keys.length} !== ${expected.length}`);
 for (const name of expected) {
-	const d = toolDescription(name as typeof expected[number]);
+	const d = toolDescription(name);
 	assert(typeof d === 'string' && d.trim().length > 20, `thin description: ${name}`);
 }
 assert(
@@ -123,6 +148,12 @@ assert(
 		/exit code 0 is green/.test(toolDescription('set_verify_command')) &&
 		!/dotnet|npm|pytest|cargo/i.test(toolDescription('set_verify_command')),
 	'verification contract: the agent finds the commands; no stack named'
+);
+assert(
+	/do not list a file/i.test(toolDescription('list')) &&
+		/missing children/i.test(toolDescription('list')) &&
+		/search\/retrieve/i.test(toolDescription('list')),
+	'list contract forbids relisting a folder or listing files'
 );
 assert(/old_string/i.test(toolDescription('edit')), 'edit contract mentions old_string');
 assert(/read/i.test(toolDescription('edit')), 'edit contract requires read');

@@ -16,6 +16,12 @@ export interface TurnOutcome {
 	sessionId: string | null;
 	reply: string;
 	loopExit: LoopExit;
+	/** True when the journal still has file edits that /restore can revert. */
+	canRestore?: boolean;
+}
+
+export interface AgentsTurnExtras {
+	attachments?: import('./attachments').PendingAttachment[];
 }
 
 export type AgentsTurnResult = ({ kind: 'finished' } & TurnOutcome) | { kind: 'busy' };

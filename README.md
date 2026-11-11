@@ -73,14 +73,14 @@ Not another chat sidebar. A **tool + system contract** that refuses to paper ove
 ## Where we’re going
 
 **Near term**
-- Harden permissions, sandbox, and secrets for daily use without babysitting
 - Packaging and onboarding so “install → pick local model → agent works” is a five-minute path
-- Keep the calibrate suite (T2/T4/CS2/CS3) as the release gate for local models
+- Keep the calibrate suite (T2/T4/CS2/CS3) as the release gate for local models (local GPU; CI gates lint/unit/integration)
+- Authenticode signing for Windows releases once a code-signing certificate is available (`CODEFORGE_SIGN_PFX` / `CODEFORGE_SIGN_PASSWORD`)
 
 **Next**
 - Broader task suites (navigation, long multi-card, review) with the same failure taxonomy: harness / protocol / semantic
 - Profile knobs proven by A/B — only when the bench says so
-- Richer Agents-window parity with the side chat (attachments, journal, restore)
+- macOS / Linux official packages + notarization
 
 **Not the roadmap**
 - Hardcoded intent crutches (“the user said fix, so nudge edit”)
@@ -105,7 +105,7 @@ Not another chat sidebar. A **tool + system contract** that refuses to paper ove
 | Memory | Session wiki, project wiki, stable facts |
 | Governance | Skills, rules, policies, hard guardrails |
 | Bench | Headless suite + optional external baselines (Aider, OpenHands) on the same tasks |
-| MCP | Inbound tools + outbound wiki + Plugins catalog |
+| MCP | Inbound tools (pinned deps, scrubbed env) + opt-in outbound wiki (Bearer) + Plugins catalog |
 
 Also discoverable as: *open source Cursor alternative*, *Ollama coding agent*, *llama.cpp coding IDE*, *local LLM agent IDE*.
 
@@ -116,6 +116,15 @@ Also discoverable as: *open source Cursor alternative*, *Ollama coding agent*, *
 1. Open **[Releases](https://github.com/Kortexio/CodeForge/releases/latest)**
 2. Download `CodeForge-Setup-*-win32-x64.exe`
 3. Run the installer (per-user under `%LOCALAPPDATA%\Programs\CodeForge`)
+
+Until an Authenticode certificate is configured, release artifacts may include `UNSIGNED.txt` (SmartScreen may warn). To sign local/CI builds:
+
+```bash
+# PFX path or base64 in CODEFORGE_SIGN_PFX; password in CODEFORGE_SIGN_PASSWORD
+npm run sign:win
+```
+
+Set the same values as GitHub Actions secrets for tag releases. `extensions.verifySignature` stays off in the Code-OSS brand until extension signing exists; Workspace Trust is on.
 
 Or build from source (below).
 
