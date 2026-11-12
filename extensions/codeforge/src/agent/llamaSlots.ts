@@ -159,6 +159,26 @@ export function cachedLlamaSlots(serverId: string, model: string): LlamaSlotCaps
 	return undefined;
 }
 
+/**
+ * Concurrent sequences this client may start. Unprobed / cloud / failed probe → 1.
+ * Optional serverId+model must match the live cache or the result is 1.
+ */
+export function slotCap(serverId?: string, model?: string): number {
+	const caps =
+		serverId && model ? cachedLlamaSlots(serverId, model) : cache?.caps;
+	const n = caps?.parallel;
+	return Number.isFinite(n) && (n as number) >= 1 ? Math.floor(n as number) : 1;
+}
+
+/** Test helper: seed GET /slots cache without a network probe. */
+export function seedLlamaSlotCache(
+	serverId: string,
+	model: string,
+	caps?: LlamaSlotCaps
+): void {
+	cache = { serverId, model, caps };
+}
+
 export function clearLlamaSlotCache(): void {
 	cache = undefined;
 }

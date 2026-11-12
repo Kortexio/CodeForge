@@ -120,7 +120,7 @@ describe('agents bridge: turn outcomes', () => {
 		expect(resultForTurn(finished('stuck')).errorDetails?.message).toMatch(/stuck/);
 		expect(resultForTurn(finished('length')).errorDetails?.message).toMatch(/length/);
 		expect(resultForTurn(finished('error', 'Error: 502 Bad Gateway')).errorDetails?.message).toBe('Error: 502 Bad Gateway');
-		expect(resultForTurn({ kind: 'busy' }).errorDetails?.message).toMatch(/already running/);
+		expect(resultForTurn({ kind: 'busy' }).errorDetails?.message).toMatch(/slots are in use/);
 	});
 
 	it('treats done and budget as completed turns', () => {

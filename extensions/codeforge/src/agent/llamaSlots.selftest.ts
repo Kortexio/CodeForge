@@ -3,12 +3,15 @@
  */
 import {
 	capsFromArgs,
+	clearLlamaSlotCache,
 	contextWindowFromModelsList,
 	effectiveContextBudget,
 	parseLlamaSlots,
 	parseModelStatusArgs,
+	seedLlamaSlotCache,
 	serverRoot,
 	shouldProbeLlamaSlots,
+	slotCap,
 } from './llamaSlots';
 
 function assert(cond: boolean, msg: string): void {
@@ -80,5 +83,14 @@ assert(
 );
 assert(contextWindowFromModelsList({ data: [{ id: 'gpt' }] }) === undefined, 'no ctx fields');
 assert(contextWindowFromModelsList({ data: [{ id: 'tiny', meta: { n_ctx: 512 } }] }) === undefined, 'below floor');
+
+clearLlamaSlotCache();
+assert(slotCap() === 1, 'unprobed cap is 1');
+assert(slotCap('lan', 'qwen') === 1, 'unknown pair is 1');
+seedLlamaSlotCache('lan', 'qwen', { parallel: 4, slotContext: 23040, kvUnified: false });
+assert(slotCap() === 4, 'cached parallel');
+assert(slotCap('lan', 'qwen') === 4, 'matching pair');
+assert(slotCap('other', 'qwen') === 1, 'mismatch pair stays 1');
+clearLlamaSlotCache();
 
 console.log('llamaSlots.selftest ok');

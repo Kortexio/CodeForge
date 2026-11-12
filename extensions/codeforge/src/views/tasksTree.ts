@@ -5,6 +5,10 @@
  */
 
 import * as vscode from 'vscode';
+import { nestSubtask, type TaskData } from './taskData';
+
+export type { TaskData };
+export { nestSubtask };
 
 export class TasksTreeProvider implements vscode.TreeDataProvider<TaskItem> {
     private _onDidChangeTreeData = new vscode.EventEmitter<TaskItem | undefined | null | void>();
@@ -46,9 +50,15 @@ export class TasksTreeProvider implements vscode.TreeDataProvider<TaskItem> {
     }
 
     upsertTask(task: TaskData): void {
+        const nested = nestSubtask(this.tasks, task);
+        if (nested) {
+            this.refresh();
+            return;
+        }
         const idx = this.tasks.findIndex(t => t.id === task.id);
         if (idx >= 0) {
-            this.tasks[idx] = { ...this.tasks[idx], ...task };
+            const prev = this.tasks[idx];
+            this.tasks[idx] = { ...prev, ...task, subtasks: task.subtasks ?? prev.subtasks };
         } else {
             this.tasks.unshift(task);
             if (this.tasks.length > 50) {
@@ -93,7 +103,14 @@ class TaskItem extends vscode.TreeItem {
 
         this.taskId = task.id;
         this.description = this.getDescription();
-        this.contextValue = isSubtask ? 'subtask' : 'task';
+        this.contextValue =
+            task.status === 'running' || task.status === 'pending'
+                ? isSubtask
+                    ? 'subtaskRunning'
+                    : 'taskRunning'
+                : isSubtask
+                    ? 'subtask'
+                    : 'task';
         this.tooltip = this.getTooltip();
 
         // Set icon based on status
@@ -154,13 +171,3 @@ class TaskItem extends vscode.TreeItem {
     }
 }
 
-export interface TaskData {
-    id: string;
-    name: string;
-    status: 'pending' | 'running' | 'completed' | 'failed' | 'cancelled';
-    model?: string;
-    workspace?: string;
-    elapsed?: number;
-    result?: string;
-    subtasks?: TaskData[];
-}

@@ -5,6 +5,7 @@
 
 import * as vscode from 'vscode';
 import * as path from 'path';
+import { journalContext } from './journalContext';
 
 export interface JournalFileEntry {
 	/** Workspace-relative path (forward slashes). */
@@ -31,8 +32,8 @@ export class EditJournal {
 	private entries: JournalFileEntry[] = [];
 	private sessionId: string | null = null;
 	private turn = 0;
-	/** Turns whose pending bar has been accepted (implicit accept on next send). */
-	private acceptedTurns = new Set<number>();
+	/** Accepted turns keyed by `sessionId:turn` so two sessions do not share the set. */
+	private acceptedTurns = new Set<string>();
 	private readonly _onDidChange = new vscode.EventEmitter<void>();
 	readonly onDidChange = this._onDidChange.event;
 
@@ -50,12 +51,33 @@ export class EditJournal {
 	}
 
 	clearSession(sessionId?: string): void {
-		if (sessionId && this.sessionId && this.sessionId !== sessionId) return;
-		this.entries = [];
-		this.acceptedTurns.clear();
-		this.sessionId = null;
-		this.turn = 0;
+		if (sessionId) {
+			this.entries = this.entries.filter(e => e.sessionId !== sessionId);
+			for (const key of [...this.acceptedTurns]) {
+				if (key.startsWith(`${sessionId}:`)) this.acceptedTurns.delete(key);
+			}
+			if (this.sessionId === sessionId) {
+				this.sessionId = null;
+				this.turn = 0;
+			}
+		} else {
+			this.entries = [];
+			this.acceptedTurns.clear();
+			this.sessionId = null;
+			this.turn = 0;
+		}
 		this._onDidChange.fire();
+	}
+
+	private acceptKey(sessionId: string, turn: number): string {
+		return `${sessionId}:${turn}`;
+	}
+
+	private writingContext(): { sessionId: string; turn: number } | undefined {
+		const als = journalContext();
+		if (als?.sessionId) return als;
+		if (this.sessionId) return { sessionId: this.sessionId, turn: this.turn };
+		return undefined;
 	}
 
 	/**
@@ -66,10 +88,11 @@ export class EditJournal {
 		readRaw: ReadRaw,
 		opts?: { deleting?: boolean }
 	): Promise<void> {
-		if (!this.sessionId) return;
+		const ctx = this.writingContext();
+		if (!ctx) return;
 		const rel = normalizeRel(filePath);
-		const keyTurn = this.turn;
-		if (this.entries.some(e => e.sessionId === this.sessionId && e.turn === keyTurn && e.path === rel)) {
+		const keyTurn = ctx.turn;
+		if (this.entries.some(e => e.sessionId === ctx.sessionId && e.turn === keyTurn && e.path === rel)) {
 			return;
 		}
 		const existing = await readRaw(filePath);
@@ -83,7 +106,7 @@ export class EditJournal {
 			path: rel,
 			originalContent: existing === undefined ? null : existing,
 			turn: keyTurn,
-			sessionId: this.sessionId,
+			sessionId: ctx.sessionId,
 			kind,
 		});
 		this._onDidChange.fire();
@@ -93,7 +116,7 @@ export class EditJournal {
 	listPending(): JournalFileEntry[] {
 		if (!this.sessionId) return [];
 		return this.entries.filter(
-			e => e.sessionId === this.sessionId && !this.acceptedTurns.has(e.turn)
+			e => e.sessionId === this.sessionId && !this.acceptedTurns.has(this.acceptKey(e.sessionId, e.turn))
 		);
 	}
 
@@ -135,9 +158,11 @@ export class EditJournal {
 	}
 
 	/** Mark all current pending turns as accepted (hides the bar). */
-	accept(): void {
-		for (const e of this.listPending()) {
-			this.acceptedTurns.add(e.turn);
+	accept(sessionId?: string): void {
+		const sid = sessionId ?? this.sessionId;
+		if (!sid) return;
+		for (const e of this.entries) {
+			if (e.sessionId === sid) this.acceptedTurns.add(this.acceptKey(sid, e.turn));
 		}
 		this._onDidChange.fire();
 	}
@@ -175,8 +200,11 @@ export class EditJournal {
 		}
 
 		this.entries = this.entries.filter(e => !(e.sessionId === sid && e.turn >= fromTurn));
-		for (const t of [...this.acceptedTurns]) {
-			if (t >= fromTurn) this.acceptedTurns.delete(t);
+		for (const key of [...this.acceptedTurns]) {
+			const prefix = `${sid}:`;
+			if (!key.startsWith(prefix)) continue;
+			const t = Number(key.slice(prefix.length));
+			if (t >= fromTurn) this.acceptedTurns.delete(key);
 		}
 		this._onDidChange.fire();
 		return firstByPath.size;

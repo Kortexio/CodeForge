@@ -393,7 +393,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<CodeFo
     );
 
     context.subscriptions.push(
-        vscode.commands.registerCommand('codeforge.cancelTask', () => chatViewProvider.cancelTask())
+        vscode.commands.registerCommand('codeforge.cancelTask', (item?: { taskId?: string }) =>
+            chatViewProvider.cancelTask(typeof item?.taskId === 'string' ? item.taskId : undefined)
+        )
     );
 
     context.subscriptions.push(

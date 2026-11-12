@@ -18,7 +18,10 @@ import {
 	effectiveContextBudget,
 	llamaSlotsProbed,
 	refreshLlamaSlots,
+	slotCap,
 } from '../agent/llamaSlots';
+import { SessionFlightRegistry, type FlightHandle } from '../agent/sessionFlights';
+import { runWithJournalContext } from '../agent/journalContext';
 import { runOrchestrated } from '../agent/orchestratorRun';
 import { runReviewPipeline } from '../agent/reviewPipeline';
 import { anyVisionModelAvailable, resolveReachableVisionRoute } from '../agent/visionRouting';
@@ -69,6 +72,7 @@ import {
 	type TurnObserver,
 	type TurnOutcome,
 } from './turnContract';
+import { TurnWaiterRegistry, appendAssistantThought } from './turnWaiters';
 
 const OPEN_TABS_KEY = 'codeforge.ai.openSessionIds';
 
@@ -89,6 +93,21 @@ interface TimelineItem {
 	/** User-turn index (0-based). */
 	turn?: number;
 	ts: number;
+}
+
+interface SessionUi {
+	messages: ChatMessage[];
+	timeline: TimelineItem[];
+	queue: SteeringQueue;
+	currentTurn: number;
+	turnReasoning: string;
+	turnTimings?: MessageTimings;
+	lastLoopExit?: LoopExit;
+	contextUsage: { used: number; limit: number } | null;
+	protocolAgg?: ProtocolAggregator;
+	protocolMeta?: { serverId: string; model: string; startedAt: number };
+	/** Mode frozen when the flight started. */
+	mode?: AgentMode;
 }
 
 interface ChatMessage {
@@ -143,8 +162,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		running: boolean;
 	};
 	private _currentSessionId: string | null = null;
-	private _cancelled = false;
-	private _abort?: AbortController;
+	private _flights = new SessionFlightRegistry(() => this.slotCapNow());
+	private _sessionUi = new Map<string, SessionUi>();
 	private _mode: AgentMode = 'agent';
 	private _permissions: Permissions = 'default';
 	private _contextBadge = { indexed: 0, inContext: 0 };
@@ -154,12 +173,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 	private _pendingAttachments: PendingAttachment[] = [];
 	private _pendingImages: Array<{ mime: string; dataUrl: string; label?: string }> = [];
 	private _hasAgentsMd = false;
-	private _running = false;
 	/** Last tool-loop exit reason from runAgentWithTools (for Continue button). */
 	private _lastLoopExit: LoopExit | undefined;
-	private _turnObserver: TurnObserver | undefined;
-	private _turnSettled: ((outcome: TurnOutcome) => void) | undefined;
+	private _turnWaiters = new TurnWaiterRegistry();
 	private _queue = new SteeringQueue();
+	private _orphanQueue = new SteeringQueue();
 	/** Set by /cards, /plan-run and /review for the next run only. */
 	private _runKind?: 'cards' | 'plan-run' | 'review';
 	private _currentTurn = 0;
@@ -293,26 +311,111 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		return this._currentSessionId;
 	}
 
-	async loadSession(sessionId: string, options: { reveal?: boolean } = {}): Promise<void> {
-		if (this._running && this._currentSessionId && this._currentSessionId !== sessionId) {
-			void vscode.window.showWarningMessage('Stop the agent before switching chats.');
+	private slotCapNow(): number {
+		const { server, model } = this._store.getActiveSelection();
+		return slotCap(server?.id, model);
+	}
+
+	private visibleBusy(): boolean {
+		return !!this._currentSessionId && this._flights.has(this._currentSessionId);
+	}
+
+	private runningIds(): string[] {
+		return this._flights.ids();
+	}
+
+	private uiFor(sessionId: string): SessionUi {
+		let ui = this._sessionUi.get(sessionId);
+		if (!ui) {
+			ui = {
+				messages: [],
+				timeline: [],
+				queue: new SteeringQueue(),
+				currentTurn: 0,
+				turnReasoning: '',
+				contextUsage: null,
+			};
+			this._sessionUi.set(sessionId, ui);
+		}
+		return ui;
+	}
+
+	private queueFor(sessionId: string | null): SteeringQueue {
+		if (!sessionId) return this._orphanQueue;
+		return this.uiFor(sessionId).queue;
+	}
+
+	private bindVisible(sessionId: string | null): void {
+		if (!sessionId) {
+			this._messages = [];
+			this._timeline = [];
+			this._queue = this._orphanQueue;
+			this._currentTurn = 0;
+			this._turnReasoning = '';
+			this._turnTimings = undefined;
+			this._lastLoopExit = undefined;
+			this._contextUsage = null;
 			return;
 		}
+		const ui = this.uiFor(sessionId);
+		this._messages = ui.messages;
+		this._timeline = ui.timeline;
+		this._queue = ui.queue;
+		this._currentTurn = ui.currentTurn;
+		this._turnReasoning = ui.turnReasoning;
+		this._turnTimings = ui.turnTimings;
+		this._lastLoopExit = ui.lastLoopExit;
+		this._contextUsage = ui.contextUsage;
+	}
+
+	private persistVisible(): void {
+		const id = this._currentSessionId;
+		if (!id) return;
+		const ui = this.uiFor(id);
+		ui.messages = this._messages;
+		ui.timeline = this._timeline;
+		ui.queue = this._queue;
+		ui.currentTurn = this._currentTurn;
+		ui.turnReasoning = this._turnReasoning;
+		ui.turnTimings = this._turnTimings;
+		ui.lastLoopExit = this._lastLoopExit;
+		ui.contextUsage = this._contextUsage;
+	}
+
+	async loadSession(sessionId: string, options: { reveal?: boolean } = {}): Promise<void> {
 		const session = this._sessions.get(sessionId);
 		if (!session) {
 			void vscode.window.showWarningMessage('Session not found');
 			return;
 		}
+		this.persistVisible();
 		this.stopPython();
 		this._currentSessionId = session.id;
 		await this._sessions.setActiveId(session.id);
 		this.ensureOpenTab(session.id);
-		try {
-			getApprovalPolicy().clearSession();
-		} catch {
-			/* ignore */
+		if (!this._flights.size()) {
+			try {
+				getApprovalPolicy().clearSession();
+			} catch {
+				/* ignore */
+			}
 		}
-		this._cancelled = false;
+		if (this._flights.has(sessionId)) {
+			this.bindVisible(sessionId);
+			getEditJournal().setContext(sessionId, this.uiFor(sessionId).currentTurn);
+			if (options.reveal !== false) {
+				await this.focus();
+			}
+			this.updateView();
+			this.pushTabs();
+			this.pushQueue();
+			this.pushConfig();
+			if (this._view) {
+				this._view.title = session.title.slice(0, 40);
+			}
+			void this.refreshEditSummary();
+			return;
+		}
 		const userTurns = session.messages.filter(m => m.role === 'user').length;
 		const lastTurn = Math.max(0, userTurns - 1);
 		this._timeline = (session.toolTraces || []).slice(-80).map(t => {
@@ -364,6 +467,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		}));
 		this._currentTurn = lastTurn;
 		this._queue.clear();
+		this.persistVisible();
+		this.bindVisible(session.id);
+		getEditJournal().setContext(session.id, lastTurn);
 		this.pushQueue();
 		if (options.reveal !== false) {
 			await this.focus();
@@ -544,34 +650,23 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 	}
 
 	newChat() {
-		if (this._running) {
-			void vscode.window.showWarningMessage('Stop the agent before opening a new chat.');
-			return;
-		}
+		this.persistVisible();
 		this.stopPython();
-		this._messages = [];
-		this._timeline = [];
-		this._queue.clear();
-		this._running = false;
-		this._cancelled = false;
-		this._abort?.abort();
-		this._abort = undefined;
 		this._currentSessionId = null;
-		this._currentTurn = 0;
-		this._contextUsage = null;
+		this.bindVisible(null);
 		this._editSummary = null;
 		this._pendingAttachments = [];
-		this._turnReasoning = '';
-		this._turnTimings = undefined;
 		void this._sessions.setActiveId(null);
-		getEditJournal().clearSession();
-		try {
-			getApprovalPolicy().clearSession();
-			if (this._permissions === 'allowAll') {
-				void getApprovalPolicy().allowAutoSession();
+		if (!this._flights.size()) {
+			getEditJournal().clearSession();
+			try {
+				getApprovalPolicy().clearSession();
+				if (this._permissions === 'allowAll') {
+					void getApprovalPolicy().allowAutoSession();
+				}
+			} catch {
+				/* policy may not be ready */
 			}
-		} catch {
-			/* policy may not be ready */
 		}
 		if (this._view) {
 			this._view.title = 'Agent';
@@ -625,31 +720,54 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		observer: TurnObserver,
 		token: vscode.CancellationToken
 	): Promise<AgentsTurnResult> {
-		if (this._running) {
+		const target = sessionId && this._sessions.get(sessionId) ? sessionId : undefined;
+		if (target && this._flights.has(target)) {
+			return { kind: 'busy' };
+		}
+		if (!this._flights.canStart(target ?? `__agents-probe-${Date.now()}`)) {
 			return { kind: 'busy' };
 		}
 		if (sessionId && this._sessions.get(sessionId)) {
 			if (this._currentSessionId !== sessionId) {
 				await this.loadSession(sessionId, { reveal: false });
 			}
-		} else if (this._currentSessionId) {
+		} else if (this._currentSessionId && this._flights.has(this._currentSessionId)) {
 			this.newChat();
 		}
 
+		const { server, model } = this._store.getActiveSelection();
+		let sid = this._currentSessionId;
+		if (!sid) {
+			const session = await this._sessions.create({
+				task,
+				model,
+				serverName: server?.name,
+			});
+			sid = session.id;
+			this._currentSessionId = sid;
+			this.bindVisible(sid);
+			this.ensureOpenTab(sid);
+			await this._sessions.setActiveId(sid);
+			this.pushTabs();
+		}
+		if (this._flights.has(sid) || !this._flights.canStart(sid)) {
+			return { kind: 'busy' };
+		}
+
 		const settled = new Promise<TurnOutcome>(resolve => {
-			this._turnSettled = resolve;
+			this._turnWaiters.register(sid!, resolve, observer);
 		});
-		this._turnObserver = observer;
 		const cancel = token.onCancellationRequested(() => {
-			if (this._turnObserver === observer) {
-				void this.cancelTask();
+			if (this._turnWaiters.has(sid!)) {
+				void this.cancelTask(sid!);
 			}
 		});
 		try {
 			const handled = this.handleUserMessage(task).then((): TurnOutcome => {
-				const last = this._messages[this._messages.length - 1];
+				const msgs = this.uiFor(sid!).messages;
+				const last = msgs[msgs.length - 1];
 				return {
-					sessionId: this._currentSessionId,
+					sessionId: sid!,
 					reply: last?.role === 'assistant' ? last.content : '',
 					loopExit: 'done',
 				};
@@ -658,18 +776,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			return { kind: 'finished', ...outcome };
 		} finally {
 			cancel.dispose();
-			if (this._turnObserver === observer) {
-				this._turnObserver = undefined;
-				this._turnSettled = undefined;
-			}
+			this._turnWaiters.clear(sid!, observer);
 		}
 	}
 
 	private settleTurn(outcome: TurnOutcome): void {
-		const settle = this._turnSettled;
-		this._turnSettled = undefined;
-		this._turnObserver = undefined;
-		settle?.(outcome);
+		this._turnWaiters.settle(outcome.sessionId, outcome);
 	}
 
 	async runTask(task: string, mode?: AgentMode) {
@@ -686,24 +798,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			this.settleTurn({ sessionId: this._currentSessionId, reply: disabled, loopExit: 'error' });
 			return;
 		}
-		if (this._running) {
-			this.enqueueMessage(task, mode);
-			return;
-		}
-
-		this._running = true;
-		this._cancelled = false;
-		this._abort?.abort();
-		this._abort = new AbortController();
-		this.pushConfig();
-		this.pushQueue();
-		// Keep prior-turn timeline; new tools tag with the upcoming turn index.
-
 		await this.maybeResumeForContinue(task);
-
-		// Implicitly accept prior pending edits when starting a new turn.
-		getEditJournal().accept();
-		void this.refreshEditSummary();
 
 		const { server, model } = this._store.getActiveSelection();
 		if (!this._currentSessionId) {
@@ -713,6 +808,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 				serverName: server?.name,
 			});
 			this._currentSessionId = session.id;
+			this.bindVisible(session.id);
 			this.ensureOpenTab(session.id);
 			if (this._view) {
 				this._view.title = session.title.slice(0, 40);
@@ -723,6 +819,26 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			this.ensureOpenTab(this._currentSessionId);
 			this.pushTabs();
 		}
+
+		const sid = this._currentSessionId;
+		if (!sid) return;
+		if (this._flights.has(sid)) {
+			this.enqueueMessage(task, mode, sid);
+			return;
+		}
+		const handle = this._flights.start(sid);
+		if (!handle) {
+			this.enqueueMessage(task, mode, sid);
+			return;
+		}
+		this.uiFor(sid).mode = this._mode;
+
+		this.pushConfig();
+		this.pushQueue();
+		this.pushTabs();
+
+		getEditJournal().accept(sid);
+		void this.refreshEditSummary();
 
 		if (this._permissions === 'allowAll' || vscode.workspace.getConfiguration('codeforge.ai').get<boolean>('fullAgentFreedom') === true) {
 			try {
@@ -755,129 +871,132 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			images.length > 0
 				? `${displayTask}\n\n(Attached images: ${images.map(i => i.label || 'image').join(', ')})`
 				: displayTask;
-		this.addMessage('user', historyText);
-		await this._sessions.appendMessage(this._currentSessionId, 'user', historyText);
-		await this._sessions.updateState(this._currentSessionId, 'running');
+		this.addMessage('user', historyText, undefined, sid);
+		await this._sessions.appendMessage(sid, 'user', historyText);
+		await this._sessions.updateState(sid, 'running');
 
-		this._currentTurn = this._messages.filter(m => m.role === 'user').length - 1;
-		if (this._currentSessionId) {
-			getEditJournal().setContext(this._currentSessionId, this._currentTurn);
-		}
+		const ui = this.uiFor(sid);
+		ui.currentTurn = ui.messages.filter(m => m.role === 'user').length - 1;
+		if (this._currentSessionId === sid) this._currentTurn = ui.currentTurn;
+		getEditJournal().setContext(sid, ui.currentTurn);
 
-		this.addMessage('assistant', '', 'pending');
-		const pending = this._messages[this._messages.length - 1];
+		this.addMessage('assistant', '', 'pending', sid);
+		const pending = ui.messages[ui.messages.length - 1];
 		if (pending?.role === 'assistant') {
-			pending.liveStatus =
-				this._mode === 'ask'
-					? 'Thinking'
-					: this._mode === 'plan'
-						? 'Planning next moves'
-						: 'Planning next moves';
+			pending.liveStatus = ui.mode === 'ask' ? 'Thinking' : 'Planning next moves';
 		}
-		this._turnReasoning = '';
-		this._turnTimings = undefined;
-		this._protocolAgg = createProtocolAggregator();
-		this._protocolMeta = {
+		ui.turnReasoning = '';
+		ui.turnTimings = undefined;
+		ui.lastLoopExit = undefined;
+		ui.protocolAgg = createProtocolAggregator();
+		ui.protocolMeta = {
 			serverId: server?.id || 'unknown',
 			model: model || 'unknown',
 			startedAt: Date.now(),
 		};
-		this.updateView();
+		if (this._currentSessionId === sid) {
+			this._turnReasoning = '';
+			this._turnTimings = undefined;
+			this._lastLoopExit = undefined;
+			this._protocolAgg = ui.protocolAgg;
+			this._protocolMeta = ui.protocolMeta;
+		}
+		this.paintSession(sid);
 		this.pushQueue();
 
-		this._lastLoopExit = undefined;
 		let loopExit = 'done' as LoopExit;
 		let finalReply = '';
 		try {
-			const reply = await this.executeLocalAgent(agentTask, images);
-			if (!this._cancelled) {
-				loopExit = (this._lastLoopExit as LoopExit | undefined) ?? 'done';
+			const reply = await runWithJournalContext({ sessionId: sid, turn: ui.currentTurn }, () =>
+				this.executeLocalAgent(agentTask, images, sid, handle)
+			);
+			if (!handle.cancelled) {
+				loopExit = (this.uiFor(sid).lastLoopExit as LoopExit | undefined) ?? 'done';
 				finalReply = reply;
 				const extra = {
-					reasoning: this._turnReasoning || undefined,
-					timings: this._turnTimings,
+					reasoning: this.uiFor(sid).turnReasoning || undefined,
+					timings: this.uiFor(sid).turnTimings,
 					continueAvailable: loopExit === 'budget',
 				};
-				this.updateLastMessage('assistant', reply, undefined, extra);
-				await this._sessions.appendMessage(
-					this._currentSessionId,
-					'assistant',
-					reply,
-					{ reasoning: extra.reasoning, timings: extra.timings }
-				);
-				await this._sessions.updateState(
-					this._currentSessionId,
-					loopExit === 'budget' ? 'failed' : 'completed'
-				);
+				this.updateLastMessage('assistant', reply, undefined, extra, sid);
+				await this._sessions.appendMessage(sid, 'assistant', reply, {
+					reasoning: extra.reasoning,
+					timings: extra.timings,
+				});
+				await this._sessions.updateState(sid, loopExit === 'budget' ? 'failed' : 'completed');
 			} else {
 				loopExit = 'cancelled';
-				await this._sessions.updateState(this._currentSessionId, 'cancelled');
+				await this._sessions.updateState(sid, 'cancelled');
 			}
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
-			if (this._cancelled || /abort/i.test(message)) {
+			if (handle.cancelled || /abort/i.test(message)) {
 				loopExit = 'cancelled';
 				finalReply = 'Cancelled.';
-				this.updateLastMessage('assistant', 'Cancelled.');
-				if (this._currentSessionId) {
-					const session = this._sessions.get(this._currentSessionId);
-					const last = session?.messages[session.messages.length - 1];
-					if (!(last?.role === 'assistant' && /Cancelled/i.test(last.content))) {
-						await this._sessions.appendMessage(this._currentSessionId, 'assistant', 'Cancelled.');
-					}
-					await this._sessions.updateState(this._currentSessionId, 'cancelled');
+				this.updateLastMessage('assistant', 'Cancelled.', undefined, undefined, sid);
+				const session = this._sessions.get(sid);
+				const last = session?.messages[session.messages.length - 1];
+				if (!(last?.role === 'assistant' && /Cancelled/i.test(last.content))) {
+					await this._sessions.appendMessage(sid, 'assistant', 'Cancelled.');
 				}
+				await this._sessions.updateState(sid, 'cancelled');
 			} else {
 				loopExit = 'error';
 				finalReply = `Error: ${message}`;
-				this.updateLastMessage('assistant', `Error: ${message}`);
-				if (this._currentSessionId) {
-					await this._sessions.appendMessage(
-						this._currentSessionId,
-						'assistant',
-						`Error: ${message}`
-					);
-					await this._sessions.updateState(this._currentSessionId, 'failed');
-				}
+				this.updateLastMessage('assistant', `Error: ${message}`, undefined, undefined, sid);
+				await this._sessions.appendMessage(sid, 'assistant', `Error: ${message}`);
+				await this._sessions.updateState(sid, 'failed');
 			}
 		} finally {
+			const doneUi = this.uiFor(sid);
 			try {
-				if (this._protocolAgg && this._protocolMeta) {
+				if (doneUi.protocolAgg && doneUi.protocolMeta) {
 					flushRunTelemetry({
-						serverId: this._protocolMeta.serverId,
-						model: this._protocolMeta.model,
+						serverId: doneUi.protocolMeta.serverId,
+						model: doneUi.protocolMeta.model,
 						source: 'chat',
-						sessionId: this._currentSessionId ?? undefined,
+						sessionId: sid,
 						loopExit,
-						elapsedMs: Date.now() - this._protocolMeta.startedAt,
-						aggregator: this._protocolAgg,
+						elapsedMs: Date.now() - doneUi.protocolMeta.startedAt,
+						aggregator: doneUi.protocolAgg,
 					});
 				}
 			} catch {
 				/* best-effort */
 			}
-			this._protocolAgg = undefined;
-			this._protocolMeta = undefined;
-			this._abort = undefined;
+			doneUi.protocolAgg = undefined;
+			doneUi.protocolMeta = undefined;
+			this._flights.end(sid);
 			this._pendingImages = [];
-			this._running = false;
 			void this.refreshEditSummary();
 			this.pushConfig();
 			this.pushQueue();
-			this.updateView();
-			this.settleTurn({ sessionId: this._currentSessionId, reply: finalReply, loopExit });
-			await this.drainQueue();
+			this.paintSession(sid);
+			this.settleTurn({ sessionId: sid, reply: finalReply, loopExit });
+			await this.drainQueueFor(sid);
+			await this.drainWaitingSessions();
 		}
 	}
 
-	private observeActivity(ev: AgentActivityEvent): void {
-		this._turnObserver?.onActivity(ev);
-		this.pushActivity(ev);
-		this._protocolAgg?.observe(ev);
+	private paintSession(sessionId: string): void {
+		if (this._currentSessionId === sessionId) {
+			this.bindVisible(sessionId);
+			this.updateView();
+		}
+		this.pushTabs();
 	}
 
-	private enqueueMessage(text: string, mode?: AgentMode): void {
-		this._queue.push('followup', text, `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, mode);
+	private observeActivity(ev: AgentActivityEvent, sessionId?: string): void {
+		const sid = sessionId ?? this._currentSessionId;
+		this._turnWaiters.observer(sid)?.onActivity(ev);
+		this.pushActivity(ev, sid ?? undefined);
+		if (sid) this.uiFor(sid).protocolAgg?.observe(ev);
+		else this._protocolAgg?.observe(ev);
+	}
+
+	private enqueueMessage(text: string, mode?: AgentMode, sessionId?: string): void {
+		const sid = sessionId ?? this._currentSessionId;
+		this.queueFor(sid).push('followup', text, `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, mode);
 		this.pushQueue();
 	}
 
@@ -901,47 +1020,75 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		void this._view?.webview.postMessage({
 			type: 'queue',
 			items: this._queue.items.map(item => ({ id: item.id, text: item.text, kind: item.kind })),
-			running: this._running,
+			running: this.visibleBusy(),
 		});
 	}
 
-	private takeSteering(): string[] {
-		const notes = this._queue.drainSteering();
+	private takeSteering(sessionId?: string): string[] {
+		const notes = this.queueFor(sessionId ?? this._currentSessionId).drainSteering();
 		if (notes.length) this.pushQueue();
 		return notes;
 	}
 
-	private async drainQueue(): Promise<void> {
-		const next = this._queue.shiftFollowUp();
+	private async drainQueueFor(sessionId: string): Promise<void> {
+		const next = this.uiFor(sessionId).queue.shiftFollowUp();
 		this.pushQueue();
 		if (!next) return;
+		if (this._currentSessionId !== sessionId) {
+			await this.loadSession(sessionId, { reveal: false });
+		}
 		await this.handleUserMessage(next.text, next.mode as AgentMode | undefined);
 	}
 
-	async cancelTask() {
-		this._cancelled = true;
-		this._abort?.abort();
+	private async drainWaitingSessions(): Promise<void> {
+		if (this._flights.size() >= this._flights.cap()) return;
+		for (const [id, ui] of this._sessionUi) {
+			if (this._flights.has(id)) continue;
+			if (!ui.queue.items.some(i => i.kind === 'followup')) continue;
+			if (!this._flights.canStart(id)) return;
+			await this.drainQueueFor(id);
+			if (this._flights.size() >= this._flights.cap()) return;
+		}
+	}
+
+	async cancelTask(taskId?: string) {
+		let sid = this._currentSessionId;
+		if (taskId) {
+			if (this._flights.abortSub(taskId)) {
+				void vscode.window.showInformationMessage('Subagent cancelled');
+				return;
+			}
+			sid = taskId.includes('-sub-') ? taskId.slice(0, taskId.indexOf('-sub-')) : taskId;
+		}
+		if (!sid || !this._flights.has(sid)) {
+			if (!taskId) {
+				void vscode.window.showInformationMessage('No running task');
+			}
+			return;
+		}
+		this._flights.abort(sid);
 		try {
 			this._bridge.abortRunningShells();
 		} catch {
 			/* ignore */
 		}
 		void vscode.window.showInformationMessage('Task cancelled');
-		this.updateLastMessage('assistant', 'Cancelled.');
-		this.pushActivity({
-			kind: 'checkpoint',
-			label: 'Stopped',
-			detail: 'User cancelled',
-		});
-		if (this._currentSessionId) {
-			const session = this._sessions.get(this._currentSessionId);
-			const last = session?.messages[session.messages.length - 1];
-			if (!(last?.role === 'assistant' && last.content === 'Cancelled.')) {
-				await this._sessions.appendMessage(this._currentSessionId, 'assistant', 'Cancelled.');
-			}
-			await this._sessions.updateState(this._currentSessionId, 'cancelled');
+		this.updateLastMessage('assistant', 'Cancelled.', undefined, undefined, sid);
+		this.pushActivity(
+			{
+				kind: 'checkpoint',
+				label: 'Stopped',
+				detail: 'User cancelled',
+			},
+			sid
+		);
+		const session = this._sessions.get(sid);
+		const last = session?.messages[session.messages.length - 1];
+		if (!(last?.role === 'assistant' && last.content === 'Cancelled.')) {
+			await this._sessions.appendMessage(sid, 'assistant', 'Cancelled.');
 		}
-		this.updateView();
+		await this._sessions.updateState(sid, 'cancelled');
+		this.paintSession(sid);
 	}
 
 	/** No configured, enabled server has an image-capable model — images must not be attached. */
@@ -1046,7 +1193,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			const result = await generateAgentsMd({
 				bridge: this._bridge,
 				store: this._store,
-				abortSignal: this._abort?.signal,
+				abortSignal: this._currentSessionId
+					? this._flights.get(this._currentSessionId)?.abort.signal
+					: undefined,
 			});
 			this._hasAgentsMd = true;
 			this.updateLastMessage(
@@ -1126,7 +1275,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			badge: this._contextBadge,
 			contextUsage: this._contextUsage,
 			editSummary: this._editSummary,
-			running: this._running,
+			running: this.visibleBusy(),
 			hasAgentsMd: this._hasAgentsMd,
 			weakHarness: this._weakHarness,
 			slashCommands: SLASH_COMMANDS,
@@ -1139,42 +1288,52 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		});
 	}
 
-	private pushActivity(event: AgentActivityEvent) {
+	private pushActivity(event: AgentActivityEvent, sessionId?: string) {
+		const sid = sessionId ?? this._currentSessionId ?? undefined;
+		const ui = sid ? this.uiFor(sid) : undefined;
+		const messages = ui?.messages ?? this._messages;
+		const timeline = ui?.timeline ?? this._timeline;
+		const turn = ui?.currentTurn ?? this._currentTurn;
+		const paint = (): void => {
+			if (!sid || sid === this._currentSessionId) this.updateView();
+		};
 		// Thoughts are shown in the Reasoning accordion on the assistant message.
 		if (event.kind === 'thought') {
-			if (event.detail) {
-				this._turnReasoning = this._turnReasoning
-					? `${this._turnReasoning}\n\n${event.detail}`
-					: event.detail;
-				const last = this._messages[this._messages.length - 1];
-				if (last?.role === 'assistant') {
-					last.reasoning = this._turnReasoning;
-					this.updateView();
-				}
+			if (event.detail && sid) {
+				appendAssistantThought(
+					new Map([[sid, { messages }]]),
+					sid,
+					event.detail
+				);
+				const last = messages[messages.length - 1];
+				const next = last?.reasoning ?? event.detail;
+				if (ui) ui.turnReasoning = next;
+				if (sid === this._currentSessionId) this._turnReasoning = next;
+				paint();
 			}
 			return;
 		}
 		// Live wait label (Cursor-style): Thinking / Reading / Grepping / Planning…
 		if (event.kind === 'thinking') {
-			this.setPendingLiveStatus(event.label || 'Thinking…');
+			this.setPendingLiveStatus(event.label || 'Thinking…', sid);
 			return;
 		}
 		if (event.kind === 'compact') {
-			this.setPendingLiveStatus(event.label || 'Compacting…');
+			this.setPendingLiveStatus(event.label || 'Compacting…', sid);
 			return;
 		}
 		if (event.kind === 'context') {
-			this.setPendingLiveStatus(event.label || 'Loading context…');
+			this.setPendingLiveStatus(event.label || 'Loading context…', sid);
 			return;
 		}
 		if (event.kind === 'checkpoint') {
 			const label = String(event.label || '');
 			if (/^Phase:\s*plan/i.test(label) || /\bplanning\b/i.test(label)) {
-				this.setPendingLiveStatus('Planning…');
+				this.setPendingLiveStatus('Planning…', sid);
 			} else if (
 				/Incomplete intent|Thin final|retry tools|ask for findings/i.test(label)
 			) {
-				this.setPendingLiveStatus(label);
+				this.setPendingLiveStatus(label, sid);
 			}
 			if (
 				/^(hook|Lesson|Oracle|LLM |Repaired|Retry|Nuked|Switched|Parsed|Truncated|Build-fix|context |Phase:|Prior context|Turn summary|Stopped)/i.test(
@@ -1189,14 +1348,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		}
 		if (event.kind === 'tool') {
 			if (event.toolStatus === 'running') {
-				this.setPendingLiveStatus(event.label || `Running ${event.tool || 'tool'}…`);
+				this.setPendingLiveStatus(event.label || `Running ${event.tool || 'tool'}…`, sid);
 			} else if (event.toolStatus === 'ok' || event.toolStatus === 'failed' || event.success !== undefined) {
-				// Between tools the model thinks again.
-				this.setPendingLiveStatus('Thinking…');
+				this.setPendingLiveStatus('Thinking…', sid);
 			}
 		}
 		if (event.kind === 'tool' && event.toolCallId) {
-			const existing = this._timeline.find(
+			const existing = timeline.find(
 				t => t.kind === 'tool' && t.toolCallId === event.toolCallId
 			);
 			if (existing) {
@@ -1205,8 +1363,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 				existing.success = event.success;
 				existing.toolStatus = event.toolStatus;
 				existing.ts = Date.now();
-				existing.turn = this._currentTurn;
-				this.updateView();
+				existing.turn = turn;
+				paint();
 				return;
 			}
 		}
@@ -1219,14 +1377,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			success: event.success,
 			toolCallId: event.toolCallId,
 			toolStatus: event.toolStatus,
-			turn: this._currentTurn,
+			turn,
 			ts: Date.now(),
 		};
-		this._timeline.push(item);
-		if (this._timeline.length > 120) {
-			this._timeline = this._timeline.slice(-120);
+		timeline.push(item);
+		if (timeline.length > 120) {
+			const trimmed = timeline.slice(-120);
+			if (ui) ui.timeline = trimmed;
+			if (!sid || sid === this._currentSessionId) this._timeline = trimmed;
 		}
-		this.updateView();
+		paint();
 	}
 
 	private async refreshEditSummary(): Promise<void> {
@@ -1240,7 +1400,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 	}
 
 	private async undoAllEdits(): Promise<void> {
-		if (this._running) {
+		if (this.visibleBusy()) {
 			void vscode.window.showWarningMessage('Stop the agent before undoing edits.');
 			return;
 		}
@@ -1279,7 +1439,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 	}
 
 	private async restoreCheckpoint(messageIndex: number): Promise<void> {
-		if (this._running) {
+		if (this.visibleBusy()) {
 			void vscode.window.showWarningMessage('Stop the agent before restoring a checkpoint.');
 			return;
 		}
@@ -1326,7 +1486,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			t => t.turn !== undefined && t.turn !== null && t.turn < userTurn
 		);
 		this._currentTurn = Math.max(0, userTurn - 1);
-		this._cancelled = false;
 		await this.refreshEditSummary();
 		this.updateView();
 		this.pushConfig();
@@ -1336,8 +1495,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
 	private async executeLocalAgent(
 		task: string,
-		images: Array<{ mime: string; dataUrl: string; label?: string }> = []
+		images: Array<{ mime: string; dataUrl: string; label?: string }> = [],
+		sessionId?: string,
+		handle?: FlightHandle
 	): Promise<string> {
+		const sid = sessionId ?? this._currentSessionId;
+		const flight = handle ?? (sid ? this._flights.get(sid) : undefined);
+		const ui = sid ? this.uiFor(sid) : undefined;
+		const runMode = ui?.mode ?? this._mode;
 		const root = this._bridge.getWorkspaceRoot();
 		let { server, model } = this._store.getActiveSelection();
 
@@ -1398,7 +1563,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
 		const numCtx = await this.resolveNumCtx(server.id, server.numCtx, activeModel, baseUrl, apiKey);
 
-		if (this._mode === 'ask') {
+		if (runMode === 'ask') {
 			if (!apiKey && provider !== 'ollama' && provider !== 'lmstudio' && provider !== 'vllm') {
 				return [
 					`Ask mode — add an API key for ${server.name} in Settings.`,
@@ -1416,31 +1581,38 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 				workspaceRoot: root,
 				task,
 				images,
-				history: this.getHistoryForLlm(),
-				cancelled: () => this._cancelled,
-				abortSignal: this._abort?.signal,
+				history: this.getHistoryForLlm(sid),
+				cancelled: () => !!flight?.cancelled,
+				abortSignal: flight?.abort.signal,
 				numCtx,
 				forceJson: server.forceJson === true,
 				sampling: server.sampling,
 				serverId: server.id,
-				onStatus: text => this.setPendingLiveStatus(text),
-				onActivity: ev => this.observeActivity(ev),
+				onStatus: text => this.setPendingLiveStatus(text, sid ?? undefined),
+				onActivity: ev => this.observeActivity(ev, sid ?? undefined),
 				onLoopExit: exit => {
-					this._lastLoopExit = exit;
+					if (ui) ui.lastLoopExit = exit;
+					if (sid === this._currentSessionId) this._lastLoopExit = exit;
 				},
 				onContextBadge: badge => {
 					this._contextBadge = badge;
 					this.pushConfig();
 				},
 				onContextUsage: usage => {
-					this._contextUsage = usage;
-					this.pushConfig();
+					if (ui) ui.contextUsage = usage;
+					if (sid === this._currentSessionId) {
+						this._contextUsage = usage;
+						this.pushConfig();
+					}
 				},
-				onTurnMetrics: metrics => this.applyTurnMetrics(metrics),
-				drainSteering: () => this.takeSteering(),
+				onTurnMetrics: metrics => this.applyTurnMetrics(metrics, sid ?? undefined),
+				drainSteering: () => this.takeSteering(sid ?? undefined),
 				sessionStore: this._sessions,
-				sessionId: this._currentSessionId,
-				turnIndex: this._currentTurn,
+				sessionId: sid,
+				turnIndex: ui?.currentTurn ?? this._currentTurn,
+				onRegisterSubAbort: (subId, abort) => {
+					if (sid) this._flights.registerSub(sid, subId, abort);
+				},
 				maxSteps: cfgAsk.get<number>('agentCheckpointSteps') ?? 20,
 				hardCap: 40,
 				weakProfile: weakAsk,
@@ -1452,7 +1624,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		this._weakHarness = weakProfile;
 		this.pushConfig();
 
-		if (this._mode === 'plan') {
+		if (runMode === 'plan') {
 			const cfgAgentPlan = vscode.workspace.getConfiguration('codeforge.ai');
 			return runAgentWithTools({
 				bridge: this._bridge,
@@ -1463,32 +1635,39 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 				workspaceRoot: root,
 				task,
 				images,
-				history: this.getHistoryForLlm(),
-				cancelled: () => this._cancelled,
-				abortSignal: this._abort?.signal,
+				history: this.getHistoryForLlm(sid),
+				cancelled: () => !!flight?.cancelled,
+				abortSignal: flight?.abort.signal,
 				numCtx,
 				forceJson: server.forceJson === true,
 				sampling: server.sampling,
 				serverId: server.id,
-				onStatus: text => this.setPendingLiveStatus(text),
-				onActivity: ev => this.observeActivity(ev),
+				onStatus: text => this.setPendingLiveStatus(text, sid ?? undefined),
+				onActivity: ev => this.observeActivity(ev, sid ?? undefined),
 				onLoopExit: exit => {
-					this._lastLoopExit = exit;
+					if (ui) ui.lastLoopExit = exit;
+					if (sid === this._currentSessionId) this._lastLoopExit = exit;
 				},
 				onContextBadge: badge => {
 					this._contextBadge = badge;
 					this.pushConfig();
 				},
 				onContextUsage: usage => {
-					this._contextUsage = usage;
-					this.pushConfig();
+					if (ui) ui.contextUsage = usage;
+					if (sid === this._currentSessionId) {
+						this._contextUsage = usage;
+						this.pushConfig();
+					}
 				},
-				onTurnMetrics: metrics => this.applyTurnMetrics(metrics),
-				drainSteering: () => this.takeSteering(),
+				onTurnMetrics: metrics => this.applyTurnMetrics(metrics, sid ?? undefined),
+				drainSteering: () => this.takeSteering(sid ?? undefined),
 				onTaskUpdate: this._onTaskUpdate,
 				sessionStore: this._sessions,
-				sessionId: this._currentSessionId,
-				turnIndex: this._currentTurn,
+				sessionId: sid,
+				turnIndex: ui?.currentTurn ?? this._currentTurn,
+				onRegisterSubAbort: (subId, abort) => {
+					if (sid) this._flights.registerSub(sid, subId, abort);
+				},
 				maxSteps: cfgAgentPlan.get<number>('agentCheckpointSteps') ?? 30,
 				hardCap: cfgAgentPlan.get<number>('agentHardCap') ?? 100,
 				weakProfile,
@@ -1523,32 +1702,39 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			workspaceRoot: root,
 			task,
 			images,
-			history: this.getHistoryForLlm(),
-			cancelled: () => this._cancelled,
-			abortSignal: this._abort?.signal,
+			history: this.getHistoryForLlm(sid),
+			cancelled: () => !!flight?.cancelled,
+			abortSignal: flight?.abort.signal,
 			numCtx,
 			forceJson: server.forceJson === true,
 			sampling: server.sampling,
 			serverId: server.id,
-			onStatus: text => this.setPendingLiveStatus(text),
-			onActivity: ev => this.observeActivity(ev),
+			onStatus: text => this.setPendingLiveStatus(text, sid ?? undefined),
+			onActivity: ev => this.observeActivity(ev, sid ?? undefined),
 			onLoopExit: exit => {
-				this._lastLoopExit = exit;
+				if (ui) ui.lastLoopExit = exit;
+				if (sid === this._currentSessionId) this._lastLoopExit = exit;
 			},
 			onContextBadge: badge => {
 				this._contextBadge = badge;
 				this.pushConfig();
 			},
 			onContextUsage: usage => {
-				this._contextUsage = usage;
-				this.pushConfig();
+				if (ui) ui.contextUsage = usage;
+				if (sid === this._currentSessionId) {
+					this._contextUsage = usage;
+					this.pushConfig();
+				}
 			},
-			onTurnMetrics: metrics => this.applyTurnMetrics(metrics),
-			drainSteering: () => this.takeSteering(),
+			onTurnMetrics: metrics => this.applyTurnMetrics(metrics, sid ?? undefined),
+			drainSteering: () => this.takeSteering(sid ?? undefined),
 			onTaskUpdate: this._onTaskUpdate,
 			sessionStore: this._sessions,
-			sessionId: this._currentSessionId,
-			turnIndex: this._currentTurn,
+			sessionId: sid,
+			turnIndex: ui?.currentTurn ?? this._currentTurn,
+			onRegisterSubAbort: (subId, abort) => {
+				if (sid) this._flights.registerSub(sid, subId, abort);
+			},
 			maxSteps: cfgAgent.get<number>('agentCheckpointSteps') ?? 30,
 			hardCap: cfgAgent.get<number>('agentHardCap') ?? 100,
 			weakProfile,
@@ -1582,8 +1768,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		this._onTaskUpdate = handler;
 	}
 
-	private getHistoryForLlm(): Array<{ role: 'user' | 'assistant'; content: string }> {
-		const completed = this._messages.filter(m => m.status !== 'pending');
+	private getHistoryForLlm(sessionId?: string | null): Array<{ role: 'user' | 'assistant'; content: string }> {
+		const msgs = sessionId ? this.uiFor(sessionId).messages : this._messages;
+		const completed = msgs.filter(m => m.status !== 'pending');
 		const prior = completed.slice(0, -1);
 		return prior.slice(-16).map(m => ({
 			role: m.role,
@@ -1633,7 +1820,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 				Accept: 'text/event-stream, application/json',
 				...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
 			},
-			signal: this._abort?.signal,
+			signal: this._currentSessionId
+				? this._flights.get(this._currentSessionId)?.abort.signal
+				: undefined,
 			body: JSON.stringify({
 				model: provider === 'ollama' ? model || 'llama3.2' : model,
 				messages: [
@@ -1769,7 +1958,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 				'x-api-key': apiKey,
 				'anthropic-version': '2023-06-01',
 			},
-			signal: this._abort?.signal,
+			signal: this._currentSessionId
+				? this._flights.get(this._currentSessionId)?.abort.signal
+				: undefined,
 			body: JSON.stringify({
 				model: model.includes('claude') ? model : 'claude-3-5-sonnet-20241022',
 				max_tokens: 1024,
@@ -1802,7 +1993,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			case 'cards':
 			case 'plan-run':
 			case 'review': {
-				if (this._running) {
+				if (this.visibleBusy()) {
 					this.enqueueMessage(`/${command}${args ? ` ${args}` : ''}`);
 					return true;
 				}
@@ -1886,49 +2077,59 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		}
 	}
 
-	private addMessage(role: 'user' | 'assistant', content: string, status?: string) {
+	private addMessage(
+		role: 'user' | 'assistant',
+		content: string,
+		status?: string,
+		sessionId?: string
+	) {
 		const { model } = this._store.getActiveSelection();
-		this._messages.push({
+		const sid = sessionId ?? this._currentSessionId;
+		const msgs = sid ? this.uiFor(sid).messages : this._messages;
+		msgs.push({
 			role,
 			content,
 			status,
 			timestamp: new Date(),
 			model: role === 'assistant' ? model : undefined,
 		});
-		this.updateView();
+		if (!sid || sid === this._currentSessionId) this.updateView();
 	}
 
 	private updateLastMessage(
 		role: 'user' | 'assistant',
 		content: string,
 		status?: string,
-		extra?: { reasoning?: string; timings?: MessageTimings; continueAvailable?: boolean }
+		extra?: { reasoning?: string; timings?: MessageTimings; continueAvailable?: boolean },
+		sessionId?: string
 	) {
-		const lastIndex = this._messages.length - 1;
-		if (lastIndex >= 0 && this._messages[lastIndex].role === role) {
-			this._messages[lastIndex].content = content;
-			this._messages[lastIndex].status = status;
+		const sid = sessionId ?? this._currentSessionId;
+		const msgs = sid ? this.uiFor(sid).messages : this._messages;
+		const lastIndex = msgs.length - 1;
+		if (lastIndex >= 0 && msgs[lastIndex]!.role === role) {
+			msgs[lastIndex]!.content = content;
+			msgs[lastIndex]!.status = status;
 			if (status !== 'pending') {
-				delete this._messages[lastIndex].liveStatus;
+				delete msgs[lastIndex]!.liveStatus;
 			}
 			if (extra?.reasoning !== undefined) {
-				this._messages[lastIndex].reasoning = extra.reasoning;
+				msgs[lastIndex]!.reasoning = extra.reasoning;
 			}
 			if (extra?.timings !== undefined) {
-				this._messages[lastIndex].timings = extra.timings;
+				msgs[lastIndex]!.timings = extra.timings;
 			}
 			if (extra?.continueAvailable) {
-				this._messages[lastIndex].continueAvailable = true;
+				msgs[lastIndex]!.continueAvailable = true;
 			} else {
-				delete this._messages[lastIndex].continueAvailable;
+				delete msgs[lastIndex]!.continueAvailable;
 			}
 		}
-		this.updateView();
+		if (!sid || sid === this._currentSessionId) this.updateView();
 	}
 
 	/** Structured resume after step-budget exhaustion (Continue button — not text "continue"). */
 	private async handleContinueTurn(): Promise<void> {
-		if (this._running) return;
+		if (this.visibleBusy()) return;
 		const last = this._messages[this._messages.length - 1];
 		if (last?.role === 'assistant') {
 			delete last.continueAvailable;
@@ -1942,8 +2143,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 	 * streamed model prose becomes a brief narration (sense of motion on long turns).
 	 * Cleared when the pending bubble leaves `pending` (see updateLastMessage).
 	 */
-	private setPendingLiveStatus(text: string): void {
-		this._turnObserver?.onStatus(text);
+	private setPendingLiveStatus(text: string, sessionId?: string): void {
+		const sid = sessionId ?? this._currentSessionId;
+		this._turnWaiters.observer(sid)?.onStatus(text);
 		let cleaned = String(text || '')
 			.replace(/\s+/g, ' ')
 			.trim();
@@ -1972,11 +2174,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			// Streamed assistant prose (or unknown status) — show intent, not a dead "Planning…" stub.
 			cleaned = ChatViewProvider.liveNarrationSnippet(cleaned);
 		}
-		const last = this._messages[this._messages.length - 1];
+		const msgs = sid ? this.uiFor(sid).messages : this._messages;
+		const last = msgs[msgs.length - 1];
 		if (!last || last.role !== 'assistant' || last.status !== 'pending') return;
 		if (last.liveStatus === cleaned) return;
 		last.liveStatus = cleaned.slice(0, 160);
-		this.updateView();
+		if (!sid || sid === this._currentSessionId) this.updateView();
 	}
 
 	/** Last sentence / trailing clause of streamed model text for the live status line. */
@@ -2001,33 +2204,44 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		return pick || 'Planning next moves';
 	}
 
-	private applyTurnMetrics(metrics: {
-		promptTokens?: number;
-		completionTokens?: number;
-		durationMs?: number;
-		tokensPerSecond?: number;
-		reasoning?: string;
-	}): void {
+	private applyTurnMetrics(
+		metrics: {
+			promptTokens?: number;
+			completionTokens?: number;
+			durationMs?: number;
+			tokensPerSecond?: number;
+			reasoning?: string;
+		},
+		sessionId?: string
+	): void {
+		const sid = sessionId ?? this._currentSessionId;
+		const ui = sid ? this.uiFor(sid) : undefined;
 		if (metrics.reasoning) {
-			this._turnReasoning = metrics.reasoning;
+			if (ui) ui.turnReasoning = metrics.reasoning;
+			if (!sid || sid === this._currentSessionId) this._turnReasoning = metrics.reasoning;
 		}
 		if (
 			metrics.promptTokens !== undefined ||
 			metrics.completionTokens !== undefined ||
 			metrics.durationMs !== undefined
 		) {
-			this._turnTimings = {
+			const timings = {
 				promptTokens: metrics.promptTokens,
 				completionTokens: metrics.completionTokens,
 				durationMs: metrics.durationMs,
 				tokensPerSecond: metrics.tokensPerSecond,
 			};
+			if (ui) ui.turnTimings = timings;
+			if (!sid || sid === this._currentSessionId) this._turnTimings = timings;
 		}
-		const last = this._messages[this._messages.length - 1];
+		const msgs = sid ? this.uiFor(sid).messages : this._messages;
+		const last = msgs[msgs.length - 1];
+		const reasoning = ui?.turnReasoning ?? this._turnReasoning;
+		const timings = ui?.turnTimings ?? this._turnTimings;
 		if (last?.role === 'assistant') {
-			if (this._turnReasoning) last.reasoning = this._turnReasoning;
-			if (this._turnTimings) last.timings = this._turnTimings;
-			this.updateView();
+			if (reasoning) last.reasoning = reasoning;
+			if (timings) last.timings = timings;
+			if (!sid || sid === this._currentSessionId) this.updateView();
 		}
 	}
 
@@ -2041,7 +2255,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 				messages: this._messages,
 				timeline: this._timeline,
 				collapseToolCards,
-				busy: this._running,
+				busy: this.visibleBusy(),
 			});
 		}
 	}
@@ -2078,25 +2292,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			type: 'tabs',
 			open,
 			active: this._currentSessionId,
-			busy: this._running,
+			busy: this.visibleBusy(),
+			running: this.runningIds(),
 		});
 	}
 
 	private async switchTab(id: string): Promise<void> {
 		if (!id || id === this._currentSessionId) return;
-		if (this._running) {
-			void vscode.window.showWarningMessage('Stop the agent before switching chats.');
-			this.pushTabs();
-			return;
-		}
-		await this.loadSession(id);
+		await this.loadSession(id, { reveal: false });
 	}
 
 	private async closeTab(id: string): Promise<void> {
 		if (!id) return;
-		if (this._running && id === this._currentSessionId) {
-			void vscode.window.showWarningMessage('Stop the agent before closing this chat.');
-			return;
+		if (this._flights.has(id)) {
+			this._flights.abort(id);
 		}
 		const idx = this._openSessionIds.indexOf(id);
 		if (idx < 0) return;
@@ -2115,7 +2324,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 	}
 
 	private async branchAt(messageIndex: number): Promise<void> {
-		if (this._running) {
+		if (this.visibleBusy()) {
 			void vscode.window.showWarningMessage('Stop the agent before branching.');
 			return;
 		}
@@ -2134,7 +2343,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 	}
 
 	private async regenerateAt(messageIndex: number): Promise<void> {
-		if (this._running) {
+		if (this.visibleBusy()) {
 			void vscode.window.showWarningMessage('Stop the agent before regenerating.');
 			return;
 		}
@@ -2176,6 +2385,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 	}
 
 	private async runPython(code: string): Promise<void> {
+		if (this._pythonProc) {
+			void vscode.window.showWarningMessage('A Python run is already in progress.');
+			return;
+		}
 		this.stopPython();
 		const trimmed = code.trim();
 		const confirmRun =

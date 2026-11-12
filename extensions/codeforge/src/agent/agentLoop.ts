@@ -57,6 +57,8 @@ import {
 // `@msf/agent-harness`. Additive: every call site below keeps its original Qwen/Hermes-shaped
 // path as the fallback when a model name matches no family in `universal/defaults.json`.
 import { batchRunsInParallel, batchTerminates, finishAgentTurn, prepareAgentRound } from './agentLoopHooks';
+import { acquireLlmSlot, mapPool } from './llmSlotGate';
+import { slotCap } from './llamaSlots';
 import { recoverToolCalls as universalRecoverToolCalls } from './universal/families/registry';
 import { repairToolCallAgainstSchema } from './universal/schemaRepair';
 import {
@@ -1416,6 +1418,8 @@ export interface AgentLoopOptions {
 	}) => void;
 	sessionStore?: SessionStore;
 	sessionId?: string | null;
+	/** Parent chat registers/unregisters a child AbortController for Tasks cancel-by-id. */
+	onRegisterSubAbort?: (subId: string, abort: AbortController | undefined) => void;
 	/** Override context window (tokens). Prefer server.numCtx from settings. */
 	numCtx?: number;
 	/** Prefer JSON responses (response_format=json_object) for this server. */
@@ -3285,6 +3289,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 				readAliases: string[];
 			}
 			const lane: ParallelIoJob[] = [];
+			const delegateLane: ParallelIoJob[] = [];
 
 			const noteIdenticalCall = (fingerprint: string, content: string, toolName = ''): string => {
 				const { note } = loopDetector.recordCall(fingerprint, hashResult(content));
@@ -3700,7 +3705,17 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 				const jobs = lane.splice(0, lane.length);
 				const rans = await Promise.all(jobs.map(job => runIoJob(job)));
 				for (let i = 0; i < jobs.length; i++) {
-					await commitExecuted(jobs[i], rans[i]);
+					await commitExecuted(jobs[i]!, rans[i]!);
+				}
+			};
+
+			const flushDelegates = async (): Promise<void> => {
+				if (!delegateLane.length) return;
+				const jobs = delegateLane.splice(0, delegateLane.length);
+				const cap = Math.max(1, slotCap(opts.serverId, opts.model));
+				const rans = await mapPool(jobs, cap, job => runIoJob(job));
+				for (let i = 0; i < jobs.length; i++) {
+					await commitExecuted(jobs[i]!, rans[i]!);
 				}
 			};
 
@@ -3717,6 +3732,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 			for (const call of toolCalls) {
 				if (opts.cancelled() || opts.abortSignal?.aborted) {
 					lane.length = 0;
+					delegateLane.length = 0;
 					ensureToolResultsForCalls(messages, toolCalls, 'Cancelled by user');
 					turnOutcome = 'cancelled';
 					return 'Cancelled.';
@@ -4196,6 +4212,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 
 				if (opts.cancelled() || opts.abortSignal?.aborted) {
 					lane.length = 0;
+					delegateLane.length = 0;
 					ensureToolResultsForCalls(messages, toolCalls, 'Cancelled by user');
 					turnOutcome = 'cancelled';
 					return 'Cancelled.';
@@ -4405,10 +4422,17 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					lane.push(job);
 					continue;
 				}
+				if (name === 'delegate_task' && depth === 0) {
+					await flushLane();
+					delegateLane.push(job);
+					continue;
+				}
+				await flushDelegates();
 				await commitExecuted(job, await runIoJob(job));
 			}
 
 			await flushLane();
+			await flushDelegates();
 
 			const batchActions = actions.slice(actionsAtBatchStart);
 			// Only a status question ends on update_status; work turns still go through the finish gates.
@@ -4963,33 +4987,51 @@ async function executeTool(
 							modeRaw !== 'general' &&
 							modeRaw !== 'plan');
 					const wantPlan = modeRaw === 'plan';
-					return await runAgentWithTools({
-						...opts,
-						task: wantExplore
-							? `${String(args.task)}\n\n(Explore mode: read-only. End with findings and path:startLine-endLine cites.)`
-							: String(args.task),
-						history: args.context
-							? [{ role: 'user', content: String(args.context) }]
-							: [],
-						depth: depth + 1,
-						maxSteps: wantExplore ? 10 : wantPlan ? 12 : 16,
-						planMode: wantPlan,
-						exploreOnly: wantExplore,
-						askMode: false,
-						coachMode: false,
-						isolated: true,
-						onTaskUpdate: opts.onTaskUpdate
-							? update =>
-									opts.onTaskUpdate?.({
-										...update,
-										id: `${opts.sessionId ?? 'task'}-sub-${update.id}`,
-										name: `[sub] ${update.name}`,
-									})
-							: undefined,
-						onStatus: text => opts.onStatus?.(`[subagent] ${text}`),
-						onActivity: ev =>
-							opts.onActivity?.({ ...ev, label: `[sub] ${ev.label}` }),
-					}).then(r => `Subagent result:\n${r}`);
+					const parentId = opts.sessionId ?? 'task';
+					const subId = `${parentId}-sub-${callId}`;
+					const childAbort = new AbortController();
+					const onParentAbort = (): void => childAbort.abort();
+					opts.abortSignal?.addEventListener('abort', onParentAbort);
+					opts.onRegisterSubAbort?.(subId, childAbort);
+					try {
+						const r = await runAgentWithTools({
+							...opts,
+							task: wantExplore
+								? `${String(args.task)}\n\n(Explore mode: read-only. End with findings and path:startLine-endLine cites.)`
+								: String(args.task),
+							history: args.context
+								? [{ role: 'user', content: String(args.context) }]
+								: [],
+							depth: depth + 1,
+							maxSteps: wantExplore ? 10 : wantPlan ? 12 : 16,
+							planMode: wantPlan,
+							exploreOnly: wantExplore,
+							askMode: false,
+							coachMode: false,
+							isolated: true,
+							abortSignal: childAbort.signal,
+							cancelled: () => childAbort.signal.aborted || opts.cancelled(),
+							onRegisterSubAbort: undefined,
+							onTaskUpdate: opts.onTaskUpdate
+								? update =>
+										opts.onTaskUpdate?.({
+											...update,
+											id: subId,
+											name: `[sub] ${update.name}`,
+										})
+								: undefined,
+							onStatus: text => opts.onStatus?.(`[subagent] ${text}`),
+							onActivity: ev =>
+								opts.onActivity?.({ ...ev, label: `[sub] ${ev.label}` }),
+						});
+						if (childAbort.signal.aborted) {
+							return 'Subagent result:\nCancelled.';
+						}
+						return `Subagent result:\n${r}`;
+					} finally {
+						opts.abortSignal?.removeEventListener('abort', onParentAbort);
+						opts.onRegisterSubAbort?.(subId, undefined);
+					}
 				}
 			case 'mcp_call': {
 				const mcp = getMcp();
@@ -5436,6 +5478,8 @@ async function postAgentRound(
 	// response content-type, so a buffered JSON reply needs no further changes downstream.
 	const useStream = !(withTools && familyProfile?.preferNonStreamTools);
 
+	const releaseSlot = await acquireLlmSlot(opts.abortSignal);
+	try {
 	let response = await fetch(openaiUrl, {
 		method: 'POST',
 		headers: {
@@ -5516,6 +5560,9 @@ async function postAgentRound(
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
 		return { ok: false, status: 502, errorText: message, data: {} };
+	}
+	} finally {
+		releaseSlot();
 	}
 }
 

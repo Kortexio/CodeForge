@@ -47,6 +47,14 @@ export function getChatViewHtml(assets: ChatViewAssets): string {
     border-radius: 6px 6px 0 0; background: transparent; color: var(--vscode-descriptionForeground);
     font: inherit; font-size: 0.78em; cursor: pointer; white-space: nowrap;
   }
+  .tab.running .title::after {
+    content: '';
+    display: inline-block;
+    width: 6px; height: 6px; border-radius: 50%;
+    margin-left: 6px;
+    background: var(--vscode-charts-blue, #3794ff);
+    vertical-align: middle;
+  }
   .tab.active {
     color: var(--vscode-foreground);
     background: var(--vscode-editor-background, var(--vscode-input-background));
@@ -436,7 +444,7 @@ export function getChatViewHtml(assets: ChatViewAssets): string {
 <body>
   <div class="drop-overlay" id="dropOverlay"><div class="drop-overlay-box">Drop files or images anywhere to attach</div></div>
   <div class="tab-strip" id="tabStrip" role="tablist"></div>
-  <div class="toast-busy" id="busyToast">Agent is running — stop it before switching or branching.</div>
+  <div class="toast-busy" id="busyToast">Stop this tab before branching or restoring a checkpoint.</div>
 
   <div class="messages" id="messages">
     <div class="empty" id="emptyState">
@@ -534,6 +542,8 @@ export function getChatViewHtml(assets: ChatViewAssets): string {
   let mode = 'agent';
   let permissions = 'default';
   let busy = false;
+  let runningIds = [];
+  let busyToastTimer = 0;
   let timeline = [];
   let slashCommands = [];
   let hasAgentsMd = false;
@@ -656,7 +666,16 @@ export function getChatViewHtml(assets: ChatViewAssets): string {
       sendButton.title = 'Send';
       input.placeholder = 'Plan, @ for context, / for commands';
     }
-    busyToast.classList.toggle('visible', !!busy);
+  }
+
+  function flashBusyToast() {
+    if (!busyToast) return;
+    busyToast.classList.add('visible');
+    if (busyToastTimer) clearTimeout(busyToastTimer);
+    busyToastTimer = setTimeout(function () {
+      busyToast.classList.remove('visible');
+      busyToastTimer = 0;
+    }, 2200);
   }
 
   function renderQueue(items) {
@@ -792,7 +811,8 @@ export function getChatViewHtml(assets: ChatViewAssets): string {
   function renderTabs() {
     var html = openTabs.map(function (t) {
       var active = t.id === activeTabId;
-      return '<button type="button" class="tab' + (active ? ' active' : '') + '" data-id="' + escapeHtml(t.id) + '" role="tab" aria-selected="' + active + '">' +
+      var running = runningIds.indexOf(t.id) >= 0;
+      return '<button type="button" class="tab' + (active ? ' active' : '') + (running ? ' running' : '') + '" data-id="' + escapeHtml(t.id) + '" role="tab" aria-selected="' + active + '">' +
         '<span class="title">' + escapeHtml(t.title || 'Chat') + '</span>' +
         '<span class="close" data-close="' + escapeHtml(t.id) + '" title="Close">×</span></button>';
     }).join('');
@@ -1013,6 +1033,7 @@ export function getChatViewHtml(assets: ChatViewAssets): string {
     if (msg.type === 'tabs') {
       openTabs = msg.open || [];
       activeTabId = msg.active || null;
+      runningIds = msg.running || [];
       if (typeof msg.busy === 'boolean') busy = msg.busy;
       renderTabs();
       syncSendButton();
@@ -1269,8 +1290,8 @@ export function getChatViewHtml(assets: ChatViewAssets): string {
     }
     if (!busy) {
       html += '<button type="button" data-act="regen" data-idx="' + idx + '" title="Regenerate">↻</button>';
-      html += '<button type="button" data-act="branch" data-idx="' + idx + '" title="Branch chat">⑂</button>';
     }
+    html += '<button type="button" data-act="branch" data-idx="' + idx + '" title="Branch chat">⑂</button>';
     html += '</div>';
     return html;
   }
@@ -1291,12 +1312,9 @@ export function getChatViewHtml(assets: ChatViewAssets): string {
     messages.forEach(function (m, idx) {
       if (m.role === 'user') {
         var turn = userTurnIndex(messages, idx);
-        var canRestore = !busy;
         html += '<div class="msg user" data-idx="' + idx + '">' +
           '<div class="bubble"><div class="msg-body">' + escapeHtml(m.content) + '</div></div>' +
-          (canRestore
-            ? '<div class="restore-row"><button type="button" class="restore-btn" data-idx="' + idx + '">Restore checkpoint</button></div>'
-            : '') +
+          '<div class="restore-row"><button type="button" class="restore-btn" data-idx="' + idx + '">Restore checkpoint</button></div>' +
           '</div>';
         return;
       }
@@ -1332,6 +1350,7 @@ export function getChatViewHtml(assets: ChatViewAssets): string {
       btn.addEventListener('click', function (e) {
         e.preventDefault();
         e.stopPropagation();
+        if (busy) { flashBusyToast(); return; }
         var idx = Number(btn.getAttribute('data-idx'));
         if (!Number.isFinite(idx)) return;
         vscode.postMessage({ type: 'restoreCheckpoint', messageIndex: idx });
@@ -1358,6 +1377,7 @@ export function getChatViewHtml(assets: ChatViewAssets): string {
           return;
         }
         if (act === 'branch') {
+          if (busy) { flashBusyToast(); return; }
           vscode.postMessage({ type: 'branchAt', messageIndex: idx });
         }
       });

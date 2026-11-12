@@ -537,6 +537,11 @@
           "command": "codeforge.exportSession",
           "when": "view == codeforge.sessions && viewItem == session",
           "group": "inline"
+        },
+        {
+          "command": "codeforge.cancelTask",
+          "when": "view == codeforge.tasks && (viewItem == taskRunning || viewItem == subtaskRunning)",
+          "group": "inline"
         }
       ],
       "editor/context": [

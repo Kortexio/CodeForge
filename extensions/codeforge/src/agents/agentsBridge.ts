@@ -144,7 +144,7 @@ export function resultForTurn(result: AgentsTurnResult): vscode.ChatResult {
 	if (result.kind === 'busy') {
 		return {
 			errorDetails: {
-				message: 'CodeForge is already running a turn in another chat. Wait for it to finish or stop it, then send again.',
+				message: 'All llama.cpp slots are in use. Wait for a turn to finish or stop one, then send again.',
 			},
 		};
 	}
