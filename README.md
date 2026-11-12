@@ -22,32 +22,31 @@ Most “local AI IDEs” stall when the model is small: they over-read, under-ed
 |---|---|
 | **GPU** | NVIDIA RTX 3060 12GB |
 | **Model** | Qwen3.6-35B (IQ2_S / ~Q2 GGUF) |
-| **Inference** | [SuperLLaMA](https://github.com/vitorcastro78/superllama) — usable local llama.cpp on modest GPUs (OpenAI-compatible `/v1`, TurboQuant KV, Windows installer) |
-| **Suite** | Headless T1–T4 × 3 reps each (`benchmarks/`) |
+| **Inference** | llama.cpp OpenAI-compatible `/v1` (1 slot, `n_ctx` 65536) |
+| **Suite** | Headless T1–T4 + CS1–CS6, empty learned harness (`benchmarks/`) |
 
-**Harness off** (empty learned harness — contract + finish gates only):
+**Full suite** (2026-11-12, 1 rep, `master` — mean **99.3**):
 
-| Task | Mean (3 reps) | Stuck | badArgs |
-|------|---------------:|------:|--------:|
-| T1 — bug fix | **100** | 0 | 0 |
-| T2 — feature (coupon) | **97** | 0 | 0 |
-| T3 — multi-file | **100** | 0 | 0 |
-| T4 — rename refactor | **100** | 0 | 0 |
+| Task | Score | Notes |
+|------|------:|-------|
+| T1 — bug fix | **100** | |
+| T2 — feature (coupon) | **100** | |
+| T3 — navigation | **100** | |
+| T4 — rename refactor | **100** | |
+| CS1 — C# bug fix | **100** | |
+| CS2 — C# coupon | **100** | |
+| CS3 — C# VIP rate | **100** | |
+| CS4 — scaffold | **100** | |
+| CS5 — review | **93** | F1 0.91; still a pass |
+| CS6 — five cards | **100** | all five cards green |
 
-**Harness on** (learned revision 1 for the same model):
+**v0.2.0 calibrate** (2026-10-22, T1–T4 × 3 reps, harness off): T1 **100** · T2 **97** · T3 **100** · T4 **100**. Stuck **0**. badArgs **0**.
 
-| Task | Mean (3 reps) | Stuck | badArgs |
-|------|---------------:|------:|--------:|
-| T1 — bug fix | **100** | 0 | 0 |
-| T2 — feature (coupon) | **94** | 0 | 0 |
-| T3 — multi-file | **100** | 0 | 0 |
-| T4 — rename refactor | **100** | 0 | 0 |
-
-**Zero stuck runs. Zero bad tool-args.** A ~Q2 35B completing real agentic coding tasks end-to-end on a gaming GPU — served by SuperLLaMA, driven by CodeForge's tool contract.
+A ~Q2 35B completing real agentic coding tasks — including a C# five-card run — on a gaming GPU, served by llama.cpp, driven by CodeForge's tool contract.
 
 That is the product bet: **the model is not the product — the contract around the model is.**
 
-Frontier APIs still work. Local weak models stop being a demo and start being a workflow. Pair CodeForge with [SuperLLaMA](https://github.com/vitorcastro78/superllama) (or any OpenAI-compatible endpoint) and point Settings → AI at your local `/v1`.
+Frontier APIs still work. Local weak models stop being a demo and start being a workflow. Pair CodeForge with llama.cpp (or any OpenAI-compatible endpoint) and point Settings → AI at your local `/v1`.
 
 ---
 
@@ -70,17 +69,32 @@ Not another chat sidebar. A **tool + system contract** that refuses to paper ove
 
 ---
 
+## Since v0.2.0 (on `master`)
+
+Shipped as **0.3.0**. Not 1.0. Notes: [`docs/releases/v0.3.0.md`](docs/releases/v0.3.0.md).
+
+| Shipped | Why it is a minor, not a patch |
+|---|---|
+| Agents window | Code-OSS sessions UI runs the same harness, settings, slash commands, and discovery |
+| Vision in chat | Paste / drag images; auto-route to a vision model; drop the image, not the turn, if none is up |
+| Universal tool recovery | Family-aware repair (Qwen, DeepSeek, Llama, Gemma, Mistral, Harmony, …) + schema repair |
+| Language-agnostic oracle | `set_verify_command` — green is exit 0, not a guessed `dotnet`/`npm` recipe |
+| Loop hardening | Finish gates after `update_status`, structural gates on CS2/CS3/CS4/CS6, parallel reads, steering, hooks |
+| Broader bench | Same IQ2_S stack now reports CS1–CS6, plus optional Aider / OpenHands baselines |
+
+**Not in 0.3.0** (still open): Authenticode, macOS/Linux packages, five-minute onboarding, Agent CORE expansion (glob / wiki / media / notebook as defaults — lives on `feat/core-tool-surface`).
+
 ## Where we’re going
 
 **Near term**
-- Harden permissions, sandbox, and secrets for daily use without babysitting
 - Packaging and onboarding so “install → pick local model → agent works” is a five-minute path
-- Keep the calibrate suite (T2/T4/CS2/CS3) as the release gate for local models
+- Authenticode for Windows releases when a code-signing certificate is available
+- Keep T2/T4/CS2/CS3 as the calibrate gate; CS5/CS6 as honesty checks (not a 100 bar)
 
 **Next**
-- Broader task suites (navigation, long multi-card, review) with the same failure taxonomy: harness / protocol / semantic
+- Expand Agent CORE (glob + remaining built-in groups) without intent crutches
 - Profile knobs proven by A/B — only when the bench says so
-- Richer Agents-window parity with the side chat (attachments, journal, restore)
+- macOS / Linux official packages + notarization
 
 **Not the roadmap**
 - Hardcoded intent crutches (“the user said fix, so nudge edit”)
@@ -93,7 +107,7 @@ Not another chat sidebar. A **tool + system contract** that refuses to paper ove
 
 | | CodeForge |
 |---|---|
-| Models | OpenAI, Anthropic, Gemini, xAI, OpenRouter, Ollama, vLLM, LM Studio, [SuperLLaMA](https://github.com/vitorcastro78/superllama) / llama.cpp / any OpenAI-compatible API |
+| Models | OpenAI, Anthropic, Gemini, xAI, OpenRouter, Ollama, vLLM, LM Studio, llama.cpp / any OpenAI-compatible API |
 | Adaptive harness | Per-model profiles + calibrate + hysteresis + scored revise |
 | Tool protocol | Universal family recovery + schema repair across local/cloud formats |
 | Agent | Multi-file loop with approvals; Ask / Plan / Agent + permission chip; steering mid-turn |
@@ -147,14 +161,25 @@ See [docs/code-oss-integration.md](docs/code-oss-integration.md) and [benchmarks
 | | |
 |---|---|
 | **GPU** | NVIDIA GeForce RTX 3060 **12GB** |
-| **Server** | llama.cpp OpenAI-compatible API |
+| **Server** | llama.cpp OpenAI-compatible `/v1` |
 | **Primary local model** | `qwen3.6-35b` (Qwen3.6-35B-A3B **IQ2_S**) |
+| **Slot** | 1 × `n_ctx` 65536 |
 | **Stronger local** | `Qwen3-32B-exl3-4.0bpw` (calibrate A/B) |
 | **Runner** | `benchmarks/bench.mjs` headless / packaged `resources/calibrate-bench/` |
 
-### Agent suite — post harness fix (2026-10-22)
+### Full suite — `master` 2026-11-12 (1 rep, empty learned harness)
 
-T1–T4 × 3 reps, learned harness off for isolation. Score 0–100.
+Score 0–100. Mean **99.3**. Stuck **0**. notRun **0**.
+
+| Model | T1 | T2 | T3 | T4 | CS1 | CS2 | CS3 | CS4 | CS5 | CS6 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `qwen3.6-35b` (IQ2_S) | **100** | **100** | **100** | **100** | **100** | **100** | **100** | **100** | **93** | **100** |
+
+CS5 is a review task (pass at F1 ≥ 0.8; this run F1 0.91). CS6 is five isolated cards — all green.
+
+### Agent suite — v0.2.0 (2026-10-22)
+
+T1–T4 × 3 reps, learned harness off. Score 0–100.
 
 | Model | T1 | T2 | T3 | T4 | Stuck |
 |---|---:|---:|---:|---:|---:|
@@ -177,9 +202,9 @@ Harness design notes: [`extensions/codeforge/HEURISTICS.md`](extensions/codeforg
 ```
 CodeForge/
 ├── extensions/codeforge/          # Shipped AI platform (source of truth)
-│   ├── src/agent/                 # Loop, profiles, oracle, revise, tools
+│   ├── src/agent/                 # Loop, profiles, oracle (`set_verify_command`), revise, tools
 │   │   └── universal/             # Multi-family tool recovery + schema repair
-│   ├── src/agents/                # Agents-window bridge + LM provider
+│   ├── src/agents/                # Agents-window bridge + LM provider (same harness as side chat)
 │   ├── resources/calibrate-bench/ # Packaged calibrate suite
 │   ├── src/views/                 # Chat host + Cursor-like UI + attachments
 │   ├── src/memory/                # Session + project wiki

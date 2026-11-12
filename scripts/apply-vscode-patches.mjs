@@ -394,6 +394,29 @@ if (fs.existsSync(gulpVscodeWinPath)) {
 	}
 }
 
+// Skip compiling the built-in Copilot extension: CodeForge strips it after package,
+// and its postinstall deletes shims.txt which then breaks packageCopilotExtensionStream.
+if (fs.existsSync(gulpExtensionsPath)) {
+	let extGulp = fs.readFileSync(gulpExtensionsPath, 'utf8');
+	const skipMarker = '[CodeForge] Skipping built-in Copilot extension compile';
+	const copilotTaskRe =
+		/export const compileCopilotExtensionBuildTask = task\.define\(\s*'compile-copilot-extension-build',\s*\(\) => ext\.packageCopilotExtensionStream\(false\)\.pipe\(gulp\.dest\('\.build'\)\)\s*\);/;
+	const skipTask =
+		`export const compileCopilotExtensionBuildTask = task.define('compile-copilot-extension-build', (cb) => {\n` +
+		`\tconsole.warn('${skipMarker} (not shipped).');\n` +
+		`\tcb();\n` +
+		`});`;
+	if (extGulp.includes(skipMarker)) {
+		console.log('Copilot extension compile skip already present');
+	} else if (copilotTaskRe.test(extGulp)) {
+		extGulp = extGulp.replace(copilotTaskRe, skipTask);
+		fs.writeFileSync(gulpExtensionsPath, extGulp, 'utf8');
+		console.log('Patched gulpfile.extensions.ts to skip Copilot extension compile');
+	} else {
+		console.warn('Could not find compileCopilotExtensionBuildTask definition to skip');
+	}
+}
+
 // CodeForge: the Agents window must not demand GitHub / Google / Apple / GHE sign-in.
 const sessionsSetUpPath = path.join(
 	root,

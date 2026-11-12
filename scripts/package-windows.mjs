@@ -126,12 +126,17 @@ await run('node', ['scripts/apply-branding.mjs']);
 await run('node', ['scripts/apply-vscode-patches.mjs']);
 
 if (!setupOnly) {
-	try {
-		await run('npx', ['gulp', 'vscode-win32-x64'], { cwd: vscodeDir });
-	} catch (err) {
-		if (!findExe()) throw err;
-		console.warn('\n⚠ gulp reported an error, but CodeForge.exe exists — continuing.');
-		console.warn(String(err.message || err));
+	const buildStartedAt = Date.now();
+	await run('npx', ['gulp', 'vscode-win32-x64'], { cwd: vscodeDir });
+	const exeAfter = findExe();
+	if (!exeAfter) {
+		throw new Error(`Portable build missing at ${portableOut} after gulp`);
+	}
+	const exeMtimeMs = fs.statSync(exeAfter).mtimeMs;
+	if (exeMtimeMs < buildStartedAt - 5_000) {
+		throw new Error(
+			`Refusing stale ${path.basename(exeAfter)} (mtime ${new Date(exeMtimeMs).toISOString()} is before this build). Fix the gulp failure and rebuild.`,
+		);
 	}
 }
 

@@ -41,7 +41,8 @@ export interface SchemaRepairResult {
 	notes: string[];
 }
 
-const ajv = new Ajv({ allErrors: true, strict: false, allowUnionTypes: true });
+// vscode/tsgo may resolve `ajv` typings to v6 (no `strict`/`allowUnionTypes`); runtime is ajv@8.
+const ajv = new Ajv({ allErrors: true, strict: false, allowUnionTypes: true } as never);
 const compiledCache = new Map<string, ValidateFunction>();
 
 function hashSchema(schema: JsonSchemaObject): string {
@@ -171,9 +172,15 @@ function preprocessAnchorBleed(args: unknown, schema: JsonSchemaObject | undefin
 	return out;
 }
 
+/** Ajv v8 uses `instancePath`; some bundled typings only expose `dataPath`. */
+function errorPath(err: ErrorObject): string {
+	const e = err as ErrorObject & { instancePath?: string; dataPath?: string };
+	return e.instancePath ?? e.dataPath ?? '';
+}
+
 /** One repair attempt for a single Ajv error. Returns true if it changed `args` in place. */
 function repairOneError(root: Record<string, unknown>, rootSchema: JsonSchemaObject, err: ErrorObject, applied: Set<string>): boolean {
-	const pointer = err.instancePath;
+	const pointer = errorPath(err);
 	const value = getAtPointer(root, pointer);
 	const propSchema = pointer ? schemaAtPointer(rootSchema, pointer) : rootSchema;
 	const required = isRequiredAtParent(rootSchema, pointer);
@@ -346,7 +353,7 @@ export function repairToolCallAgainstSchema(input: SchemaRepairInput): SchemaRep
 		const errors = validate.errors ?? [];
 		if (typeof current === 'string') {
 			// Try the root string→object wrap directly (no instancePath to key off of).
-			const rootErr = errors.find((e) => e.instancePath === '' && e.keyword === 'type');
+			const rootErr = errors.find((e) => errorPath(e) === '' && e.keyword === 'type');
 			if (rootErr) {
 				const props = Object.keys((input.schema.properties as Record<string, unknown>) ?? {});
 				const required = (input.schema.required as string[] | undefined) ?? [];
@@ -370,7 +377,7 @@ export function repairToolCallAgainstSchema(input: SchemaRepairInput): SchemaRep
 				nameRecovered,
 				args: current,
 				valid: false,
-				errors: errors.map((e) => `${e.instancePath || '(root)'} ${e.message ?? ''}`.trim()),
+				errors: errors.map((e) => `${errorPath(e) || '(root)'} ${e.message ?? ''}`.trim()),
 				appliedRules: [...appliedRules],
 				notes,
 			};
