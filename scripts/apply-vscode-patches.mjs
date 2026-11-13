@@ -3,6 +3,7 @@
  * Currently:
  * - Allow Visual Studio 2026 (folder "18") in Windows toolchain check
  * - Register codeforge in gulpfile.extensions.ts compilations
+ * - Strip upstream Copilot / Claude / Codex npm deps CodeForge does not ship
  */
 
 import fs from 'fs';
@@ -13,6 +14,58 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(__dirname, '..');
 const preinstallPath = path.join(root, 'vscode', 'build', 'npm', 'preinstall.ts');
 const gulpExtensionsPath = path.join(root, 'vscode', 'build', 'gulpfile.extensions.ts');
+
+/**
+ * Microsoft agent-host / Copilot / Codex packages. CodeForge ships its own agent
+ * (extensions/codeforge) and strips the built-in Copilot extension at package time.
+ * Keeping these in package.json only inflates install size and caused Release CI
+ * peer conflicts (`@anthropic-ai/sdk` vs `claude-agent-sdk`).
+ *
+ * Kept on purpose: `foundry-local-sdk` (dictation typecheck), `@microsoft/mxc-sdk` (sandbox).
+ */
+const UNUSED_VENDOR_AI_PACKAGES = [
+	'@anthropic-ai/sdk',
+	'@anthropic-ai/claude-agent-sdk',
+	'@openai/codex',
+	'@github/copilot',
+	'@github/copilot-sdk',
+	'@vscode/copilot-api',
+];
+
+function stripUnusedVendorAiPackages(packageJsonPath, label) {
+	if (!fs.existsSync(packageJsonPath)) {
+		return;
+	}
+	const pkg = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
+	const sections = ['dependencies', 'devDependencies', 'optionalDependencies'];
+	const removed = [];
+	for (const section of sections) {
+		const bag = pkg[section];
+		if (!bag || typeof bag !== 'object') continue;
+		for (const name of UNUSED_VENDOR_AI_PACKAGES) {
+			if (Object.prototype.hasOwnProperty.call(bag, name)) {
+				delete bag[name];
+				removed.push(`${section}:${name}`);
+			}
+		}
+		// Platform optional packages pulled only for Copilot CLI (e.g. @github/copilot-win32-x64).
+		for (const name of Object.keys(bag)) {
+			if (/^@github\/copilot-/.test(name) || /^@anthropic-ai\/claude-agent-sdk-/.test(name) || /^@openai\/codex-/.test(name)) {
+				delete bag[name];
+				removed.push(`${section}:${name}`);
+			}
+		}
+	}
+	if (removed.length === 0) {
+		console.log(`Vendor AI deps already stripped from ${label}`);
+		return;
+	}
+	fs.writeFileSync(packageJsonPath, `${JSON.stringify(pkg, null, 2)}\n`, 'utf8');
+	console.log(`Stripped unused vendor AI deps from ${label}: ${removed.join(', ')}`);
+}
+
+stripUnusedVendorAiPackages(path.join(root, 'vscode', 'package.json'), 'vscode/package.json');
+stripUnusedVendorAiPackages(path.join(root, 'vscode', 'remote', 'package.json'), 'vscode/remote/package.json');
 
 if (!fs.existsSync(preinstallPath)) {
 	console.error('vscode/build/npm/preinstall.ts not found. Run vscode setup first.');
@@ -372,10 +425,13 @@ if (fs.existsSync(settingsEditor2Path)) {
 	}
 }
 
-// CodeForge does not ship built-in Copilot — skip the ripgrep shim when the SDK is absent.
+// CodeForge does not ship built-in Copilot — skip the ripgrep shim when the SDK is absent,
+// skip fetching platform Copilot packages, and do not require copilotVersions in product.json.
 const gulpVscodeWinPath = path.join(root, 'vscode', 'build', 'gulpfile.vscode.ts');
 if (fs.existsSync(gulpVscodeWinPath)) {
 	let gulpSrc = fs.readFileSync(gulpVscodeWinPath, 'utf8');
+	let changed = false;
+
 	const shimCall =
 		'prepareBuiltInCopilotRipgrepShim(platform, arch, builtInCopilotExtensionDir, appNodeModulesDir);';
 	const shimGuard = `if (!fs.existsSync(path.join(builtInCopilotExtensionDir, 'node_modules', '@github', 'copilot', 'sdk'))) {
@@ -383,14 +439,77 @@ if (fs.existsSync(gulpVscodeWinPath)) {
 			return;
 		}
 		${shimCall}`;
-	if (gulpSrc.includes("Skipping Copilot ripgrep shim")) {
+	if (gulpSrc.includes('Skipping Copilot ripgrep shim')) {
 		console.log('Copilot ripgrep shim skip already present');
 	} else if (gulpSrc.includes(shimCall)) {
 		gulpSrc = gulpSrc.replace(shimCall, shimGuard);
-		fs.writeFileSync(gulpVscodeWinPath, gulpSrc, 'utf8');
+		changed = true;
 		console.log('Patched gulpfile.vscode.ts to skip Copilot ripgrep shim when SDK is missing');
 	} else {
 		console.warn('Could not find Copilot ripgrep shim call in gulpfile.vscode.ts');
+	}
+
+	const ensureCall = 'ensureCopilotPlatformPackage(platform, arch);';
+	const ensureSkip =
+		`// CodeForge: Copilot npm packages are stripped — do not fetch platform natives.\n` +
+		`\t\tconsole.warn('[CodeForge] Skipping ensureCopilotPlatformPackage');\n`;
+	if (gulpSrc.includes('[CodeForge] Skipping ensureCopilotPlatformPackage')) {
+		console.log('ensureCopilotPlatformPackage skip already present');
+	} else if (gulpSrc.includes(ensureCall)) {
+		gulpSrc = gulpSrc.replace(ensureCall, ensureSkip);
+		changed = true;
+		console.log('Patched gulpfile.vscode.ts to skip ensureCopilotPlatformPackage');
+	} else {
+		console.warn('Could not find ensureCopilotPlatformPackage call in gulpfile.vscode.ts');
+	}
+
+	const copilotVersionsBlock =
+		`json.copilotVersions = {\n` +
+		`\t\t\t\t\truntime: getLockedPackageVersion('@github/copilot'),\n` +
+		`\t\t\t\t\tsdk: getLockedPackageVersion('@github/copilot-sdk'),\n` +
+		`\t\t\t\t};`;
+	const copilotVersionsOptional =
+		`// CodeForge: Copilot packages are stripped from package.json — omit stamp when absent.\n` +
+		`\t\t\t\ttry {\n` +
+		`\t\t\t\t\tjson.copilotVersions = {\n` +
+		`\t\t\t\t\t\truntime: getLockedPackageVersion('@github/copilot'),\n` +
+		`\t\t\t\t\t\tsdk: getLockedPackageVersion('@github/copilot-sdk'),\n` +
+		`\t\t\t\t\t};\n` +
+		`\t\t\t\t} catch {\n` +
+		`\t\t\t\t\tconsole.warn('[CodeForge] Skipping product.json copilotVersions (packages not installed)');\n` +
+		`\t\t\t\t}`;
+	if (gulpSrc.includes('Skipping product.json copilotVersions')) {
+		console.log('copilotVersions optional stamp already present');
+	} else if (gulpSrc.includes(copilotVersionsBlock)) {
+		gulpSrc = gulpSrc.replace(copilotVersionsBlock, copilotVersionsOptional);
+		changed = true;
+		console.log('Patched gulpfile.vscode.ts to make copilotVersions optional');
+	} else {
+		console.warn('Could not find copilotVersions stamp in gulpfile.vscode.ts');
+	}
+
+	if (changed) {
+		fs.writeFileSync(gulpVscodeWinPath, gulpSrc, 'utf8');
+	}
+}
+
+// Same Copilot platform fetch skip for the remote/reh package path.
+const gulpRehPath = path.join(root, 'vscode', 'build', 'gulpfile.reh.ts');
+if (fs.existsSync(gulpRehPath)) {
+	let rehSrc = fs.readFileSync(gulpRehPath, 'utf8');
+	const rehEnsure =
+		"ensureCopilotPlatformPackage(platform, arch, 'remote/node_modules');";
+	const rehSkip =
+		`// CodeForge: Copilot npm packages are stripped — do not fetch platform natives.\n` +
+		`\t\tconsole.warn('[CodeForge] Skipping ensureCopilotPlatformPackage (reh)');\n`;
+	if (rehSrc.includes('[CodeForge] Skipping ensureCopilotPlatformPackage (reh)')) {
+		console.log('reh ensureCopilotPlatformPackage skip already present');
+	} else if (rehSrc.includes(rehEnsure)) {
+		rehSrc = rehSrc.replace(rehEnsure, rehSkip);
+		fs.writeFileSync(gulpRehPath, rehSrc, 'utf8');
+		console.log('Patched gulpfile.reh.ts to skip ensureCopilotPlatformPackage');
+	} else {
+		console.warn('Could not find ensureCopilotPlatformPackage call in gulpfile.reh.ts');
 	}
 }
 

@@ -44,8 +44,8 @@ function isCommitSha(ref) {
 
 /**
  * Upstream `main` no longer ships vscode/.npmrc. Without legacy-peer-deps, npm 10+
- * fails ERESOLVE on `@anthropic-ai/sdk` vs `@anthropic-ai/claude-agent-sdk` peers
- * (Release CI failure on v0.3.0).
+ * can still fail peer resolution on unrelated packages. CodeForge also strips
+ * Copilot/Anthropic/Codex deps in apply-vscode-patches before install.
  */
 function ensureLegacyPeerDeps() {
 	const npmrcPath = path.join(vscodeDir, '.npmrc');

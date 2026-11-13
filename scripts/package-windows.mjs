@@ -124,6 +124,12 @@ console.log('=== CodeForge Windows package ===');
 await run('node', ['scripts/sync-builtin-extension.mjs']);
 await run('node', ['scripts/apply-branding.mjs']);
 await run('node', ['scripts/apply-vscode-patches.mjs']);
+// apply-vscode-patches strips Copilot/Anthropic/Codex from package.json; prune so
+// leftover node_modules are not packed into the product ASAR.
+if (fs.existsSync(path.join(vscodeDir, 'node_modules'))) {
+	console.log('Pruning stripped vendor AI packages from vscode/node_modules...');
+	await run('npm', ['prune', '--legacy-peer-deps'], { cwd: vscodeDir });
+}
 
 if (!setupOnly) {
 	const buildStartedAt = Date.now();
