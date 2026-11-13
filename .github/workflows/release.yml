@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Existing tag to attach / update artifacts for (e.g. v0.3.0).'
+        required: true
+        default: 'v0.3.0'
 
 jobs:
   windows:
@@ -25,6 +31,9 @@ jobs:
 
       - name: Setup Code-OSS
         run: npm run vscode:setup
+        env:
+          # Pin when a floating main peer break returns; leave unset for latest main.
+          VSCODE_REF: ${{ vars.VSCODE_REF || 'main' }}
 
       - name: Build extensions
         run: npm run build:extensions
@@ -56,9 +65,12 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.event.inputs.release_tag || github.ref_name }}
           files: artifacts/*
           draft: false
-          generate_release_notes: true
+          # Preserve curated notes when updating an existing release (e.g. v0.3.0 re-run).
+          generate_release_notes: ${{ github.event_name == 'push' }}
           fail_on_unmatched_files: true
+          make_latest: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
