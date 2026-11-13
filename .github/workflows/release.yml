@@ -32,8 +32,9 @@ jobs:
       - name: Setup Code-OSS
         run: npm run vscode:setup
         env:
-          # Pin when a floating main peer break returns; leave unset for latest main.
-          VSCODE_REF: ${{ vars.VSCODE_REF || 'main' }}
+          # Override via repo variable VSCODE_REF. Default in setup-vscode.mjs is the
+          # last npm-era SHA — upstream main is pnpm-only and breaks this workflow.
+          VSCODE_REF: ${{ vars.VSCODE_REF }}
 
       - name: Build extensions
         run: npm run build:extensions

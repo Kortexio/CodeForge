@@ -8,7 +8,8 @@
  * Usage: node scripts/setup-vscode.mjs [--skip-install]
  *
  * Env:
- *   VSCODE_REF  Branch or tag to clone (default: main). Example: main, release/1.105
+ *   VSCODE_REF  Branch, tag, or full commit SHA (default: pinned npm-era SHA).
+ *               Upstream `main` is pnpm-only; CodeForge packaging still uses npm.
  */
 
 import { spawnSync } from 'child_process';
@@ -20,7 +21,10 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(__dirname, '..');
 const vscodeDir = path.join(root, 'vscode');
 const skipInstall = process.argv.includes('--skip-install');
-const vscodeRef = (process.env.VSCODE_REF || 'main').trim() || 'main';
+/** Last known microsoft/vscode tip that still installs with npm (pre pnpm-lock migration). */
+const DEFAULT_VSCODE_REF = '3d7cfab6d77dce362755ac573a7a350e8f64528f';
+const vscodeRef = (process.env.VSCODE_REF || DEFAULT_VSCODE_REF).trim() || DEFAULT_VSCODE_REF;
+const vscodeRepo = 'https://github.com/microsoft/vscode.git';
 
 function run(cmd, args, cwd) {
 	console.log(`\n> ${cmd} ${args.join(' ')}`);
@@ -32,6 +36,10 @@ function run(cmd, args, cwd) {
 	if (result.status !== 0) {
 		process.exit(result.status ?? 1);
 	}
+}
+
+function isCommitSha(ref) {
+	return /^[0-9a-f]{7,40}$/i.test(ref);
 }
 
 /**
@@ -56,13 +64,21 @@ function ensureLegacyPeerDeps() {
 	console.log('Appended legacy-peer-deps=true to vscode/.npmrc');
 }
 
-if (!fs.existsSync(vscodeDir)) {
+function cloneVscode() {
 	console.log(`Cloning Code-OSS (microsoft/vscode @ ${vscodeRef}, shallow)...`);
-	run(
-		'git',
-		['clone', '--depth', '1', '--branch', vscodeRef, 'https://github.com/microsoft/vscode.git', 'vscode'],
-		root,
-	);
+	if (isCommitSha(vscodeRef)) {
+		fs.mkdirSync(vscodeDir, { recursive: true });
+		run('git', ['init'], vscodeDir);
+		run('git', ['remote', 'add', 'origin', vscodeRepo], vscodeDir);
+		run('git', ['fetch', '--depth', '1', 'origin', vscodeRef], vscodeDir);
+		run('git', ['checkout', '--force', 'FETCH_HEAD'], vscodeDir);
+		return;
+	}
+	run('git', ['clone', '--depth', '1', '--branch', vscodeRef, vscodeRepo, 'vscode'], root);
+}
+
+if (!fs.existsSync(vscodeDir)) {
+	cloneVscode();
 } else {
 	console.log('vscode/ already exists — skipping clone');
 }
