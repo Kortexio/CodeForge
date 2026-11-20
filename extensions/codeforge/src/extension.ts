@@ -279,9 +279,24 @@ export async function activate(context: vscode.ExtensionContext): Promise<CodeFo
 
     context.subscriptions.push(
         vscode.commands.registerCommand('codeforge.openSettings', (tab?: string) => {
-            const allowed = new Set(['models', 'mcp', 'guardrails', 'agent', 'benchmark', 'plugins']);
+            const allowed = new Set([
+                'models',
+                'mcp',
+                'guardrails',
+                'agent',
+                'profile',
+                'benchmark',
+                'plugins',
+            ]);
             const initial = allowed.has(String(tab))
-                ? (tab as 'models' | 'mcp' | 'guardrails' | 'agent' | 'benchmark' | 'plugins')
+                ? (tab as
+                        | 'models'
+                        | 'mcp'
+                        | 'guardrails'
+                        | 'agent'
+                        | 'profile'
+                        | 'benchmark'
+                        | 'plugins')
                 : 'models';
             AiSettingsPanel.show(context, settingsStore, governance, initial);
         })

@@ -301,7 +301,7 @@
             "on"
           ],
           "default": "off",
-          "markdownDescription": "Small-model harness: **on** = phase tool filtering + tighter guardrails; **off** = full tool surface (default). Legacy values: `force`→on, `auto`→off. Per-model knobs: [CodeForge Settings → Benchmark](command:codeforge.openSettings?%5B%22benchmark%22%5D)."
+          "markdownDescription": "Small-model harness: **on** = phase tool filtering + tighter guardrails; **off** = full tool surface (default). Legacy values: `force`→on, `auto`→off. Per-model knobs: [CodeForge Settings → Profile](command:codeforge.openSettings?%5B%22profile%22%5D); calibrate via [Benchmark](command:codeforge.openSettings?%5B%22benchmark%22%5D)."
         },
         "codeforge.ai.collapseToolCards": {
           "type": "boolean",

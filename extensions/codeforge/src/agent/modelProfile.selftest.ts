@@ -6,11 +6,14 @@ import * as os from 'os';
 import * as path from 'path';
 import {
 	applyCalibrationFromStats,
+	applyProfileEditorPatch,
 	applyStrongCalibration,
 	candidateArmWins,
 	candidateToolTransport,
 	classifyCalibration,
+	collectModelProfileChoices,
 	defaultModelProfile,
+	listModelProfileRefs,
 	loadModelProfile,
 	mergeModelProfile,
 	resolveProfileForRun,
@@ -176,6 +179,44 @@ assert(
 );
 assert(transport({ classification: 'strong', badArgsRate: 0.01 }) === undefined, 'clean strong on native: nothing to try');
 assert(transport({ badArgsRate: 0.06 }) === undefined, 'in-between proposes nothing');
+
+const edited = applyProfileEditorPatch(defaultModelProfile('srv', 'local-model'), {
+	thinking: { escalate: false, maxEscalationsPerTurn: 1, maxTokens: 2048, toolRounds: false },
+	sampling: {
+		toolThinking: { temperature: 0.3, top_p: 0.8 },
+		toolReasoning: { temperature: 0.25 },
+		plain: { temperature: 0.2 },
+	},
+	completion: { mutatingMaxTokens: 4096 },
+	toolTransport: 'native',
+});
+assert(edited.thinking.escalate === false, 'editor clears escalate');
+assert(edited.thinking.maxEscalationsPerTurn === 1, 'editor escalations');
+assert(edited.thinking.maxTokens === 2048, 'editor thinking tokens');
+assert(edited.sampling.toolThinking.temperature === 0.3, 'editor toolThinking temp');
+assert(edited.sampling.toolReasoning.temperature === 0.25, 'editor toolReasoning temp');
+assert(edited.sampling.plain.temperature === 0.2, 'editor keeps plain');
+assert(edited.completion.mutatingMaxTokens === 4096, 'editor completion');
+assert(edited.toolTransport === 'native', 'editor transport');
+assert(edited.mutations.writeMaxContentLines === 180, 'editor leaves unrelated knobs');
+
+const clearedTransport = applyProfileEditorPatch(edited, { toolTransport: '' });
+assert(clearedTransport.toolTransport === undefined, 'empty transport clears override');
+
+const clamped = applyProfileEditorPatch(d, {
+	thinking: { maxTokens: 10, maxEscalationsPerTurn: 99 },
+	sampling: { toolThinking: { temperature: 9 } },
+});
+assert(clamped.thinking.maxTokens === 256, 'thinking tokens floor');
+assert(clamped.thinking.maxEscalationsPerTurn === 32, 'escalations ceiling');
+assert(clamped.sampling.toolThinking.temperature === 2, 'temp ceiling');
+
+assert(Array.isArray(listModelProfileRefs()), 'list refs returns array');
+const choices = collectModelProfileChoices([{ id: 'srv-ui', models: ['model-a', 'model-b'] }]);
+assert(
+	choices.some(c => c.serverId === 'srv-ui' && c.model === 'model-a' && c.exists === false),
+	'collect includes configured models without a file'
+);
 
 fs.rmSync(tmp, { recursive: true, force: true });
 console.log('modelProfile.selftest: ok');

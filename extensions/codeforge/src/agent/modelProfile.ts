@@ -5,9 +5,188 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { modelProfileDir } from '../storage/paths';
+import { modelProfileDir, modelProfilesRoot } from '../storage/paths';
 import { applyOnlineHysteresis } from './profileHysteresis';
 import { EFFECTFUL_TOOLS } from './finishGate';
+
+export type ModelProfileRef = {
+	serverId: string;
+	model: string;
+	path: string;
+	exists: boolean;
+};
+
+/** Profiles already on disk under ~/.CodeForge/ai/model-profiles/. */
+export function listModelProfileRefs(): ModelProfileRef[] {
+	const root = modelProfilesRoot();
+	if (!fs.existsSync(root)) return [];
+	const out: ModelProfileRef[] = [];
+	for (const serverEnt of fs.readdirSync(root, { withFileTypes: true })) {
+		if (!serverEnt.isDirectory()) continue;
+		const serverDir = path.join(root, serverEnt.name);
+		for (const modelEnt of fs.readdirSync(serverDir, { withFileTypes: true })) {
+			if (!modelEnt.isDirectory()) continue;
+			const fp = path.join(serverDir, modelEnt.name, 'profile.json');
+			let serverId = serverEnt.name;
+			let model = modelEnt.name;
+			if (fs.existsSync(fp)) {
+				try {
+					const raw = JSON.parse(fs.readFileSync(fp, 'utf8')) as Partial<ModelProfile>;
+					if (typeof raw.serverId === 'string' && raw.serverId.trim()) serverId = raw.serverId.trim();
+					if (typeof raw.model === 'string' && raw.model.trim()) model = raw.model.trim();
+				} catch {
+					/* keep dir names */
+				}
+			}
+			out.push({ serverId, model, path: fp, exists: fs.existsSync(fp) });
+		}
+	}
+	return out.sort((a, b) =>
+		`${a.serverId}/${a.model}`.localeCompare(`${b.serverId}/${b.model}`, undefined, {
+			sensitivity: 'base',
+		})
+	);
+}
+
+/**
+ * Disk profiles plus models configured on servers (so the editor can create a file on save).
+ */
+export function collectModelProfileChoices(
+	servers: Array<{ id: string; models?: string[] }>
+): ModelProfileRef[] {
+	const map = new Map<string, ModelProfileRef>();
+	const keyOf = (serverId: string, model: string) => `${serverId}\0${model}`;
+	for (const ref of listModelProfileRefs()) {
+		map.set(keyOf(ref.serverId, ref.model), ref);
+	}
+	for (const s of servers) {
+		const serverId = String(s.id ?? '').trim();
+		if (!serverId) continue;
+		for (const m of s.models ?? []) {
+			const model = String(m ?? '').trim();
+			if (!model) continue;
+			const key = keyOf(serverId, model);
+			if (map.has(key)) continue;
+			const fp = profileFilePath(serverId, model);
+			map.set(key, {
+				serverId,
+				model,
+				path: fp,
+				exists: fs.existsSync(fp),
+			});
+		}
+	}
+	return [...map.values()].sort((a, b) =>
+		`${a.serverId}/${a.model}`.localeCompare(`${b.serverId}/${b.model}`, undefined, {
+			sensitivity: 'base',
+		})
+	);
+}
+
+function clampNumber(raw: unknown, fallback: number, min: number, max: number): number {
+	const n = typeof raw === 'number' ? raw : Number(raw);
+	if (!Number.isFinite(n)) return fallback;
+	return Math.min(max, Math.max(min, n));
+}
+
+/** Apply Settings → Profile form values onto a base profile (keeps unrelated knobs). */
+export function applyProfileEditorPatch(
+	base: ModelProfile,
+	patch: {
+		thinking?: Partial<ModelProfile['thinking']>;
+		sampling?: {
+			plan?: Partial<ModelProfile['sampling']['plan']>;
+			toolThinking?: Partial<ModelProfile['sampling']['toolThinking']>;
+			toolReasoning?: Partial<ModelProfile['sampling']['toolReasoning']>;
+			plain?: Partial<ModelProfile['sampling']['plain']>;
+		};
+		completion?: Partial<ModelProfile['completion']>;
+		toolTransport?: ToolTransport | '';
+	}
+): ModelProfile {
+	const next = structuredClone(base);
+	const th = patch.thinking;
+	if (th) {
+		if (typeof th.toolRounds === 'boolean') next.thinking.toolRounds = th.toolRounds;
+		if (typeof th.escalate === 'boolean') next.thinking.escalate = th.escalate;
+		if (th.maxEscalationsPerTurn !== undefined) {
+			next.thinking.maxEscalationsPerTurn = Math.round(
+				clampNumber(th.maxEscalationsPerTurn, next.thinking.maxEscalationsPerTurn, 0, 32)
+			);
+		}
+		if (th.maxTokens !== undefined) {
+			next.thinking.maxTokens = Math.round(
+				clampNumber(th.maxTokens, next.thinking.maxTokens, 256, 65536)
+			);
+		}
+	}
+	const samp = patch.sampling;
+	if (samp?.plan) {
+		if (samp.plan.temperature !== undefined) {
+			next.sampling.plan.temperature = clampNumber(samp.plan.temperature, next.sampling.plan.temperature, 0, 2);
+		}
+		if (samp.plan.top_p !== undefined) {
+			next.sampling.plan.top_p = clampNumber(samp.plan.top_p, next.sampling.plan.top_p, 0, 1);
+		}
+	}
+	const patchSlice = (
+		target: { temperature: number; top_p: number; presence_penalty?: number },
+		src: Partial<{ temperature: number; top_p: number; presence_penalty: number }> | undefined
+	) => {
+		if (!src) return;
+		if (src.temperature !== undefined) {
+			target.temperature = clampNumber(src.temperature, target.temperature, 0, 2);
+		}
+		if (src.top_p !== undefined) {
+			target.top_p = clampNumber(src.top_p, target.top_p, 0, 1);
+		}
+		if (src.presence_penalty !== undefined && 'presence_penalty' in target) {
+			target.presence_penalty = clampNumber(
+				src.presence_penalty,
+				target.presence_penalty ?? 0,
+				-2,
+				2
+			);
+		}
+	};
+	if (samp) {
+		patchSlice(next.sampling.toolThinking, samp.toolThinking);
+		patchSlice(next.sampling.toolReasoning, samp.toolReasoning);
+		if (samp.plain) {
+			if (samp.plain.temperature !== undefined) {
+				next.sampling.plain.temperature = clampNumber(
+					samp.plain.temperature,
+					next.sampling.plain.temperature,
+					0,
+					2
+				);
+			}
+			if (samp.plain.top_p !== undefined) {
+				next.sampling.plain.top_p = clampNumber(samp.plain.top_p, next.sampling.plain.top_p, 0, 1);
+			}
+		}
+	}
+	if (patch.completion) {
+		if (patch.completion.mutatingMaxTokens !== undefined) {
+			next.completion.mutatingMaxTokens = Math.round(
+				clampNumber(patch.completion.mutatingMaxTokens, next.completion.mutatingMaxTokens, 256, 65536)
+			);
+		}
+		if (patch.completion.readOnlyMaxTokens !== undefined) {
+			next.completion.readOnlyMaxTokens = Math.round(
+				clampNumber(patch.completion.readOnlyMaxTokens, next.completion.readOnlyMaxTokens, 256, 65536)
+			);
+		}
+	}
+	if (patch.toolTransport === 'native' || patch.toolTransport === 'text') {
+		next.toolTransport = patch.toolTransport;
+	} else if (patch.toolTransport === '') {
+		delete next.toolTransport;
+	}
+	return next;
+}
+
+export type ToolTransport = 'native' | 'text';
 
 export type ModelProfile = {
 	version: 1;
@@ -77,7 +256,7 @@ export type ModelProfile = {
 	 * - native: server parses tool_calls (default; strong models)
 	 * - text: tools described in prompt; model emits XML/`tool_calls` in content; CodeForge parses
 	 */
-	toolTransport?: 'native' | 'text';
+	toolTransport?: ToolTransport;
 	weak: { maxWritesWithoutBuild: number };
 	orchestrator: {
 		autoMinCards: number;
@@ -328,8 +507,6 @@ export function candidateArmWins(baseline: CalibrationArm, candidate: Calibratio
 
 /** Fewest reps per task before calibrate may measure another tool transport. */
 export const MIN_REPS_FOR_TRANSPORT_CHANGE = 3;
-
-export type ToolTransport = 'native' | 'text';
 
 /**
  * Transport worth measuring against the current one, or undefined when protocol stats give no

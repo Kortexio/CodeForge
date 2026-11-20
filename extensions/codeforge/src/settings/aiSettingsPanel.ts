@@ -1,9 +1,10 @@
 /**
  * CodeForge AI Settings — Cursor-like editor panel
  *
- * Tabs: Models · MCP · Guardrails · Agent · Benchmark · Plugins
+ * Tabs: Models · MCP · Guardrails · Agent · Profile · Benchmark · Plugins
  * - Models / MCP / Guardrails: catalog UIs (same surface the Settings TOC opens)
  * - Agent: codeforge.ai.* prefs (shared with Settings TOC → AI → Agent)
+ * - Profile: per-model profile.json knobs (thinking / sampling / completion)
  * - Benchmark: calibrate weak vs strong model profiles (packaged harness suite)
  * - Plugins: marketplace (Discover / Featured) — Cursor Customize layout
  *
@@ -12,6 +13,7 @@
 
 import * as vscode from 'vscode';
 import { randomBytes } from 'crypto';
+import * as fs from 'fs';
 import {
 	AiSettingsStore,
 	AiSettingsState,
@@ -42,8 +44,25 @@ import {
 	serverRoot,
 	shouldProbeLlamaSlots,
 } from '../agent/llamaSlots';
+import {
+	applyProfileEditorPatch,
+	collectModelProfileChoices,
+	defaultModelProfile,
+	loadModelProfile,
+	profileFilePath,
+	saveModelProfile,
+	type ModelProfile,
+	type ModelProfileRef,
+} from '../agent/modelProfile';
 
-export type AiSettingsTab = 'models' | 'mcp' | 'guardrails' | 'agent' | 'benchmark' | 'plugins';
+export type AiSettingsTab =
+	| 'models'
+	| 'mcp'
+	| 'guardrails'
+	| 'agent'
+	| 'profile'
+	| 'benchmark'
+	| 'plugins';
 
 type AgentPrefs = {
 	enabled: boolean;
@@ -620,7 +639,114 @@ export class AiSettingsPanel {
 				}
 				return;
 			}
+			case 'listModelProfiles': {
+				this.postProfileList();
+				return;
+			}
+			case 'loadModelProfile': {
+				const serverId = String(msg.serverId || '').trim();
+				const model = String(msg.model || '').trim();
+				if (!serverId || !model) {
+					void this.panel.webview.postMessage({
+						type: 'modelProfile',
+						error: 'Pick a server and model.',
+					});
+					return;
+				}
+				const profile = loadModelProfile(serverId, model, {
+					createIfMissing: false,
+					applyHysteresis: false,
+				});
+				const fp = profileFilePath(serverId, model);
+				void this.panel.webview.postMessage({
+					type: 'modelProfile',
+					profile,
+					path: fp,
+					exists: fs.existsSync(fp),
+				});
+				return;
+			}
+			case 'saveModelProfile': {
+				const raw = msg.profile as Partial<ModelProfile> | undefined;
+				const serverId = String(raw?.serverId || msg.serverId || '').trim();
+				const model = String(raw?.model || msg.model || '').trim();
+				if (!serverId || !model) {
+					void vscode.window.showWarningMessage('Pick a server and model before saving.');
+					return;
+				}
+				const base = loadModelProfile(serverId, model, {
+					createIfMissing: false,
+					applyHysteresis: false,
+				});
+				const transportRaw = raw?.toolTransport ?? msg.toolTransport;
+				const next = applyProfileEditorPatch(base, {
+					thinking: raw?.thinking,
+					sampling: raw?.sampling,
+					completion: raw?.completion,
+					toolTransport:
+						transportRaw === 'native' || transportRaw === 'text'
+							? transportRaw
+							: '',
+				});
+				next.serverId = serverId;
+				next.model = model;
+				saveModelProfile(next);
+				void vscode.window.showInformationMessage(`Saved profile for ${model}.`);
+				void this.panel.webview.postMessage({
+					type: 'modelProfile',
+					profile: next,
+					path: profileFilePath(serverId, model),
+					exists: true,
+					saved: true,
+				});
+				this.postProfileList();
+				return;
+			}
+			case 'resetModelProfileForm': {
+				const serverId = String(msg.serverId || '').trim();
+				const model = String(msg.model || '').trim();
+				if (!serverId || !model) return;
+				const profile = defaultModelProfile(serverId, model);
+				void this.panel.webview.postMessage({
+					type: 'modelProfile',
+					profile,
+					path: profileFilePath(serverId, model),
+					exists: fs.existsSync(profileFilePath(serverId, model)),
+					reset: true,
+				});
+				return;
+			}
+			case 'openModelProfileFile': {
+				const serverId = String(msg.serverId || '').trim();
+				const model = String(msg.model || '').trim();
+				if (!serverId || !model) return;
+				const fp = profileFilePath(serverId, model);
+				try {
+					if (!fs.existsSync(fp)) {
+						saveModelProfile(defaultModelProfile(serverId, model), fp);
+					}
+					await vscode.window.showTextDocument(vscode.Uri.file(fp));
+				} catch (err) {
+					void vscode.window.showWarningMessage(
+						err instanceof Error ? err.message : String(err)
+					);
+				}
+				return;
+			}
 		}
+	}
+
+	private postProfileList(): void {
+		const state = this.store.getState();
+		const profiles: ModelProfileRef[] = collectModelProfileChoices(
+			state.servers.map(s => ({ id: s.id, models: s.models }))
+		);
+		void this.panel.webview.postMessage({
+			type: 'modelProfileList',
+			profiles,
+			activeServerId: state.activeServerId,
+			activeModel: state.activeModel,
+		});
 	}
 
 	private async runReviseFromUi(opts: { model: string; reps: number }): Promise<void> {
@@ -995,13 +1121,14 @@ export class AiSettingsPanel {
     <button class="${tabActive('mcp')}" data-tab="mcp">MCP</button>
     <button class="${tabActive('guardrails')}" data-tab="guardrails">Guardrails</button>
     <button class="${tabActive('agent')}" data-tab="agent">Agent</button>
+    <button class="${tabActive('profile')}" data-tab="profile">Profile</button>
     <button class="${tabActive('benchmark')}" data-tab="benchmark">Benchmark</button>
     <button class="${tabActive('plugins')}" data-tab="plugins">Plugins</button>
   </aside>
   <main class="main${initialTab === 'plugins' ? ' plugins-wide' : ''}" id="settingsMain">
     <section id="tab-models" class="split ${tabActive('models')}">
       <h1>Models</h1>
-      <p class="subtitle">Add API or local servers, manage their models, and choose what’s active. While coding, use the model QuickPick to switch quickly.</p>
+      <p class="subtitle">Add API or local servers, manage their models, and choose what’s active. Per-model thinking/sampling: <strong>Profile</strong>. Calibration: <strong>Benchmark</strong>. While coding, use the model QuickPick to switch quickly.</p>
 
       <div class="toolbar">
         <select id="newKind">${kinds}</select>
@@ -1112,12 +1239,61 @@ export class AiSettingsPanel {
           <button class="primary" id="agentSave">Save</button>
         </div>
       </div></div>
-      <p class="subtitle" style="margin-top:16px">Per-model harness calibration lives under <strong>Benchmark</strong>.</p>
+    </section>
+
+    <section id="tab-profile" class="split ${tabActive('profile')}">
+      <h1>Profile</h1>
+      <p class="subtitle">Edit the per-model <code>profile.json</code> under ~/.CodeForge/ai/model-profiles/. These knobs control thinking escalation and sampling for the agent loop. Benchmark can overwrite classification-related fields.</p>
+      <div class="card"><div class="card-body">
+        <div class="row" style="grid-template-columns:140px 1fr 1fr;gap:10px">
+          <label>Model</label>
+          <select id="profilePick"></select>
+          <span class="hint" id="profilePathHint" style="grid-column:2 / -1"></span>
+        </div>
+        <div class="actions">
+          <button class="primary" id="profileSave">Save profile</button>
+          <button type="button" class="secondary" id="profileReload">Reload</button>
+          <button type="button" class="secondary" id="profileDefaults">Fill defaults</button>
+          <button type="button" class="secondary" id="profileOpenFile">Open JSON</button>
+          <button type="button" class="secondary" id="profileLocalPreset">Local-agent preset</button>
+        </div>
+        <p id="profileStatus" class="subtitle" style="margin:0"></p>
+      </div></div>
+
+      <div class="card" id="profileFormCard"><div class="card-body">
+        <h2 style="margin-top:0">Thinking</h2>
+        <div class="row"><label><input type="checkbox" id="profThinkEscalate" /> Escalate after stumble</label></div>
+        <div class="row"><label><input type="checkbox" id="profThinkToolRounds" /> Thinking on every tool round</label></div>
+        <div class="row"><label>Max escalations / turn</label><input type="number" id="profThinkMaxEsc" min="0" max="32" step="1" /></div>
+        <div class="row"><label>Thinking max tokens</label><input type="number" id="profThinkMaxTokens" min="256" max="65536" step="256" /></div>
+        <p class="subtitle" id="profThinkMeta" style="margin:0"></p>
+
+        <h2>Sampling</h2>
+        <div class="row"><label>toolThinking temp</label><input type="number" id="profTempTool" min="0" max="2" step="0.05" /></div>
+        <div class="row"><label>toolThinking top_p</label><input type="number" id="profTopPTool" min="0" max="1" step="0.05" /></div>
+        <div class="row"><label>toolReasoning temp</label><input type="number" id="profTempReason" min="0" max="2" step="0.05" /></div>
+        <div class="row"><label>toolReasoning top_p</label><input type="number" id="profTopPReason" min="0" max="1" step="0.05" /></div>
+        <div class="row"><label>plain temp</label><input type="number" id="profTempPlain" min="0" max="2" step="0.05" /></div>
+        <div class="row"><label>plain top_p</label><input type="number" id="profTopPPlain" min="0" max="1" step="0.05" /></div>
+        <div class="row"><label>plan temp</label><input type="number" id="profTempPlan" min="0" max="2" step="0.05" /></div>
+        <div class="row"><label>plan top_p</label><input type="number" id="profTopPPlan" min="0" max="1" step="0.05" /></div>
+
+        <h2>Completion &amp; transport</h2>
+        <div class="row"><label>Mutating max tokens</label><input type="number" id="profMutMax" min="256" max="65536" step="256" /></div>
+        <div class="row"><label>Read-only max tokens</label><input type="number" id="profReadMax" min="256" max="65536" step="256" /></div>
+        <div class="row"><label>Tool transport</label>
+          <select id="profTransport">
+            <option value="">default (native)</option>
+            <option value="native">native</option>
+            <option value="text">text</option>
+          </select>
+        </div>
+      </div></div>
     </section>
 
     <section id="tab-benchmark" class="split ${tabActive('benchmark')}">
       <h1>Benchmark</h1>
-      <p class="subtitle">Pick a model. The harness runs the suite and classifies it as weak or strong from protocol results (not from the name). Profile stays local under ~/.CodeForge/ai/model-profiles/.</p>
+      <p class="subtitle">Pick a model. The harness runs the suite and classifies it as weak or strong from protocol results (not from the name). Profile stays local under ~/.CodeForge/ai/model-profiles/. Manual knobs: <strong>Profile</strong> tab.</p>
       <div class="card" id="calibrateCard"><div class="card-body">
         <h2>Calibrate model profile</h2>
         <p class="subtitle" style="margin-top:0">Suite: T2, T4, CS2, CS3. Clean tool protocol → strong knobs (less overhead); otherwise weak defaults. Long-running — notification progress; cancel anytime.</p>
@@ -1170,6 +1346,11 @@ export class AiSettingsPanel {
   let agent = {};
   let calibrateMeta = { available: false, busy: false };
   let lastCalibrateReport = '';
+  let profileList = [];
+  let profileDirty = false;
+  let profileCurrent = null;
+  let profilePath = '';
+  let profileExists = false;
   let govKind = 'skills';
   let agentDirty = false;
   let pluginsFilter = 'all';
@@ -1188,6 +1369,9 @@ export class AiSettingsPanel {
     if (main) main.classList.toggle('plugins-wide', tab === 'plugins');
     if (tab === 'plugins') renderPlugins();
     if (tab === 'benchmark') renderCalibrate();
+    if (tab === 'profile') {
+      vscode.postMessage({ type: 'listModelProfiles' });
+    }
   }
 
   document.querySelectorAll('.nav button').forEach(btn => {
@@ -1581,6 +1765,182 @@ export class AiSettingsPanel {
     return false;
   }
 
+  function profileKey(serverId, model) {
+    return encodeURIComponent(serverId) + '::' + encodeURIComponent(model);
+  }
+  function parseProfileKey(key) {
+    const i = String(key || '').indexOf('::');
+    if (i < 0) return { serverId: '', model: '' };
+    return {
+      serverId: decodeURIComponent(key.slice(0, i)),
+      model: decodeURIComponent(key.slice(i + 2)),
+    };
+  }
+  function selectedProfileTarget() {
+    const pick = document.getElementById('profilePick');
+    return parseProfileKey(pick && pick.value);
+  }
+  function markProfileDirty() {
+    profileDirty = true;
+    const st = document.getElementById('profileStatus');
+    if (st && !/unsaved/i.test(st.textContent || '')) {
+      st.textContent = (st.textContent ? st.textContent + ' · ' : '') + 'Unsaved changes';
+    }
+  }
+  function fillProfileForm(profile) {
+    if (!profile) return;
+    profileCurrent = profile;
+    document.getElementById('profThinkEscalate').checked = profile.thinking?.escalate !== false;
+    document.getElementById('profThinkToolRounds').checked = !!profile.thinking?.toolRounds;
+    document.getElementById('profThinkMaxEsc').value = profile.thinking?.maxEscalationsPerTurn ?? 6;
+    document.getElementById('profThinkMaxTokens').value = profile.thinking?.maxTokens ?? 12288;
+    const meta = [];
+    if (profile.thinking?.supported === true) meta.push('Thinking probe: supported');
+    if (profile.thinking?.supported === false) meta.push('Thinking probe: not supported');
+    if (profile.calibration?.classification) {
+      meta.push(
+        'Calibrated ' +
+          profile.calibration.classification +
+          (profile.calibration.at ? ' · ' + profile.calibration.at.slice(0, 10) : '')
+      );
+    }
+    document.getElementById('profThinkMeta').textContent = meta.join(' · ');
+    document.getElementById('profTempTool').value = profile.sampling?.toolThinking?.temperature ?? 0.7;
+    document.getElementById('profTopPTool').value = profile.sampling?.toolThinking?.top_p ?? 0.8;
+    document.getElementById('profTempReason').value = profile.sampling?.toolReasoning?.temperature ?? 0.7;
+    document.getElementById('profTopPReason').value = profile.sampling?.toolReasoning?.top_p ?? 0.8;
+    document.getElementById('profTempPlain').value = profile.sampling?.plain?.temperature ?? 0.2;
+    document.getElementById('profTopPPlain').value = profile.sampling?.plain?.top_p ?? 1;
+    document.getElementById('profTempPlan').value = profile.sampling?.plan?.temperature ?? 0.6;
+    document.getElementById('profTopPPlan').value = profile.sampling?.plan?.top_p ?? 0.95;
+    document.getElementById('profMutMax').value = profile.completion?.mutatingMaxTokens ?? 6144;
+    document.getElementById('profReadMax').value = profile.completion?.readOnlyMaxTokens ?? 3072;
+    document.getElementById('profTransport').value = profile.toolTransport || '';
+    profileDirty = false;
+  }
+  function readProfileForm() {
+    const { serverId, model } = selectedProfileTarget();
+    return {
+      serverId,
+      model,
+      thinking: {
+        escalate: document.getElementById('profThinkEscalate').checked,
+        toolRounds: document.getElementById('profThinkToolRounds').checked,
+        maxEscalationsPerTurn: Number(document.getElementById('profThinkMaxEsc').value),
+        maxTokens: Number(document.getElementById('profThinkMaxTokens').value),
+      },
+      sampling: {
+        toolThinking: {
+          temperature: Number(document.getElementById('profTempTool').value),
+          top_p: Number(document.getElementById('profTopPTool').value),
+        },
+        toolReasoning: {
+          temperature: Number(document.getElementById('profTempReason').value),
+          top_p: Number(document.getElementById('profTopPReason').value),
+        },
+        plain: {
+          temperature: Number(document.getElementById('profTempPlain').value),
+          top_p: Number(document.getElementById('profTopPPlain').value),
+        },
+        plan: {
+          temperature: Number(document.getElementById('profTempPlan').value),
+          top_p: Number(document.getElementById('profTopPPlan').value),
+        },
+      },
+      completion: {
+        mutatingMaxTokens: Number(document.getElementById('profMutMax').value),
+        readOnlyMaxTokens: Number(document.getElementById('profReadMax').value),
+      },
+      toolTransport: document.getElementById('profTransport').value || '',
+    };
+  }
+  function applyLocalAgentPreset() {
+    document.getElementById('profThinkEscalate').checked = false;
+    document.getElementById('profThinkToolRounds').checked = false;
+    document.getElementById('profThinkMaxEsc').value = 1;
+    document.getElementById('profThinkMaxTokens').value = 2048;
+    document.getElementById('profTempTool').value = 0.3;
+    document.getElementById('profTempReason').value = 0.3;
+    document.getElementById('profTempPlain').value = 0.2;
+    markProfileDirty();
+    const st = document.getElementById('profileStatus');
+    if (st) st.textContent = 'Local-agent preset applied (not saved yet)';
+  }
+  function renderProfileList(profiles, activeServerId, activeModel) {
+    const pick = document.getElementById('profilePick');
+    if (!pick) return;
+    profileList = profiles || [];
+    const prev = pick.value;
+    pick.innerHTML = '';
+    if (!profileList.length) {
+      const o = document.createElement('option');
+      o.value = '';
+      o.textContent = '(add a model on the Models tab)';
+      pick.appendChild(o);
+      return;
+    }
+    for (const p of profileList) {
+      const o = document.createElement('option');
+      o.value = profileKey(p.serverId, p.model);
+      o.textContent = p.model + ' · ' + p.serverId.slice(0, 8) + (p.exists ? '' : ' (new)');
+      pick.appendChild(o);
+    }
+    const preferred =
+      activeServerId && activeModel ? profileKey(activeServerId, activeModel) : '';
+    const keys = profileList.map(p => profileKey(p.serverId, p.model));
+    pick.value = keys.includes(prev) ? prev : keys.includes(preferred) ? preferred : keys[0];
+    const target = parseProfileKey(pick.value);
+    if (target.serverId && target.model) {
+      vscode.postMessage({ type: 'loadModelProfile', serverId: target.serverId, model: target.model });
+    }
+  }
+  function updateProfilePathHint() {
+    const hint = document.getElementById('profilePathHint');
+    const st = document.getElementById('profileStatus');
+    if (hint) hint.textContent = profilePath || '';
+    if (st && !profileDirty) {
+      st.textContent = profileExists ? 'Loaded from disk' : 'No file yet — Save creates profile.json';
+    }
+  }
+
+  [
+    'profThinkEscalate', 'profThinkToolRounds', 'profThinkMaxEsc', 'profThinkMaxTokens',
+    'profTempTool', 'profTopPTool', 'profTempReason', 'profTopPReason',
+    'profTempPlain', 'profTopPPlain', 'profTempPlan', 'profTopPPlan',
+    'profMutMax', 'profReadMax', 'profTransport'
+  ].forEach(id => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.addEventListener('change', markProfileDirty);
+    if (el.tagName === 'INPUT' && el.type === 'number') el.addEventListener('input', markProfileDirty);
+  });
+  document.getElementById('profilePick')?.addEventListener('change', () => {
+    if (profileDirty) {
+      const ok = confirm('Discard unsaved profile changes?');
+      if (!ok) return;
+    }
+    const { serverId, model } = selectedProfileTarget();
+    if (serverId && model) vscode.postMessage({ type: 'loadModelProfile', serverId, model });
+  });
+  document.getElementById('profileSave')?.addEventListener('click', () => {
+    const profile = readProfileForm();
+    if (!profile.serverId || !profile.model) return;
+    vscode.postMessage({ type: 'saveModelProfile', profile, toolTransport: profile.toolTransport });
+  });
+  document.getElementById('profileReload')?.addEventListener('click', () => {
+    const { serverId, model } = selectedProfileTarget();
+    if (serverId && model) vscode.postMessage({ type: 'loadModelProfile', serverId, model });
+  });
+  document.getElementById('profileDefaults')?.addEventListener('click', () => {
+    const { serverId, model } = selectedProfileTarget();
+    if (serverId && model) vscode.postMessage({ type: 'resetModelProfileForm', serverId, model });
+  });
+  document.getElementById('profileOpenFile')?.addEventListener('click', () => {
+    const { serverId, model } = selectedProfileTarget();
+    if (serverId && model) vscode.postMessage({ type: 'openModelProfileFile', serverId, model });
+  });
+  document.getElementById('profileLocalPreset')?.addEventListener('click', applyLocalAgentPreset);
+
   window.addEventListener('message', (e) => {
     if (e.data.type === 'selectTab') {
       selectTab(e.data.tab);
@@ -1606,6 +1966,36 @@ export class AiSettingsPanel {
         lastCalibrateReport = e.data.reportPath;
         const openBtn = document.getElementById('calibrateOpenReport');
         if (openBtn) openBtn.style.display = '';
+      }
+      return;
+    }
+    if (e.data.type === 'modelProfileList') {
+      renderProfileList(e.data.profiles || [], e.data.activeServerId, e.data.activeModel);
+      return;
+    }
+    if (e.data.type === 'modelProfile') {
+      if (e.data.error) {
+        const st = document.getElementById('profileStatus');
+        if (st) st.textContent = e.data.error;
+        return;
+      }
+      profilePath = e.data.path || '';
+      profileExists = !!e.data.exists;
+      fillProfileForm(e.data.profile);
+      if (e.data.saved) {
+        profileExists = true;
+        const st = document.getElementById('profileStatus');
+        if (st) st.textContent = 'Saved';
+      } else if (e.data.reset) {
+        markProfileDirty();
+        const st = document.getElementById('profileStatus');
+        if (st) st.textContent = 'Defaults filled (not saved yet)';
+      } else {
+        updateProfilePathHint();
+      }
+      if (e.data.path) {
+        const hint = document.getElementById('profilePathHint');
+        if (hint) hint.textContent = e.data.path;
       }
       return;
     }
