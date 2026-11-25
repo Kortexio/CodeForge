@@ -2,7 +2,7 @@
   "name": "codeforge",
   "displayName": "CodeForge AI",
   "description": "AI Agent sidebar and approval UI for CodeForge",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "publisher": "kortexio",
   "engines": {
     "vscode": "^1.136.0"
@@ -626,3 +626,4 @@
     "minimatch": "^10.2.6"
   }
 }
+
