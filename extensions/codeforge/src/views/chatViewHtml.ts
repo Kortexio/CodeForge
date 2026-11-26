@@ -334,18 +334,32 @@ export function getChatViewHtml(assets: ChatViewAssets): string {
     border: 0; background: transparent; color: inherit; cursor: pointer;
     padding: 0 2px; font: inherit; line-height: 1;
   }
+  /* Cursor-like: left chips shrink/scroll; send stays pinned on the right. */
   .composer-actions {
-    display: flex; align-items: center; gap: 6px; margin-top: 4px; flex-wrap: wrap;
+    display: flex; align-items: center; gap: 8px; margin-top: 4px;
+    flex-wrap: nowrap; min-width: 0;
+  }
+  .composer-actions-main {
+    display: flex; align-items: center; gap: 6px; flex: 1 1 auto; min-width: 0;
+    overflow-x: auto; scrollbar-width: none;
+  }
+  .composer-actions-main::-webkit-scrollbar { display: none; }
+  .composer-actions-end {
+    display: flex; align-items: center; gap: 6px; flex: 0 0 auto; margin-left: auto;
   }
   .chip, .icon-btn, .perm-chip, .mode-chip, .model-chip {
     border: 1px solid var(--vscode-panel-border); background: var(--vscode-input-background);
     color: var(--vscode-foreground); border-radius: 999px; padding: 3px 10px;
     font: inherit; font-size: 0.78em; cursor: pointer; max-width: 160px;
-    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex-shrink: 0;
+  }
+  .model-chip {
+    flex: 1 1 auto; min-width: 48px; max-width: 140px;
   }
   .icon-btn {
     width: 28px; height: 28px; padding: 0; display: grid; place-items: center; border-radius: 6px;
   }
+  .send, .stop, .ctx-ring { flex-shrink: 0; }
   .mode-menu {
     display: none; position: absolute; left: 8px; bottom: 100%;
     margin-bottom: 4px; min-width: 220px; z-index: 6;
@@ -498,22 +512,25 @@ export function getChatViewHtml(assets: ChatViewAssets): string {
       <div class="attach-row" id="attachRow"></div>
       <textarea id="messageInput" placeholder="Plan, @ for context, / for commands"></textarea>
       <div class="composer-actions">
-        <button type="button" class="icon-btn" id="attachBtn" title="Attach files · or drag & drop / paste images and files anywhere here">📎</button>
-        <button type="button" class="mode-chip" id="modeChip" title="Switch mode (Shift+Tab)">Agent ▾</button>
-        <button type="button" class="model-chip" id="modelChip" title="Switch model">model</button>
-        <button type="button" class="perm-chip" id="permChip" title="Permissions">Default</button>
-        <span class="spacer"></span>
-        <span class="ctx-ring" id="ctxRing" title="Context usage">
-          <svg viewBox="0 0 28 28" width="28" height="28" aria-hidden="true">
-            <circle cx="14" cy="14" r="11" fill="none" stroke="var(--vscode-panel-border)" stroke-width="2.5"/>
-            <circle id="ctxArc" cx="14" cy="14" r="11" fill="none"
-              stroke="var(--vscode-charts-blue, #3794ff)" stroke-width="2.5"
-              stroke-linecap="round" stroke-dasharray="69.1" stroke-dashoffset="69.1"
-              transform="rotate(-90 14 14)"/>
-          </svg>
-          <span id="ctxPct">0%</span>
-        </span>
-        <button class="send" id="sendButton" type="button" title="Send">↑</button>
+        <div class="composer-actions-main">
+          <button type="button" class="icon-btn" id="attachBtn" title="Attach files · or drag & drop / paste images and files anywhere here">📎</button>
+          <button type="button" class="mode-chip" id="modeChip" title="Switch mode (Shift+Tab)">Agent ▾</button>
+          <button type="button" class="model-chip" id="modelChip" title="Switch model">model</button>
+          <button type="button" class="perm-chip" id="permChip" title="Permissions">Default</button>
+        </div>
+        <div class="composer-actions-end">
+          <span class="ctx-ring" id="ctxRing" title="Context usage">
+            <svg viewBox="0 0 28 28" width="28" height="28" aria-hidden="true">
+              <circle cx="14" cy="14" r="11" fill="none" stroke="var(--vscode-panel-border)" stroke-width="2.5"/>
+              <circle id="ctxArc" cx="14" cy="14" r="11" fill="none"
+                stroke="var(--vscode-charts-blue, #3794ff)" stroke-width="2.5"
+                stroke-linecap="round" stroke-dasharray="69.1" stroke-dashoffset="69.1"
+                transform="rotate(-90 14 14)"/>
+            </svg>
+            <span id="ctxPct">0%</span>
+          </span>
+          <button class="send" id="sendButton" type="button" title="Send">↑</button>
+        </div>
       </div>
     </div>
   </div>

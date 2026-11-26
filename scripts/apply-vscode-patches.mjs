@@ -654,6 +654,66 @@ function patchFile(relPath, label, edits) {
 	}
 }
 
+// CodeForge AI chat lives in the Auxiliary Bar. Upstream min (170) is too narrow for
+// the composer row (mode + model + permissions + send) — clamp so the sash cannot crush it.
+patchFile('src/vs/workbench/browser/parts/auxiliarybar/auxiliaryBarPart.ts', 'Auxiliary Bar min width for AI chat', [
+	{
+		from: `\t// Use the side bar dimensions
+\toverride readonly minimumWidth: number = 170;
+\toverride readonly maximumWidth: number = Number.POSITIVE_INFINITY;
+\toverride readonly minimumHeight: number = 0;
+\toverride readonly maximumHeight: number = Number.POSITIVE_INFINITY;
+
+\tget preferredHeight(): number | undefined {
+\t\t// Don't worry about titlebar or statusbar visibility
+\t\t// The difference is minimal and keeps this function clean
+\t\treturn this.layoutService.mainContainerDimension.height * 0.4;
+\t}
+
+\tget preferredWidth(): number | undefined {
+\t\tconst activeComposite = this.getActivePaneComposite();
+
+\t\tif (!activeComposite) {
+\t\t\treturn undefined;
+\t\t}
+
+\t\tconst width = activeComposite.getOptimalWidth();
+\t\tif (typeof width !== 'number') {
+\t\t\treturn undefined;
+\t\t}
+
+\t\treturn Math.max(width, 300);
+\t}`,
+		to: `\t// Use the side bar dimensions
+\t// CodeForge: 360px keeps mode/model/permissions chips + send on one row.
+\toverride readonly minimumWidth: number = 360;
+\toverride readonly maximumWidth: number = Number.POSITIVE_INFINITY;
+\toverride readonly minimumHeight: number = 0;
+\toverride readonly maximumHeight: number = Number.POSITIVE_INFINITY;
+
+\tget preferredHeight(): number | undefined {
+\t\t// Don't worry about titlebar or statusbar visibility
+\t\t// The difference is minimal and keeps this function clean
+\t\treturn this.layoutService.mainContainerDimension.height * 0.4;
+\t}
+
+\tget preferredWidth(): number | undefined {
+\t\tconst activeComposite = this.getActivePaneComposite();
+
+\t\tif (!activeComposite) {
+\t\t\treturn undefined;
+\t\t}
+
+\t\tconst width = activeComposite.getOptimalWidth();
+\t\tif (typeof width !== 'number') {
+\t\t\treturn undefined;
+\t\t}
+
+\t\treturn Math.max(width, 360);
+\t}`,
+	},
+]);
+
 const disabledImport = (line) => `// CodeForge: provider disabled in the Agents window.\n// ${line}`;
 
 patchFile('src/vs/sessions/sessions.common.main.ts', 'Agents window providers', [
