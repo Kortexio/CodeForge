@@ -24,8 +24,9 @@ describe('tool groups (phase 4)', () => {
 			expect([...CORE, 'mcp_call']).toContain(n);
 		}
 		expect(names).not.toContain('git_status');
-		expect(names).not.toContain('web_search');
-		expect(names).not.toContain('browser_navigate');
+		expect(names).toContain('web_search');
+		expect(names).toContain('browser_navigate');
+		expect(names).toContain('computer_screenshot');
 		expect(names).not.toContain('delete');
 	}, 60_000);
 
@@ -43,7 +44,7 @@ describe('tool groups (phase 4)', () => {
 		const names = tools.map(t => t.function?.name).filter(Boolean) as string[];
 		expect(names).toContain('git_status');
 		expect(names).toContain('git_commit');
-		expect(names).not.toContain('web_search');
+		expect(names).toContain('web_search');
 	}, 60_000);
 });
 

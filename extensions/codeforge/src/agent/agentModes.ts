@@ -14,7 +14,8 @@ export interface AgentModeDefinition {
 	skillHints?: string[];
 	/**
 	 * Optional tool groups to enable on top of CORE in Agent (build) profile
-	 * (git | wiki | browser | web | media | notebook | navigation | files).
+	 * (git | wiki | media | notebook | navigation | files).
+	 * Web, browser, and computer are already in CORE for Agent.
 	 */
 	toolGroups?: string[];
 }

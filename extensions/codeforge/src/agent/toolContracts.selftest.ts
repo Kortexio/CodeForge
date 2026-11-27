@@ -26,8 +26,9 @@ assert(/After diagnosing|bug list/i.test(toolDescription('edit')), 'edit pushes 
 const coreOnly = buildToolSystemContract(CORE);
 assert(coreOnly.includes('### Tool contract'), 'core contract header');
 assert(/edit/i.test(coreOnly), 'core mentions edit');
-assert(!/Browser:/i.test(coreOnly), 'core omits browser when inactive');
-assert(!/web_search/i.test(coreOnly), 'core omits web when inactive');
+assert(/Browser:/i.test(coreOnly), 'core includes browser');
+assert(/web_search/i.test(coreOnly), 'core includes web');
+assert(/Computer:/i.test(coreOnly), 'core includes computer');
 assert(!/symbols\/definition/i.test(coreOnly), 'core omits navigation when inactive');
 
 assert(
@@ -105,6 +106,19 @@ const expected = [
 	'browser_click',
 	'browser_type',
 	'browser_screenshot',
+	'browser_scroll',
+	'browser_press_key',
+	'browser_hover',
+	'browser_select_option',
+	'browser_wait',
+	'browser_tabs',
+	'browser_close',
+	'computer_screenshot',
+	'computer_click',
+	'computer_move',
+	'computer_type',
+	'computer_key',
+	'computer_scroll',
 	'delegate_task',
 	'mcp_call',
 	'skill',

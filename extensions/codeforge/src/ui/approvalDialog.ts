@@ -19,6 +19,17 @@ export interface ApprovalResult {
 	scope: 'once' | 'session' | 'always' | 'edits-session' | 'edits-always';
 }
 
+let approvalDialogDepth = 0;
+
+export function isApprovalDialogOpen(): boolean {
+	return approvalDialogDepth > 0;
+}
+
+/** Test hook. */
+export function setApprovalDialogOpenForTests(open: boolean): void {
+	approvalDialogDepth = open ? 1 : 0;
+}
+
 export class ApprovalDialog {
 	static async show(request: ApprovalRequest): Promise<ApprovalResult> {
 		const policy = getApprovalPolicy();
@@ -26,11 +37,16 @@ export class ApprovalDialog {
 			return { approved: true, scope: 'once' };
 		}
 
-		const isEdit = EDIT_TOOLS.has(request.tool.toLowerCase());
-		if (isEdit) {
-			return ApprovalDialog.showForEdits(request);
+		approvalDialogDepth += 1;
+		try {
+			const isEdit = EDIT_TOOLS.has(request.tool.toLowerCase());
+			if (isEdit) {
+				return await ApprovalDialog.showForEdits(request);
+			}
+			return await ApprovalDialog.showGeneric(request);
+		} finally {
+			approvalDialogDepth = Math.max(0, approvalDialogDepth - 1);
 		}
-		return ApprovalDialog.showGeneric(request);
 	}
 
 	/** Cursor-style prompts for write / rename / delete. */

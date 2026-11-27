@@ -434,8 +434,6 @@
             "enum": [
               "git",
               "wiki",
-              "browser",
-              "web",
               "media",
               "notebook",
               "navigation",
@@ -443,7 +441,27 @@
             ]
           },
           "default": [],
-          "description": "Optional tool groups enabled on top of the Agent CORE surface (git, wiki, browser, web, media, notebook, navigation, files). Empty = CORE only."
+          "description": "Optional tool groups on top of Agent CORE (git, wiki, media, notebook, navigation, files). Web, browser, and computer are always on for Agent. Empty = CORE plus those fixed tools."
+        },
+        "codeforge.ai.browserHeadless": {
+          "type": "boolean",
+          "default": false,
+          "description": "Launch the agent browser headless. CI and the bench force headless even when this is false."
+        },
+        "codeforge.ai.devServerUrl": {
+          "type": "string",
+          "default": "",
+          "description": "URL of the app under test. After edits the agent should open it and read console and network issues."
+        },
+        "codeforge.ai.knowledgePrefetch": {
+          "type": "boolean",
+          "default": true,
+          "description": "Before the first reply, put repository evidence in context, or a web search of the task when the repo has no useful hit."
+        },
+        "codeforge.ai.computerInteractive": {
+          "type": "boolean",
+          "default": true,
+          "description": "Allow computer-use tools to ask for a per-turn desktop grant. Off in headless and bench. Allow all does not skip the grant."
         },
         "codeforge.ai.openModels": {
           "type": "boolean",

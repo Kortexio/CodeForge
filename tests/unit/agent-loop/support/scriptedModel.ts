@@ -15,6 +15,8 @@ export type ScriptedStepResult = {
 	finish_reason?: string;
 	prompt_tokens?: number;
 	completion_tokens?: number;
+	/** When set, a streaming request emits this content in these SSE pieces instead of one body. */
+	streamPieces?: string[];
 };
 
 export type ScriptedRequestBody = {
@@ -64,6 +66,34 @@ function buildMessage(step: ScriptedStepResult) {
 	};
 }
 
+function sseResponse(step: ScriptedStepResult): Response {
+	const pieces = step.streamPieces?.length ? step.streamPieces : [step.content ?? ''];
+	const encoder = new TextEncoder();
+	const body = new ReadableStream<Uint8Array>({
+		start(controller) {
+			const send = (payload: unknown) => {
+				controller.enqueue(encoder.encode(`data: ${JSON.stringify(payload)}\n\n`));
+			};
+			for (const piece of pieces) {
+				send({ choices: [{ index: 0, delta: { content: piece } }] });
+			}
+			send({
+				choices: [{ index: 0, delta: {}, finish_reason: step.finish_reason ?? 'stop' }],
+				usage: {
+					prompt_tokens: step.prompt_tokens ?? 100,
+					completion_tokens: step.completion_tokens ?? 50,
+				},
+			});
+			controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+			controller.close();
+		},
+	});
+	return new Response(body, {
+		status: 200,
+		headers: { 'Content-Type': 'text/event-stream' },
+	});
+}
+
 async function scriptedFetch(input: string | URL | { url: string }, init?: RequestInit): Promise<Response> {
 	const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
 	if (!/\/chat\/completions\/?$/i.test(url.replace(/\?.*$/, ''))) {
@@ -87,6 +117,9 @@ async function scriptedFetch(input: string | URL | { url: string }, init?: Reque
 		step = steps[stepIndex++]!(body);
 	}
 	const message = buildMessage(step);
+	if (body.stream === true && !message.tool_calls?.length) {
+		return sseResponse(step);
+	}
 	return jsonResponse({
 		id: `scripted-${stepIndex}`,
 		object: 'chat.completion',

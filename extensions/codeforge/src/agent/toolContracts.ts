@@ -64,7 +64,7 @@ export function buildToolSystemContract(
 	if (has('shell')) commands.push('shell (cmd.exe)');
 	if (has('dotnet')) commands.push('dotnet for .NET');
 	if (has('web_search') || has('web_fetch')) {
-		commands.push('web_search/web_fetch for HTTP');
+		commands.push('web_search/web_fetch for docs the repo does not contain');
 	}
 	if (has('await_shell')) commands.push('await_shell for background jobs');
 	if (commands.length) {
@@ -73,7 +73,12 @@ export function buildToolSystemContract(
 
 	if (has('browser_navigate', 'browser_snapshot', 'browser_click', 'browser_type')) {
 		lines.push(
-			'Browser: snapshot is the source of truth. Loop observe → act (click/type) → read the After page state in the tool result. Click success alone is not the goal — UI must match the expected outcome. If UI UNCHANGED, do not repeat the same selector.'
+			'Browser: one Playwright window (headed). Snapshot and After-state are the source of truth, including console and network issues. Prefer @refs from the snapshot. If UI UNCHANGED, do not repeat the same selector. Prefer browser_* over an MCP browser when Playwright loaded. Use computer_* only for the OS desktop.'
+		);
+	}
+	if (has('computer_click', 'computer_screenshot')) {
+		lines.push(
+			'Computer: virtual-screen pixels across monitors. It bypasses the shell sandbox and needs a grant for this turn. Screenshot is allowed during an approval dialog; clicks are not.'
 		);
 	}
 
@@ -157,9 +162,9 @@ export const TOOL_DESCRIPTIONS = {
 	await_shell:
 		'Wait/poll a background shell job. id required (from shell background). Optional pattern regex on output; optional block_until_ms.',
 	web_search:
-		'Search the public web (no API key). Prefer over shell curl for discovery. query required; optional max_results.',
+		'Search the public web (no API key) when the repo and the context packet do not support the fact. query required; optional max_results.',
 	web_fetch:
-		'Fetch a URL over HTTPS and return text/markdown-ish content. url required; optional max_chars.',
+		'Fetch an http(s) URL and return readable text. url required; optional max_chars. Localhost is allowed. file: and link-local metadata hosts are blocked.',
 	todo_write:
 		'Create or update a multi-step checklist for this session. todos array required (content; optional id/status). merge defaults true.',
 	git_add: 'Stage files (git add). Optional paths array; omit to stage all relevant changes.',
@@ -176,7 +181,7 @@ export const TOOL_DESCRIPTIONS = {
 		'Write a canvas doc under .CodeForge/canvas/ (md or html). id, title, and content required; optional format (md|html).',
 	voice_status: 'Report whether voice input is available (status only; does not record audio).',
 	diagnostics:
-		'Language-server errors/warnings for a file or the workspace. Optional path; omit for workspace-wide.',
+		'Language-server errors and warnings for a file or the workspace. Optional path. Use this as proof of compile/type health alongside the oracle, not a phrase in the final summary.',
 	symbols:
 		'List document symbols (path) or search workspace symbols (query). Provide path and/or query.',
 	references:
@@ -215,8 +220,22 @@ export const TOOL_DESCRIPTIONS = {
 		'Type into a CSS selector. selector and text required.',
 		'Result includes UI change verdict and After page state (same observe-after-act contract as browser_click).',
 	].join(' '),
+	browser_scroll: 'Scroll the page. dy required (pixels; negative scrolls up). Result includes After-state.',
+	browser_press_key: 'Press a key in the page. key required. Result includes After-state.',
+	browser_hover: 'Hover a CSS selector. selector required.',
+	browser_select_option: 'Select an option in a <select>. selector and value required.',
+	browser_wait: 'Wait up to 10s. ms required. Result includes After-state.',
+	browser_tabs: 'List, open, switch, or close Playwright tabs. action: list | new | switch | close. id for switch/close.',
+	browser_close: 'Close the Playwright browser session.',
+	computer_screenshot:
+		'Capture the Windows virtual screen (all monitors) to an artifact. Needs the turn grant. Not written to the wiki.',
+	computer_click: 'Click virtual-screen x,y on Windows. Needs the turn grant. Refused while an approval dialog is open.',
+	computer_move: 'Move the pointer to virtual-screen x,y. Needs the turn grant.',
+	computer_type: 'Type text into the focused OS window via SendKeys. text required. Needs the turn grant.',
+	computer_key: 'Press a SendKeys token such as {ENTER}. key required. Needs the turn grant.',
+	computer_scroll: 'Scroll the mouse wheel. dy is notches (positive up). Needs the turn grant.',
 	browser_screenshot: [
-		'Full-page screenshot saved as an artifact, plus a short After text state.',
+		'Viewport screenshot saved as an artifact, plus After text state (console and network issues included).',
 		'Use when a visual check helps; for automation logic prefer browser_snapshot / After state from click.',
 	].join(' '),
 	delegate_task: [

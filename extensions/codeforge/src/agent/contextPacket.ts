@@ -15,6 +15,7 @@ import {
 } from '../intelligence/workspaceIndex';
 import * as fs from 'fs/promises';
 import * as path from 'path';
+import { selectUsefulHits } from './knowledgePrefetch';
 import { StableFacts, normalizeFacts } from './stableFacts';
 import {
 	assembleContext,
@@ -71,10 +72,12 @@ export async function buildContextPacket(opts: {
 	let retrieveNote = '';
 	if (opts.includeRetrieve === true) {
 		try {
-			retrieved = await retrieveSnippets(opts.task, opts.retrieveK ?? 6, {
-				rerank: true,
-				rerankFn: opts.rerankFn,
-			});
+			retrieved = selectUsefulHits(
+				await retrieveSnippets(opts.task, opts.retrieveK ?? 6, {
+					rerank: true,
+					rerankFn: opts.rerankFn,
+				})
+			);
 		} catch (err) {
 			retrieveNote = `(retrieve failed: ${err instanceof Error ? err.message : String(err)})`;
 			retrieved = [];

@@ -7,22 +7,37 @@ export type PageState = {
 	url: string;
 	title: string;
 	text: string;
+	/** Console errors/warnings, page errors, and failed requests collected since navigation. */
+	issues?: string;
 };
 
 /** Stable fingerprint for "did the UI change?" (not cryptographic). */
 export function pageStateFingerprint(state: PageState): string {
 	const body = state.text.replace(/\s+/g, ' ').trim().slice(0, 2500);
-	return `${state.url}\n${state.title}\n${body}`;
+	const issues = (state.issues ?? '').replace(/\s+/g, ' ').trim().slice(0, 500);
+	return `${state.url}\n${state.title}\n${issues}\n${body}`;
 }
 
 export function pageStateChanged(before: PageState, after: PageState): boolean {
 	return pageStateFingerprint(before) !== pageStateFingerprint(after);
 }
 
+export function isLocalAppUrl(url: string): boolean {
+	return /localhost|127\.0\.0\.1|\[::1\]/i.test(url);
+}
+
 export function formatPageState(state: PageState, maxChars = 6000): string {
 	const text =
 		state.text.length > maxChars ? `${state.text.slice(0, maxChars)}\n…[clipped]` : state.text;
-	return `URL: ${state.url}\nTitle: ${state.title}\n\n${text}`;
+	const issues = state.issues?.trim() ?? '';
+	const local = isLocalAppUrl(state.url);
+	const issueBlock = issues
+		? `${local ? 'Issues (local app)' : 'Issues'}:\n${issues}\n\n`
+		: '';
+	if (local && issues) {
+		return `${issueBlock}URL: ${state.url}\nTitle: ${state.title}\n\n${text}`;
+	}
+	return `${issueBlock}URL: ${state.url}\nTitle: ${state.title}\n\n${text}`;
 }
 
 /**

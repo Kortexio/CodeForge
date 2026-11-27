@@ -21,7 +21,12 @@ import {
 } from '../agent/llamaSlots';
 import { runOrchestrated } from '../agent/orchestratorRun';
 import { runReviewPipeline } from '../agent/reviewPipeline';
-import { anyVisionModelAvailable, resolveReachableVisionRoute } from '../agent/visionRouting';
+import {
+	anyVisionModelAvailable,
+	modelLikelySupportsVision,
+	resolveReachableVisionRoute,
+	visionModelsForServer,
+} from '../agent/visionRouting';
 import { SessionStore, type MessageTimings } from '../sessions/sessionStore';
 import { getApprovalPolicy, PermissionLevel } from '../policy/approvalPolicy';
 import { ensureWorkspaceIndex, getIndexedCount } from '../intelligence/workspaceIndex';
@@ -163,6 +168,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 	/** Set by /cards, /plan-run and /review for the next run only. */
 	private _runKind?: 'cards' | 'plan-run' | 'review';
 	private _currentTurn = 0;
+	/** Last timestamp a streamed delta repainted the pending bubble (throttle). */
+	private _lastStreamPaint = 0;
 	/** Protocol telemetry for the in-flight turn (flushed when the turn ends). */
 	private _protocolAgg: ProtocolAggregator | undefined;
 	private _protocolMeta:
@@ -765,6 +772,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 		}
 
 		this.addMessage('assistant', '', 'pending');
+		this._lastStreamPaint = 0;
 		const pending = this._messages[this._messages.length - 1];
 		if (pending?.role === 'assistant') {
 			pending.liveStatus =
@@ -1424,6 +1432,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 				sampling: server.sampling,
 				serverId: server.id,
 				onStatus: text => this.setPendingLiveStatus(text),
+				onStreamingText: text => this.pushStreamingText(text),
 				onActivity: ev => this.observeActivity(ev),
 				onLoopExit: exit => {
 					this._lastLoopExit = exit;
@@ -1471,6 +1480,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 				sampling: server.sampling,
 				serverId: server.id,
 				onStatus: text => this.setPendingLiveStatus(text),
+				onStreamingText: text => this.pushStreamingText(text),
 				onActivity: ev => this.observeActivity(ev),
 				onLoopExit: exit => {
 					this._lastLoopExit = exit;
@@ -1523,6 +1533,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			workspaceRoot: root,
 			task,
 			images,
+			visionCapable:
+				images.length > 0 ||
+				visionModelsForServer(server).includes(activeModel) ||
+				modelLikelySupportsVision(server.kind, activeModel),
 			history: this.getHistoryForLlm(),
 			cancelled: () => this._cancelled,
 			abortSignal: this._abort?.signal,
@@ -1531,6 +1545,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 			sampling: server.sampling,
 			serverId: server.id,
 			onStatus: text => this.setPendingLiveStatus(text),
+			onStreamingText: text => this.pushStreamingText(text),
 			onActivity: ev => this.observeActivity(ev),
 			onLoopExit: exit => {
 				this._lastLoopExit = exit;
@@ -1942,6 +1957,22 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 	 * streamed model prose becomes a brief narration (sense of motion on long turns).
 	 * Cleared when the pending bubble leaves `pending` (see updateLastMessage).
 	 */
+	/**
+	 * Live model prose for the in-flight assistant bubble. Throttled here so the webview
+	 * re-renders at most ~20 times/s; the final reply replaces this when the turn settles.
+	 */
+	private pushStreamingText(text: string): void {
+		const now = Date.now();
+		if (now - this._lastStreamPaint < 50) return;
+		this._lastStreamPaint = now;
+		const last = this._messages[this._messages.length - 1];
+		if (!last || last.role !== 'assistant' || last.status !== 'pending') return;
+		if (last.content === text) return;
+		last.content = text;
+		delete last.liveStatus;
+		this.updateView();
+	}
+
 	private setPendingLiveStatus(text: string): void {
 		this._turnObserver?.onStatus(text);
 		let cleaned = String(text || '')

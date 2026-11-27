@@ -15,6 +15,13 @@ export const EFFECTFUL_TOOLS = new Set([
 	'browser_navigate',
 	'browser_click',
 	'browser_type',
+	'browser_scroll',
+	'browser_press_key',
+	'browser_hover',
+	'browser_select_option',
+	'computer_click',
+	'computer_type',
+	'computer_key',
 ]);
 
 /** Shell/dotnet commands that only inspect — not effectful for the finish gate. */
@@ -129,6 +136,12 @@ export const RUNTIME_OBSERVE_TOOLS = new Set([
 	'browser_screenshot',
 	'browser_click',
 	'browser_type',
+	'browser_scroll',
+	'browser_press_key',
+	'browser_hover',
+	'browser_select_option',
+	'browser_wait',
+	'browser_tabs',
 ]);
 
 export function isRuntimeObserveTool(name: string): boolean {

@@ -44,6 +44,9 @@ export class ApprovalPolicy {
 	}
 
 	isAutoApproved(tool: string): boolean {
+		if (normalizeTool(tool).startsWith('computer_')) {
+			return false;
+		}
 		if (this.globalAllowAllEnabled()) {
 			return true;
 		}

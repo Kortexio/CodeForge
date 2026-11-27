@@ -19,7 +19,7 @@ import {
 	isPlausiblePath,
 	normalizeFacts,
 } from '../../extensions/codeforge/src/agent/stableFacts';
-import { buildPriorAgentTranscript } from '../../extensions/codeforge/src/agent/priorContext';
+import { buildPriorAgentTranscript, isHarnessAckEcho } from '../../extensions/codeforge/src/agent/priorContext';
 import type { ToolTraceEntry } from '../../extensions/codeforge/src/sessions/sessionStore';
 import {
 	dropOrphanToolResults,
@@ -201,6 +201,12 @@ describe('buildPriorAgentTranscript', () => {
 		success,
 		durationMs: 1,
 		timestamp: new Date(0).toISOString(),
+	});
+
+	it('recognizes the old fake acknowledgement and nothing else', () => {
+		expect(isHarnessAckEcho('Understood — I have the earlier paths and recent tool results.')).toBe(true);
+		expect(isHarnessAckEcho('Understood — I have the earlier paths and recent tool results')).toBe(true);
+		expect(isHarnessAckEcho('Edited airplane/index.html and declared apron once.')).toBe(false);
 	});
 
 	it('returns null without useful traces', () => {

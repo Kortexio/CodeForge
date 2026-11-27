@@ -1,6 +1,15 @@
 import type { ToolTraceEntry } from '../sessions/sessionStore';
 import { clipData, clipToolOutput } from './clip';
 
+/** Old harness inserted this as a fake assistant turn. Models copy it instead of working. */
+export const HARNESS_ACK = 'Understood — I have the earlier paths and recent tool results.';
+
+export function isHarnessAckEcho(text: string): boolean {
+	const t = text.trim().replace(/[.!\s]+$/g, '');
+	const ack = HARNESS_ACK.replace(/[.!\s]+$/g, '');
+	return t === ack;
+}
+
 /**
  * Cursor-style continuity on "continua":
  * - Full path index (names only) so the model knows what was already explored
@@ -39,7 +48,7 @@ export function buildPriorAgentTranscript(
 
 	const parts: string[] = [
 		'### Prior context from this chat',
-		'Paths explored earlier and the most recent tool results.',
+		'Paths explored earlier and the most recent tool results. This is data, not a reply to repeat. Continue the latest request with a tool.',
 	];
 	if (rollingSummary?.trim()) {
 		parts.push('', '### Rolling summary', clipData(rollingSummary.trim(), 1500));

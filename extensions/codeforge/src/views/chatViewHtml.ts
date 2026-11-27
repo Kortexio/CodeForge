@@ -120,6 +120,15 @@ export function getChatViewHtml(assets: ChatViewAssets): string {
   .msg-meta { font-size: 0.72em; color: var(--vscode-descriptionForeground); margin-bottom: 4px; }
   .msg-meta .model { font-weight: 600; color: var(--vscode-foreground); margin-right: 6px; }
   .msg-body { word-wrap: break-word; overflow-wrap: anywhere; }
+  /* Live model prose while the turn runs: no layout jump when the final reply lands. */
+  .msg-body.streaming { opacity: 0.98; }
+  .msg-body.streaming::after {
+    content: '▍';
+    margin-left: 1px;
+    opacity: 0.55;
+    animation: blink 1s steps(1) infinite;
+  }
+  @keyframes blink { 50% { opacity: 0; } }
   .msg.user .msg-body { white-space: pre-wrap; }
   .md > :first-child { margin-top: 0; }
   .md > :last-child { margin-bottom: 0; }
@@ -552,6 +561,10 @@ export function getChatViewHtml(assets: ChatViewAssets): string {
   let permissions = 'default';
   let busy = false;
   let timeline = [];
+  /** Signatures of the messages currently in the DOM (for incremental re-render). */
+  let renderedSignatures = [];
+  /** Timeline fingerprint at last full render — a new tool row must repaint the turn. */
+  let renderedTimelineSig = '';
   let slashCommands = [];
   let hasAgentsMd = false;
   let slashOpen = false;
@@ -1243,9 +1256,10 @@ export function getChatViewHtml(assets: ChatViewAssets): string {
     } catch (e) { return ''; }
   }
 
-  function renderThinking(reasoning, isPending, liveStatus) {
-    // Pending: muted live line (tool verb or short model narration). Gone when the turn finishes.
+  function renderThinking(reasoning, isPending, liveStatus, hasBody) {
+    // While pending: the live line is only a placeholder until real prose arrives.
     if (isPending) {
+      if (hasBody) return '';
       var status = String(liveStatus || 'Planning next moves').trim() || 'Planning next moves';
       return '<div class="thinking-live" aria-live="polite">' + escapeHtml(status) + '</div>';
     }
@@ -1292,11 +1306,69 @@ export function getChatViewHtml(assets: ChatViewAssets): string {
     return html;
   }
 
+  function timelineSignature(items) {
+    if (!items || !items.length) return '0';
+    var last = items[items.length - 1];
+    return items.length + ':' + String(last.id || '') + ':' + String(last.toolStatus || '') + ':' + String(last.label || '');
+  }
+
+  function messageSignature(m) {
+    return [m.role, m.status || '', m.liveStatus || '', String(m.content || '').length,
+      m.continueAvailable ? '1' : '0'].join('|');
+  }
+
+  /** Cheap patch for the common case: only the last assistant bubble is growing. */
+  function patchLastMessage(messages) {
+    if (canvasOpen) return false;
+    var last = messages[messages.length - 1];
+    if (!last || last.role !== 'assistant' || last.status !== 'pending') return false;
+    var node = messagesEl.querySelector('.msg.assistant[data-idx="' + (messages.length - 1) + '"]');
+    if (!node) return false;
+    var split = splitThink(last.content);
+    var body = split.content;
+    var hasBody = !!String(body || '').trim();
+    var live = node.querySelector('.thinking-live');
+    var bodyEl = node.querySelector('.msg-body');
+    if (hasBody) {
+      if (live) live.remove();
+      if (!bodyEl) {
+        bodyEl = document.createElement('div');
+        bodyEl.className = 'msg-body md streaming';
+        node.appendChild(bodyEl);
+      }
+      var next = renderMarkdown(normalizeAssistantContent(body));
+      if (bodyEl.innerHTML !== next) bodyEl.innerHTML = next;
+    } else if (!live) {
+      var line = document.createElement('div');
+      line.className = 'thinking-live';
+      line.setAttribute('aria-live', 'polite');
+      line.textContent = String(last.liveStatus || 'Planning next moves').trim() || 'Planning next moves';
+      if (bodyEl) node.insertBefore(line, bodyEl);
+      else node.appendChild(line);
+    } else {
+      var status = String(last.liveStatus || 'Planning next moves').trim() || 'Planning next moves';
+      if (live.textContent !== status) live.textContent = status;
+    }
+    var nearBottom = messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < 120;
+    if (nearBottom) messagesEl.scrollTop = messagesEl.scrollHeight;
+    return true;
+  }
+
   function renderMessages(messages) {
     if (canvasOpen) return;
     if (!messages.length) {
       messagesEl.innerHTML = emptyHtml();
       bindEmptyCtas();
+      renderedSignatures = [];
+      return;
+    }
+    // Incremental: append-only history with a growing last bubble is by far the common case
+    // during a turn. Full innerHTML here would rebuild every bubble on every token.
+    if (renderedSignatures.length === messages.length &&
+        timelineSignature(timeline) === renderedTimelineSig &&
+        messages.slice(0, -1).every(function (m, i) { return messageSignature(m) === renderedSignatures[i]; }) &&
+        patchLastMessage(messages)) {
+      renderedSignatures[renderedSignatures.length - 1] = messageSignature(messages[messages.length - 1]);
       return;
     }
     var roleLabel = mode === 'ask' ? 'Ask' : mode === 'plan' ? 'Plan' : 'Agent';
@@ -1322,6 +1394,10 @@ export function getChatViewHtml(assets: ChatViewAssets): string {
       var body = split.content;
       var isPending = m.status === 'pending';
       var time = formatTime(m.timestamp);
+      var hasBody = !!String(body || '').trim();
+      var turnRows = isPending || hasBody || reasoning
+        ? renderStepRows(timeline.filter(function (t) { return t.turn === userTurnIndex(messages, idx); }))
+        : '';
       html += '<div class="msg assistant ' + (m.status || '') + '" data-idx="' + idx + '">' +
         (isPending ? '' : (
           '<div class="msg-meta">' +
@@ -1329,8 +1405,12 @@ export function getChatViewHtml(assets: ChatViewAssets): string {
             (time ? '<span>' + escapeHtml(time) + '</span>' : '') +
           '</div>'
         )) +
-        renderThinking(reasoning, isPending, m.liveStatus) +
-        (isPending ? '' : '<div class="msg-body md">' + renderMarkdown(normalizeAssistantContent(body)) + '</div>') +
+        turnRows +
+        renderThinking(reasoning, isPending, m.liveStatus, hasBody) +
+        (hasBody
+          ? '<div class="msg-body md' + (isPending ? ' streaming' : '') + '">' +
+            renderMarkdown(normalizeAssistantContent(body)) + '</div>'
+          : '') +
         (m.continueAvailable && !busy && !isPending
           ? '<div class="continue-row"><button type="button" class="continue-btn" data-continue="1">Continue</button></div>'
           : '') +
@@ -1338,6 +1418,8 @@ export function getChatViewHtml(assets: ChatViewAssets): string {
         '</div>';
     });
     messagesEl.innerHTML = html;
+    renderedSignatures = messages.map(messageSignature);
+    renderedTimelineSig = timelineSignature(timeline);
     messagesEl.querySelectorAll('.continue-btn').forEach(function (btn) {
       btn.addEventListener('click', function (e) {
         e.preventDefault();

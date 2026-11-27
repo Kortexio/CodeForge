@@ -11,6 +11,35 @@ export interface WebSearchHit {
 	snippet: string;
 }
 
+/** Block non-http(s) and link-local metadata. Localhost stays allowed for the app under test. */
+export function webFetchBlockedReason(raw: string): string | null {
+	let url: URL;
+	try {
+		url = new URL(raw);
+	} catch {
+		return 'Error: invalid URL';
+	}
+	if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+		return 'Error: only http and https URLs are allowed';
+	}
+	const host = url.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+	if (host === 'metadata.google.internal' || host.startsWith('169.254.')) {
+		return 'Error: link-local and metadata hosts are blocked';
+	}
+	return null;
+}
+
+function readableHtml(html: string): string {
+	const title = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(html)?.[1] ?? '';
+	const main =
+		/<main[^>]*>([\s\S]*?)<\/main>/i.exec(html)?.[1] ??
+		/<article[^>]*>([\s\S]*?)<\/article>/i.exec(html)?.[1] ??
+		html;
+	const body = stripTags(main);
+	const heading = stripTags(title);
+	return heading ? `${heading}\n\n${body}` : body;
+}
+
 function stripTags(html: string): string {
 	return html
 		.replace(/<script[\s\S]*?<\/script>/gi, ' ')
@@ -63,6 +92,16 @@ export async function webSearch(query: string, maxResults = MAX_SEARCH_RESULTS):
 		hits.push({ title, url: href, snippet });
 	}
 	if (!hits.length) {
+		const loose =
+			/<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
+		while ((m = loose.exec(html)) && hits.length < Math.min(20, Math.max(1, maxResults))) {
+			const href = decodeDuckUrl(m[1]);
+			const title = stripTags(m[2]).slice(0, 200);
+			if (!title || !href.startsWith('http')) continue;
+			hits.push({ title, url: href, snippet: '' });
+		}
+	}
+	if (!hits.length) {
 		// Fallback: DuckDuckGo Instant Answer API
 		const ia = await fetch(
 			`https://api.duckduckgo.com/?q=${encodeURIComponent(q)}&format=json&no_html=1&skip_disambig=1`,
@@ -96,7 +135,8 @@ export async function webSearch(query: string, maxResults = MAX_SEARCH_RESULTS):
 
 export async function webFetch(urlArg: string, maxChars = MAX_FETCH_CHARS): Promise<string> {
 	const url = String(urlArg ?? '').trim();
-	if (!/^https?:\/\//i.test(url)) return 'Error: url must start with http:// or https://';
+	const blocked = webFetchBlockedReason(url);
+	if (blocked) return blocked;
 	const res = await fetch(url, {
 		headers: {
 			'User-Agent': 'CodeForgeAgent/0.1',
@@ -112,7 +152,7 @@ export async function webFetch(urlArg: string, maxChars = MAX_FETCH_CHARS): Prom
 	}
 	let text = buf.toString('utf8');
 	if (/html/i.test(ctype) || /^\s*</.test(text)) {
-		text = stripTags(text);
+		text = readableHtml(text);
 	}
 	const limit = Math.min(MAX_FETCH_CHARS, Math.max(1000, maxChars));
 	if (text.length > limit) {

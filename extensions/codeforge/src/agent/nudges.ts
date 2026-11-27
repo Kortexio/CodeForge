@@ -147,6 +147,12 @@ export function specSelfCheckNote(opts: {
 export const EMPTY_TURN_NOTE =
 	'The reply was empty. Continue with the next tool call, or reply with a summary if the task is done.';
 
+/** Model echoed the old fake assistant acknowledgement instead of doing the task. */
+export const ACK_ECHO_NOTE = [
+	'That sentence is not a result. Do not repeat it.',
+	'Continue the latest request with one tool call.',
+].join('\n');
+
 /**
  * Protocol: exploration-only tools then prose finish is not done (sent at most twice).
  * Structural — based on tool counts, not user-phrase matchers.

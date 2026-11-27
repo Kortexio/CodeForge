@@ -1169,7 +1169,7 @@ export class AiSettingsPanel {
 
     <section id="tab-agent" class="split ${tabActive('agent')}">
       <h1>Agent</h1>
-      <p class="subtitle">Same preferences as Settings → AI → Agent / Approvals / Context / Completion. Changes sync both ways.</p>
+      <p class="subtitle">Same preferences as Settings → AI → Agent / Approvals / Context / Completion. Changes sync both ways. Web, browser, and computer tools are always on for Agent. Computer use still asks for a desktop grant each turn. Allow all does not skip that grant. Optional tool groups (git, wiki, media, files) stay in Settings.</p>
       <div class="card" id="agentForm"><div class="card-body">
         <div class="row"><label><input type="checkbox" id="agentEnabled" /> Enable AI Agent</label></div>
         <div class="row"><label>Mode</label>

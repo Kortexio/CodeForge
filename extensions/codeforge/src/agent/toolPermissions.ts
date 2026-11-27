@@ -142,9 +142,36 @@ const EXPLORE_ALLOWED = [
 ] as const;
 
 /**
- * Default Agent surface: CORE only. Optional groups come from
- * `codeforge.ai.toolGroups` and `AgentModeDefinition.toolGroups`.
+ * Default Agent surface: CORE (web, browser, and computer are always on for build).
+ * Optional groups come from `codeforge.ai.toolGroups` and mode toolGroups.
  */
+export const WEB_CORE = ['web_search', 'web_fetch'] as const;
+
+export const BROWSER_CORE = [
+	'browser_navigate',
+	'browser_snapshot',
+	'browser_click',
+	'browser_type',
+	'browser_screenshot',
+	'browser_scroll',
+	'browser_press_key',
+	'browser_hover',
+	'browser_select_option',
+	'browser_wait',
+	'browser_tabs',
+	'browser_close',
+] as const;
+
+/** Desktop control. Always listed on build; each turn still needs a grant. */
+export const COMPUTER_CORE = [
+	'computer_screenshot',
+	'computer_click',
+	'computer_type',
+	'computer_key',
+	'computer_scroll',
+	'computer_move',
+] as const;
+
 export const CORE = [
 	'read',
 	'edit',
@@ -163,6 +190,9 @@ export const CORE = [
 	'think',
 	'update_status',
 	'skill',
+	...WEB_CORE,
+	...BROWSER_CORE,
+	...COMPUTER_CORE,
 ] as const;
 
 export const TOOL_GROUPS = {
@@ -179,14 +209,6 @@ export const TOOL_GROUPS = {
 		'gh_pr_create',
 	],
 	wiki: ['wiki_read', 'wiki_search', 'wiki_write', 'wiki_fact', 'wiki_facts'],
-	browser: [
-		'browser_navigate',
-		'browser_snapshot',
-		'browser_click',
-		'browser_type',
-		'browser_screenshot',
-	],
-	web: ['web_search', 'web_fetch'],
 	media: ['generate_image', 'canvas_write', 'voice_status'],
 	notebook: ['edit_notebook'],
 	navigation: ['symbols', 'references', 'definition'],

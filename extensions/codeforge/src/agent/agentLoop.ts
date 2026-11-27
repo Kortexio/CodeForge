@@ -18,7 +18,7 @@ import {
 } from './toolRegistry';
 import { getAgentModeRegistry, toolVisibleInMode, type AgentModeDefinition } from './agentModes';
 import { SessionStore } from '../sessions/sessionStore';
-import { buildPriorAgentTranscript } from './priorContext';
+import { buildPriorAgentTranscript, isHarnessAckEcho } from './priorContext';
 import {
 	calibratedTokens,
 	isContextOverflowError,
@@ -118,9 +118,21 @@ import { getArtifactStore } from '../storage/artifacts';
 import { AgentStateMachine } from './stateMachine';
 import { DEFAULT_BUDGET } from '../context/engine';
 import * as browser from '../browser/agent';
+import { consumePendingVision } from '../browser/visionHandoff';
+import * as computer from '../computer/desktop';
+import {
+	clearComputerGrant,
+	computerInputBlockedReason,
+	computerTurnGranted,
+	computerUnavailableReason,
+	grantComputerTurn,
+	isComputerTool,
+} from '../computer/guard';
+import { buildKnowledgeMarkdown, knowledgePrefetchEnabled } from './knowledgePrefetch';
 import {
 	NO_VERIFICATION_NOTE,
 	DIAG_ONLY_FINISH_NOTE,
+	ACK_ECHO_NOTE,
 	EMPTY_TURN_NOTE,
 	finalReplyNote,
 	LENGTH_CAP_NOTE,
@@ -276,6 +288,17 @@ const MUTATING = new Set([
 	'browser_navigate',
 	'browser_click',
 	'browser_type',
+	'browser_scroll',
+	'browser_press_key',
+	'browser_hover',
+	'browser_select_option',
+	'browser_tabs',
+	'computer_screenshot',
+	'computer_click',
+	'computer_type',
+	'computer_key',
+	'computer_scroll',
+	'computer_move',
 	'git_add',
 	'git_commit',
 	'git_push',
@@ -1185,6 +1208,156 @@ export const AGENT_TOOLS = [
 	{
 		type: 'function' as const,
 		function: {
+			name: 'browser_scroll',
+			description: toolDescription('browser_scroll'),
+			parameters: {
+				type: 'object',
+				properties: { dy: { type: 'number', description: 'Pixels down (negative scrolls up).' } },
+				required: ['dy'],
+			},
+		},
+	},
+	{
+		type: 'function' as const,
+		function: {
+			name: 'browser_press_key',
+			description: toolDescription('browser_press_key'),
+			parameters: {
+				type: 'object',
+				properties: { key: { type: 'string' } },
+				required: ['key'],
+			},
+		},
+	},
+	{
+		type: 'function' as const,
+		function: {
+			name: 'browser_hover',
+			description: toolDescription('browser_hover'),
+			parameters: {
+				type: 'object',
+				properties: { selector: { type: 'string' } },
+				required: ['selector'],
+			},
+		},
+	},
+	{
+		type: 'function' as const,
+		function: {
+			name: 'browser_select_option',
+			description: toolDescription('browser_select_option'),
+			parameters: {
+				type: 'object',
+				properties: { selector: { type: 'string' }, value: { type: 'string' } },
+				required: ['selector', 'value'],
+			},
+		},
+	},
+	{
+		type: 'function' as const,
+		function: {
+			name: 'browser_wait',
+			description: toolDescription('browser_wait'),
+			parameters: {
+				type: 'object',
+				properties: { ms: { type: 'number' } },
+				required: ['ms'],
+			},
+		},
+	},
+	{
+		type: 'function' as const,
+		function: {
+			name: 'browser_tabs',
+			description: toolDescription('browser_tabs'),
+			parameters: {
+				type: 'object',
+				properties: {
+					action: { type: 'string', description: 'list | new | switch | close' },
+					id: { type: 'string' },
+				},
+			},
+		},
+	},
+	{
+		type: 'function' as const,
+		function: {
+			name: 'browser_close',
+			description: toolDescription('browser_close'),
+			parameters: { type: 'object', properties: {} },
+		},
+	},
+	{
+		type: 'function' as const,
+		function: {
+			name: 'computer_screenshot',
+			description: toolDescription('computer_screenshot'),
+			parameters: { type: 'object', properties: {} },
+		},
+	},
+	{
+		type: 'function' as const,
+		function: {
+			name: 'computer_click',
+			description: toolDescription('computer_click'),
+			parameters: {
+				type: 'object',
+				properties: { x: { type: 'number' }, y: { type: 'number' } },
+				required: ['x', 'y'],
+			},
+		},
+	},
+	{
+		type: 'function' as const,
+		function: {
+			name: 'computer_move',
+			description: toolDescription('computer_move'),
+			parameters: {
+				type: 'object',
+				properties: { x: { type: 'number' }, y: { type: 'number' } },
+				required: ['x', 'y'],
+			},
+		},
+	},
+	{
+		type: 'function' as const,
+		function: {
+			name: 'computer_type',
+			description: toolDescription('computer_type'),
+			parameters: {
+				type: 'object',
+				properties: { text: { type: 'string' } },
+				required: ['text'],
+			},
+		},
+	},
+	{
+		type: 'function' as const,
+		function: {
+			name: 'computer_key',
+			description: toolDescription('computer_key'),
+			parameters: {
+				type: 'object',
+				properties: { key: { type: 'string', description: 'SendKeys token, e.g. {ENTER}' } },
+				required: ['key'],
+			},
+		},
+	},
+	{
+		type: 'function' as const,
+		function: {
+			name: 'computer_scroll',
+			description: toolDescription('computer_scroll'),
+			parameters: {
+				type: 'object',
+				properties: { dy: { type: 'number', description: 'Wheel notches. Positive is up.' } },
+				required: ['dy'],
+			},
+		},
+	},
+	{
+		type: 'function' as const,
+		function: {
 			name: 'delegate_task',
 			description:
 				toolDescription('delegate_task'),
@@ -1379,10 +1552,14 @@ export interface AgentLoopOptions {
 	modelProfile?: ModelProfile;
 	/** Optional vision parts (data URLs) attached to the user turn. */
 	images?: Array<{ mime: string; dataUrl: string; label?: string }>;
+	/** When true, browser/desktop screenshots are attached as image_url on the next message. */
+	visionCapable?: boolean;
 	history?: AgentHistoryMessage[];
 	cancelled: () => boolean;
 	abortSignal?: AbortSignal;
 	onStatus?: (text: string) => void;
+	/** Live assistant prose for this round (already buffered); rendered in the pending bubble. */
+	onStreamingText?: (textSoFar: string) => void;
 	onActivity?: (event: AgentActivityEvent) => void;
 	/** How the tool loop ended (budget / stuck / length / done). Used for Continue UI. */
 	onLoopExit?: (exit: 'budget' | 'stuck' | 'length' | 'done' | 'cancelled' | 'error') => void;
@@ -1575,6 +1752,11 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 		? `MCP: ${mcpTools.length} tool(s) available via mcp_call (server__tool).`
 		: '';
 	const agentsMdSection = await loadAgentsMdForPrompt();
+	const governanceSection = governance.buildPromptSection(opts.task, { charBudget: 1800 });
+	const devServerUrl = vscode.workspace
+		.getConfiguration('codeforge.ai')
+		.get<string>('devServerUrl')
+		?.trim();
 
 	const statusQuestion = isStatusQuestion(opts.task);
 	if (statusQuestion) {
@@ -1649,6 +1831,10 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 		'Paths are relative to the workspace root.',
 		toolContract,
 		'Do not ask the user for API keys already configured in CodeForge settings; never paste secrets into the chat.',
+		'If the context does not support an API, version, or external behavior, call web_search with a more specific query and web_fetch a result. Do not fill that gap from memory.',
+		devServerUrl
+			? `Dev server URL: ${devServerUrl}. After source edits, open it with browser_navigate and read console and network issues in the After-state.`
+			: '',
 		'Long-running servers hand off to the Agent Terminal after startup.',
 		[
 			seedActiveTools.has('skill') ? 'Call `skill` for playbooks.' : '',
@@ -1692,6 +1878,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					.join('\n')
 			: '',
 		agentsMdSection,
+		governanceSection,
 		forcedSkillSection,
 		learnedHarnessBlock(learnedHarness, runStamp.contract),
 		mcpHint,
@@ -1710,6 +1897,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 	};
 	const history = (opts.history ?? [])
 		.filter(m => m.content?.trim())
+		.filter(m => !(m.role === 'assistant' && isHarnessAckEcho(m.content)))
 		.slice(-16)
 		.map(m => ({
 			role: m.role,
@@ -1747,7 +1935,13 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 		detail: lean.markdown.slice(0, 400),
 	});
 
-	const system = `${systemBase}\n\n${lean.markdown}`;
+	clearComputerGrant();
+	const computerTurnId = `${opts.sessionId ?? 'nosession'}:${opts.turnIndex ?? 0}:${Date.now()}`;
+	const knowledge =
+		knowledgePrefetchEnabled() && !opts.coachMode && !statusQuestion
+			? await buildKnowledgeMarkdown({ task: opts.task })
+			: { markdown: '' };
+	const system = [systemBase, lean.markdown, knowledge.markdown].filter(Boolean).join('\n\n');
 
 	let messages: ChatMessage[] = [
 		{ role: 'system', content: system },
@@ -1759,6 +1953,8 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 	trace?.state?.('executing');
 
 	const actions: string[] = [];
+	/** Assistant prose from rounds that ended in a tool call — kept above live streaming text. */
+	let proseSoFar = '';
 	const recentFingerprints: string[] = [];
 	const resultCache = new Map<string, string>();
 	const readGate = createReadGateState();
@@ -2043,23 +2239,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 		priorSession?.rollingSummary
 	);
 	if (priorTranscript) {
-		const rest = messages.slice(1);
-		const head = rest.slice(0, -1);
-		const latestUser = rest[rest.length - 1];
-		messages = [
-			{ role: 'system', content: systemWithMemory },
-			...head,
-			{
-				role: 'user',
-				content: priorTranscript,
-			},
-			{
-				role: 'assistant',
-				content:
-					'Understood — I have the earlier paths and recent tool results.',
-			},
-			latestUser,
-		];
+		systemWithMemory = `${systemWithMemory}\n\n${priorTranscript}`;
 		opts.onActivity?.({
 			kind: 'context',
 			label: 'Prior context (Cursor-style)',
@@ -2390,6 +2570,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 				drainSteering: opts.drainSteering,
 				sanitize: sanitizeMessages,
 			});
+			const baseProse = proseSoFar;
 			const round = await postAgentRound(
 				opts,
 				url,
@@ -2397,7 +2578,8 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 				roundMaxTokens,
 				roundTools,
 				'auto',
-				escalatedThisRound
+				escalatedThisRound,
+				baseProse
 			);
 			if (!round.ok) {
 				const errText = round.errorText;
@@ -2788,7 +2970,8 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					typeof lastHarnessNote.content === 'string' &&
 					content.trim() !== '' &&
 					content.trim() === lastHarnessNote.content.trim();
-				const trivial = isTrivialAssistantContent(content) || echoesHarnessNote;
+				const ackEcho = isHarnessAckEcho(content);
+				const trivial = isTrivialAssistantContent(content) || echoesHarnessNote || ackEcho;
 				const hitLengthCap =
 					finishReason === 'length' ||
 					tokensOut >= 7500 ||
@@ -2868,7 +3051,7 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 				if ((!content || trivial) && emptyFinishNudges < 2 && step + 1 < stepBudget) {
 					emptyFinishNudges += 1;
 					emitProtocol('emptyReplies', '1');
-					const note = EMPTY_TURN_NOTE;
+					const note = ackEcho ? ACK_ECHO_NOTE : EMPTY_TURN_NOTE;
 					trace?.info('harness', String(note.length));
 					messages.push({ role: 'assistant', content: content || '(empty)' });
 					messages.push({ role: 'user', content: note });
@@ -2911,6 +3094,9 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 				) {
 					diagFinishNudges += 1;
 					trace?.info('harness', String(DIAG_ONLY_FINISH_NOTE.length));
+					if (summary.trim()) {
+						proseSoFar = proseSoFar ? `${proseSoFar}\n\n${summary.trim()}` : summary.trim();
+					}
 					messages.push({ role: 'assistant', content: summary });
 					messages.push({ role: 'user', content: DIAG_ONLY_FINISH_NOTE });
 					opts.onActivity?.({
@@ -3199,7 +3385,13 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					detail: blocked ?? (stillRed ? 'oracle still red' : summarizeActionsForLlm(actions).slice(0, 400)),
 				});
 				emitTurnMetrics();
-				let reply = summary + doneNote;
+				// The bubble already shows prose from earlier tool rounds (proseSoFar).
+				// Keep it in the settled reply so the text does not shrink when the turn ends.
+				const finalProse =
+					proseSoFar && summary && !summary.includes(proseSoFar)
+						? `${proseSoFar}\n\n${summary}`
+						: summary;
+				let reply = finalProse + doneNote;
 				if (
 					experimentOn &&
 					!blocked &&
@@ -3264,6 +3456,11 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					? { reasoning_content: thoughtRaw }
 					: {}),
 			});
+			if (assistantContent.trim()) {
+				proseSoFar = proseSoFar
+					? `${proseSoFar}\n\n${assistantContent.trim()}`
+					: assistantContent.trim();
+			}
 			lengthTruncationNudges = 0;
 			preferShortCompletion = false;
 			emptyFinishNudges = 0;
@@ -3693,6 +3890,17 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 						clipToolOutput
 					),
 				});
+				if (name === 'browser_screenshot' || name === 'computer_screenshot') {
+					const shot = consumePendingVision();
+					if (success && shot && opts.visionCapable) {
+						messages.push({
+							role: 'user',
+							content: buildUserContent('Screenshot from the tool above.', [
+								{ mime: 'image/png', dataUrl: shot },
+							]),
+						});
+					}
+				}
 			};
 
 			const flushLane = async (): Promise<void> => {
@@ -4156,7 +4364,41 @@ export async function runAgentWithTools(opts: AgentLoopOptions): Promise<string>
 					detail: JSON.stringify(summarizeArgs(name, args)).slice(0, 200),
 				});
 
-				if (agentToolNeedsUserApproval(name) && !gateApproved) {
+				if (isComputerTool(name)) {
+					const unavailable = computerUnavailableReason() || computerInputBlockedReason(name);
+					if (unavailable) {
+						await flushLane();
+						messages.push({
+							role: 'tool',
+							tool_call_id: call.id,
+							name,
+							content: unavailable,
+						});
+						actions.push(`${name} not run`);
+						continue;
+					}
+					if (!computerTurnGranted(computerTurnId)) {
+						const approval = await ApprovalDialog.show({
+							tool: 'computer_session',
+							arguments: {},
+							risk: 'high',
+							reason:
+								'This turn may control the mouse and keyboard of this PC until it ends. That bypasses the shell sandbox. Allow all does not cover this.',
+						});
+						if (!approval.approved) {
+							await flushLane();
+							messages.push({
+								role: 'tool',
+								tool_call_id: call.id,
+								name,
+								content: 'Denied by user: computer_session',
+							});
+							actions.push(`${name} denied`);
+							continue;
+						}
+						grantComputerTurn(computerTurnId);
+					}
+				} else if (agentToolNeedsUserApproval(name) && !gateApproved) {
 					const policy = getApprovalPolicy();
 					if (policy.isAutoApproved(name)) {
 						/* Allow all / auto-approve — no HITL checkpoint */
@@ -4825,6 +5067,32 @@ async function executeTool(
 				return await browser.browserType(String(args.selector), String(args.text));
 			case 'browser_screenshot':
 				return await browser.browserScreenshot(opts.sessionId ?? undefined);
+			case 'browser_scroll':
+				return await browser.browserScroll(Number(args.dy ?? 0));
+			case 'browser_press_key':
+				return await browser.browserPressKey(String(args.key ?? ''));
+			case 'browser_hover':
+				return await browser.browserHover(String(args.selector ?? ''));
+			case 'browser_select_option':
+				return await browser.browserSelectOption(String(args.selector ?? ''), String(args.value ?? ''));
+			case 'browser_wait':
+				return await browser.browserWait(Number(args.ms ?? 0));
+			case 'browser_tabs':
+				return await browser.browserTabs(String(args.action ?? 'list'), args.id ? String(args.id) : undefined);
+			case 'browser_close':
+				return await browser.browserClose();
+			case 'computer_screenshot':
+				return await computer.computerScreenshot(opts.sessionId ?? undefined);
+			case 'computer_click':
+				return await computer.computerClick(Number(args.x), Number(args.y));
+			case 'computer_move':
+				return await computer.computerMove(Number(args.x), Number(args.y));
+			case 'computer_type':
+				return await computer.computerType(String(args.text ?? ''));
+			case 'computer_key':
+				return await computer.computerKey(String(args.key ?? ''));
+			case 'computer_scroll':
+				return await computer.computerScroll(Number(args.dy ?? 0));
 			case 'retrieve': {
 				const query = String(args.query ?? '');
 				const k = Number(args.k ?? 6);
@@ -5264,13 +5532,21 @@ async function compactWithLlm(
 		task: opts.task,
 		facts,
 		workspaceRoot: opts.workspaceRoot,
-		includeRetrieve: false,
+		includeRetrieve: true,
 		includePrefetch: false,
 		retrieveK: 4,
 		rerankFn: makeRerankFn(opts),
 		budget: { ...DEFAULT_BUDGET, total: contextPacketTokenBudget(getContextBudget(opts.numCtx)) },
 	});
 	opts.onContextBadge?.(packet.badge);
+	let webEvidence = '';
+	if (knowledgePrefetchEnabled() && packet.retrieved.length === 0 && !opts.coachMode) {
+		const kn = await buildKnowledgeMarkdown({
+			task: opts.task,
+			retrieve: async () => [],
+		});
+		webEvidence = kn.markdown;
+	}
 
 	const prior =
 		history.length > 0
@@ -5289,6 +5565,7 @@ async function compactWithLlm(
 		'',
 		'### Context packet (compact)',
 		packet.markdown,
+		webEvidence,
 		'',
 		'### Rolling summary + facts',
 		'The conversation was compacted. STABLE FACTS (system message) hold the canonical paths and open errors.',
@@ -5362,7 +5639,9 @@ async function postAgentRound(
 	tools: typeof AGENT_TOOLS = AGENT_TOOLS,
 	/** Keep tool schemas but forbid calls (prefix-cache friendly wrap-up). */
 	toolChoice: 'auto' | 'none' = 'auto',
-	escalatedThinking = false
+	escalatedThinking = false,
+	/** Prose already shown this turn (earlier rounds) — streamed text is appended to it. */
+	streamBaseline = ''
 ): Promise<{
 	ok: boolean;
 	status: number;
@@ -5499,16 +5778,12 @@ async function postAgentRound(
 		return { ok: false, status: response.status, errorText: await response.text(), data: {} };
 	}
 	try {
-		let lastUi = 0;
 		const data = await readChatCompletionResponse(
 			response,
 			partial => {
 				// Stream visible prose into the pending bubble; skip tool-JSON spam.
 				if (!partial || looksLikeToolJson(partial)) return;
-				const now = Date.now();
-				if (now - lastUi < 60 && partial.length < 40) return;
-				lastUi = now;
-				opts.onStatus?.(partial);
+				opts.onStreamingText?.(streamBaseline ? `${streamBaseline}\n\n${partial}` : partial);
 			},
 			{ profile: familyProfile, toolNames: tools.map(t => t.function.name) }
 		);
@@ -5638,7 +5913,10 @@ async function streamSseChatCompletion(
 	// SSE chunks (`<tool_c` | `all>`) never flashes half-formed in `opts.onStatus`. `content`
 	// itself (used for the final parse once the stream ends) always keeps every character —
 	// only what we hand to `onDelta` as-we-go is buffered.
-	const previewBuffer = new StreamBuffer();
+	const previewBuffer = new StreamBuffer({
+		prefixSize: 96,
+		maxSize: 512,
+	});
 	let shownContent = '';
 	const emitPreview = (delta: string) => {
 		if (!onDelta) return;
@@ -7174,7 +7452,7 @@ function cleanToolDetailForUi(output: string): string {
 
 /** Shell exit≠0 must not be cached as success / treated as OK progress. */
 function isToolSuccess(name: string, output: string): boolean {
-	if (/^(Error:|FAILED:|Not run:)/i.test(output.trim()) || /^FILE_NOT_FOUND:/i.test(output.trim())) {
+	if (/^(Error:|FAILED:|Not run:|NotRun:)/i.test(output.trim()) || /^FILE_NOT_FOUND:/i.test(output.trim())) {
 		return false;
 	}
 	// Text rules for patch tools only — shell/search may mention "hunk" in docs.

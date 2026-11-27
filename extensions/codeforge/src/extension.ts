@@ -50,6 +50,9 @@ import { getContextProviderRegistry } from './context/providers';
 import { checkForAppUpdate, scheduleStartupUpdateCheck } from './platform/releaseCheck';
 import { getAgentModeRegistry } from './agent/agentModes';
 import { EXPLORE_MODE } from './agent/exploreMode';
+import { PRODUCT_MODE } from './agent/productMode';
+import { warnIfPlaywrightMissing } from './browser/agent';
+import { registerBrowserMirror } from './browser/panel';
 
 let chatViewProvider: ChatViewProvider;
 let sessionsTreeProvider: SessionsTreeProvider;
@@ -122,6 +125,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<CodeFo
     startWorkspaceIndexWatcher(context);
     try {
         getAgentModeRegistry().register(EXPLORE_MODE);
+        getAgentModeRegistry().register(PRODUCT_MODE);
+        context.subscriptions.push(registerBrowserMirror());
+        void warnIfPlaywrightMissing();
     } catch {
         /* already registered */
     }

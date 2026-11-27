@@ -51,6 +51,8 @@ export type RunLoopResult = {
 	files: Map<string, string>;
 	workspaceRoot: string;
 	codeforgeHome: string;
+	/** Assistant prose as the loop handed it to the UI while streaming. */
+	streamed: string[];
 };
 
 function fakeExtensionContext(): import('vscode').ExtensionContext {
@@ -149,6 +151,9 @@ export async function runLoop(opts: RunLoopOptions): Promise<RunLoopResult> {
 		'codeforge.ai.weakModelMode': opts.weakProfile === false ? 'off' : 'on',
 		'codeforge.ai.shellSandbox': 'unrestricted',
 		'codeforge.ai.fullAgentFreedom': true,
+		'codeforge.ai.knowledgePrefetch': false,
+		'codeforge.ai.browserHeadless': true,
+		'codeforge.ai.computerInteractive': false,
 		...(opts.config ?? {}),
 	});
 	if (opts.diagnostics) {
@@ -168,7 +173,8 @@ export async function runLoop(opts: RunLoopOptions): Promise<RunLoopResult> {
 		installScriptedModel(opts.script);
 	}
 
-	const activities: RunLoopResult['activities'] = [];
+		const activities: RunLoopResult['activities'] = [];
+		const streamed: string[] = [];
 
 	try {
 		const ctx = fakeExtensionContext();
@@ -216,6 +222,9 @@ export async function runLoop(opts: RunLoopOptions): Promise<RunLoopResult> {
 				});
 			},
 			onStatus: () => undefined,
+			onStreamingText: text => {
+				streamed.push(text);
+			},
 			numCtx: opts.numCtx ?? 32768,
 			forceJson: opts.forceJson,
 			maxSteps: opts.maxSteps ?? 20,
@@ -239,6 +248,7 @@ export async function runLoop(opts: RunLoopOptions): Promise<RunLoopResult> {
 			files,
 			workspaceRoot,
 			codeforgeHome,
+			streamed,
 		};
 	} finally {
 		uninstallScriptedModel();

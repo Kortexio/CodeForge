@@ -28,6 +28,8 @@ const ALL = [
 	'todo_write',
 	'browser_navigate',
 	'browser_click',
+	'computer_click',
+	'computer_screenshot',
 	'mcp_call',
 	'delegate_task',
 	'update_status',
@@ -82,8 +84,9 @@ assert(buildCore.has('write') && buildCore.has('shell'), 'build keeps write/shel
 assert(buildCore.has('todo_write') && buildCore.has('await_shell'), 'build keeps todo/await');
 assert(buildCore.has('delegate_task'), 'delegate always in build');
 assert(!buildCore.has('mcp_call'), 'build omits mcp by default');
-assert(!buildCore.has('web_search'), 'build CORE omits web by default');
-assert(!buildCore.has('browser_navigate'), 'build CORE omits browser by default');
+assert(buildCore.has('web_search'), 'build CORE includes web');
+assert(buildCore.has('browser_navigate'), 'build CORE includes browser');
+assert(buildCore.has('computer_click'), 'build CORE includes computer');
 assert(!buildCore.has('git_commit'), 'build CORE omits git by default');
 for (const name of CORE) {
 	if (ALL.includes(name)) assert(buildCore.has(name), `CORE includes ${name}`);
@@ -91,10 +94,11 @@ for (const name of CORE) {
 
 const buildGit = filterToolsByProfile(ALL, 'build', { toolGroups: ['git'] });
 assert(buildGit.has('git_commit') && buildGit.has('gh_pr_create'), 'git group enables git tools');
-assert(!buildGit.has('web_search'), 'git group does not enable web');
+assert(buildGit.has('web_search'), 'git group keeps CORE web');
 
-const buildWeb = filterToolsByProfile(ALL, 'build', { toolGroups: ['web', 'browser'] });
-assert(buildWeb.has('web_search') && buildWeb.has('browser_navigate'), 'web+browser groups');
+const askNoDesktop = filterToolsByProfile(ALL, 'ask');
+assert(!askNoDesktop.has('browser_navigate'), 'ask has no browser');
+assert(!askNoDesktop.has('computer_click'), 'ask has no computer');
 
 assert(toolsForGroups(['git']).includes('git_status'), 'toolsForGroups git');
 assert(TOOL_GROUPS.files.includes('delete'), 'files group');
